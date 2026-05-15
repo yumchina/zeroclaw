@@ -28,6 +28,7 @@ zeroclaw-tool-call-parser = { path = "crates/zeroclaw-tool-call-parser", version
 zeroclaw-macros = { path = "crates/zeroclaw-macros", version = "0.7.5" }
 zeroclaw-progress-observer = { path = "crates/zeroclaw-progress-observer", version = "0.7.5" }
 aardvark-sys = { path = "crates/aardvark-sys", version = "0.1.0" }
+notify = "7.0"
 
 [package]
 name = "zeroclawlabs"
