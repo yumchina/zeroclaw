@@ -36,6 +36,9 @@ pub mod sop_execute;
 pub mod sop_list;
 pub mod sop_status;
 pub mod verifiable_intent;
+pub mod registry_manager;
+
+pub use registry_manager::ToolRegistryManager;
 
 // Tool types from zeroclaw-tools (direct imports, no shims)
 pub use zeroclaw_tools::ask_user::AskUserTool;
