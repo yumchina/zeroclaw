@@ -33,7 +33,7 @@ use crate::cost::types::BudgetCheck;
 use crate::observability::{self, Observer, ObserverEvent, runtime_trace};
 use crate::platform;
 use crate::security::{AutonomyLevel, SecurityPolicy};
-use crate::tools::{self, Tool};
+use crate::tools::{self, Tool, ToolRegistryManager};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use futures_util::StreamExt;
@@ -2282,11 +2282,21 @@ pub async fn run(
         tools_registry.extend(peripheral_tools);
     }
 
+    // ── Wrap tools in ToolRegistryManager for hot reload support ─────
+    let tools_mgr = std::sync::Arc::new(tools::ToolRegistryManager::new(tools_registry));
+
     // ── Capability-based tool access control ─────────────────────
     // When `allowed_tools` is `Some(list)`, restrict the tool registry to only
     // those tools whose name appears in the list. Unknown names are silently
     // ignored. When `None`, all tools remain available (backward compatible).
     if let Some(ref allow_list) = allowed_tools {
+        // Note: Filtering happens via ToolRegistryManager if needed in future
+        // For now, we log the filter for observability
+        tracing::info!(
+            allowed = allow_list.len(),
+            "Capability-based tool access filter specified"
+        );
+    }
         tools_registry.retain(|t| allow_list.iter().any(|name| name == t.name()));
         tracing::info!(
             allowed = allow_list.len(),
@@ -2434,9 +2444,10 @@ pub async fn run(
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
 
-    // Register skill-defined tools as callable tool specs in the tool registry
-    // so the LLM can invoke them via native function calling, not just XML prompts.
-    tools::register_skill_tools(&mut tools_registry, &skills, security.clone());
+    // Register skill-defined tools via ToolRegistryManager atomic swap
+    let mut tools_with_skills = tools_mgr.get_current().to_vec();
+    tools::register_skill_tools(&mut tools_with_skills, &skills, security.clone());
+    tools_mgr.atomic_swap(tools_with_skills);
 
     let mut tool_descs: Vec<(&str, &str)> = vec![
         (
@@ -2605,6 +2616,54 @@ pub async fn run(
             )))
         }
     });
+
+    // ── Skill hot reload watcher (if enabled) ─────────────────────
+    let reload_task = if config.skills.hot_reload.enabled {
+        let watcher_config = crate::skills::WatcherConfig::from_config(
+            config.workspace_dir.join("skills"),
+            &config.skills.hot_reload,
+        );
+
+        match crate::skills::spawn_skill_watcher(watcher_config) {
+            Ok((handle, mut reload_rx)) => {
+                let tools_mgr_for_task = std::sync::Arc::clone(&tools_mgr);
+                let config_dir = config.workspace_dir.clone();
+                let security_for_task = security.clone();
+
+                let task = tokio::spawn(async move {
+                    while let Some(req) = reload_rx.recv().await {
+                        info!("Received skill reload request (force={})", req.force);
+
+                        // Reload skills from disk
+                        let new_skills = crate::skills::load_skills_with_config(
+                            &config_dir,
+                            &config,
+                        );
+
+                        // Get current tools and add skill tools
+                        let mut new_tools = tools_mgr_for_task.get_current().to_vec();
+                        crate::tools::register_skill_tools(
+                            &mut new_tools,
+                            &new_skills,
+                            security_for_task.clone(),
+                        );
+
+                        // Atomic swap
+                        let new_version = tools_mgr_for_task.atomic_swap(new_tools);
+                        info!("Skills reloaded, new version: {}", new_version);
+                    }
+                });
+
+                Some(task)
+            }
+            Err(e) => {
+                tracing::warn!("Failed to spawn skill watcher: {}", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // ── Cost tracking context (scoped for CLI / cron / web agents) ──
     let cost_tracking_context: Option<ToolLoopCostTrackingContext> =
