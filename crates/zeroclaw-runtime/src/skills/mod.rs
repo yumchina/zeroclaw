@@ -17,6 +17,9 @@ pub mod creator;
 pub mod improver;
 mod suggestions;
 pub mod testing;
+pub mod watcher;
+
+pub use watcher::{spawn_skill_watcher, WatcherConfig, ReloadRequest};
 
 pub(crate) use suggestions::render_missing_skill_install_suggestion;
 
