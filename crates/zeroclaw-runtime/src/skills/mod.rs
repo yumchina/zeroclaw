@@ -20,6 +20,9 @@ pub mod watcher;
 
 pub use watcher::{spawn_skill_watcher, WatcherConfig, ReloadRequest};
 
+#[cfg(test)]
+mod watcher_tests;
+
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
 const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;
