@@ -745,6 +745,8 @@ impl Agent {
 
         // Load skills and register them as callable tools so WebSocket/daemon
         // sessions can execute them (not just describe them in the prompt).
+        // Note: Agent::from_config creates isolated instances without hot reload support.
+        // For hot reload, use the agent loop with ToolRegistryManager.
         let skills = crate::skills::load_skills_with_config(&config.workspace_dir, config);
         tools::register_skill_tools(&mut tools, &skills, security.clone());
 
