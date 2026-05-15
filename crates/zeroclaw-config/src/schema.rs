@@ -1927,6 +1927,49 @@ fn parse_skills_prompt_injection_mode(raw: &str) -> Option<SkillsPromptInjection
     }
 }
 
+/// Hot reload configuration for skills (`[skills.hot_reload]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "skills.hot_reload"]
+#[serde(default)]
+pub struct SkillsHotReloadConfig {
+    /// Enable hot reload. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Debounce delay in milliseconds. Default: `300`.
+    #[serde(default = "default_hot_reload_debounce_ms")]
+    pub debounce_ms: u64,
+    /// Watch mode: "notify" (file system events), "poll" (mtime polling), or "off". Default: `"notify"`.
+    #[serde(default = "default_hot_reload_watch_mode")]
+    pub watch_mode: String,
+    /// Poll interval in seconds (fallback when notify fails). Default: `30`.
+    #[serde(default = "default_hot_reload_poll_interval_secs")]
+    pub poll_interval_secs: u64,
+}
+
+impl Default for SkillsHotReloadConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            debounce_ms: 300,
+            watch_mode: "notify".to_string(),
+            poll_interval_secs: 30,
+        }
+    }
+}
+
+fn default_hot_reload_debounce_ms() -> u64 {
+    300
+}
+
+fn default_hot_reload_watch_mode() -> String {
+    "notify".to_string()
+}
+
+fn default_hot_reload_poll_interval_secs() -> u64 {
+    30
+}
+
 /// Skills loading configuration (`[skills]` section).
 #[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
@@ -1964,6 +2007,9 @@ pub struct SkillsConfig {
     #[serde(default)]
     #[nested]
     pub skill_improvement: SkillImprovementConfig,
+    /// Hot reload configuration for skills.
+    #[serde(default)]
+    pub hot_reload: SkillsHotReloadConfig,
 }
 
 /// Autonomous skill creation configuration (`[skills.skill_creation]` section).
