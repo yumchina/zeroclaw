@@ -21,7 +21,18 @@ pub mod watcher;
 
 pub use watcher::{spawn_skill_watcher, WatcherConfig, ReloadRequest};
 
+<<<<<<< HEAD
 pub(crate) use suggestions::render_missing_skill_install_suggestion;
+=======
+#[cfg(test)]
+mod watcher_tests;
+>>>>>>> 6b07586fe (test(runtime): add hot reload integration tests)
+=======
+pub(crate) use suggestions::render_missing_skill_install_suggestion;
+
+#[cfg(test)]
+mod watcher_tests;
+>>>>>>> resolved conflict
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
