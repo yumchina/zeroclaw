@@ -16,6 +16,9 @@ pub mod audit;
 pub mod creator;
 pub mod improver;
 pub mod testing;
+pub mod watcher;
+
+pub use watcher::{spawn_skill_watcher, WatcherConfig, ReloadRequest};
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
