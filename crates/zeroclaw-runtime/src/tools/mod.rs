@@ -56,6 +56,7 @@ pub use zeroclaw_tools::codex_cli::CodexCliTool;
 pub use zeroclaw_tools::composio::ComposioTool;
 pub use zeroclaw_tools::content_search::ContentSearchTool;
 pub use zeroclaw_tools::data_management::DataManagementTool;
+pub use zeroclaw_tools::excel_tool::ExcelTool;
 pub use zeroclaw_tools::dawn_s3::DawnS3Tool;
 pub use zeroclaw_tools::discord_search::DiscordSearchTool;
 pub use zeroclaw_tools::escalate::EscalateToHumanTool;
@@ -773,6 +774,12 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(RateLimitedTool::new(
         PathGuardedTool::new(ImageInfoTool::new(security.clone()), security.clone()),
+        security.clone(),
+    )));
+
+    // Excel tool - always available for spreadsheet operations
+    tool_arcs.push(Arc::new(RateLimitedTool::new(
+        PathGuardedTool::new(ExcelTool::new(security.clone(), workspace_dir.to_path_buf()), security.clone()),
         security.clone(),
     )));
 
