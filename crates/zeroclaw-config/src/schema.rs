@@ -1947,6 +1947,10 @@ pub struct SkillsHotReloadConfig {
     pub poll_interval_secs: u64,
 }
 
+impl HasPropKind for SkillsHotReloadConfig {
+    const PROP_KIND: PropKind = PropKind::Object;
+}
+
 impl Default for SkillsHotReloadConfig {
     fn default() -> Self {
         Self {
