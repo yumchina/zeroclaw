@@ -4,7 +4,7 @@
 //! with fallback to polling mode when notify is unavailable.
 
 use anyhow::{Context, Result};
-use notify::{RecursiveMode, Watcher, recommended_watcher, Event, EventKind};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher, Event, EventKind, Config};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -109,7 +109,7 @@ async fn run_notify_watcher(
     let (event_tx, mut event_rx) = mpsc::channel(32);
     let event_tx = Arc::new(Mutex::new(event_tx));
 
-    let mut watcher = recommended_watcher(move |res: Result<Event, _>| {
+    let mut watcher = RecommendedWatcher::new(move |res: Result<Event, _>| {
         if let Ok(event) = res {
             // Filter for relevant event kinds (create, modify, remove)
             if matches!(
@@ -121,7 +121,7 @@ async fn run_notify_watcher(
                 }
             }
         }
-    })
+    }, Config::default())
     .context("Failed to create file watcher")?;
 
     // Watch the skills directory

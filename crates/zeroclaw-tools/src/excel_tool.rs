@@ -4,6 +4,7 @@
 //! - rust_xlsxwriter: write formatted .xlsx reports
 
 use async_trait::async_trait;
+use calamine::Reader;
 use serde_json::json;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,6 +18,7 @@ const MAX_EXPORT_ROWS: usize = 100_000;
 
 pub struct ExcelTool {
     security: Arc<SecurityPolicy>,
+    #[expect(dead_code)] // Reserved for future relative path resolution
     workspace_dir: PathBuf,
 }
 
@@ -60,7 +62,24 @@ impl Tool for ExcelTool {
                 },
                 "data": {
                     "type": "array",
-                    "description": "Data array for export (array of arrays)"
+                    "description": "Data array for export (array of rows, each row is an array of cell values)",
+                    "items": {
+                        "type": "array",
+                        "description": "A single row of cell values",
+                        "items": {
+                            "oneOf": [
+                                {"type": "string"},
+                                {"type": "number"},
+                                {"type": "boolean"},
+                                {"type": "null"}
+                            ]
+                        }
+                    }
+                },
+                "header": {
+                    "type": "array",
+                    "description": "Header row for export (array of column names)",
+                    "items": {"type": "string"}
                 },
                 "title": {
                     "type": "string",
@@ -68,7 +87,35 @@ impl Tool for ExcelTool {
                 },
                 "sections": {
                     "type": "array",
-                    "description": "Report sections with title and data"
+                    "description": "Report sections with title and data",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "title": {"type": "string"},
+                            "data": {
+                                "type": "array",
+                                "items": {
+                                    "type": "array",
+                                    "items": {
+                                        "oneOf": [
+                                            {"type": "string"},
+                                            {"type": "number"},
+                                            {"type": "boolean"},
+                                            {"type": "null"}
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                "range": {
+                    "type": "string",
+                    "description": "Cell range for import (e.g., 'A1:Z100')"
+                },
+                "has_header": {
+                    "type": "boolean",
+                    "description": "Whether first row is header (default: true)"
                 }
             }
         })
@@ -119,7 +166,7 @@ impl ExcelTool {
         // Canonicalize the path for security checks
         let resolved_path = match tokio::fs::canonicalize(&full_path).await {
             Ok(p) => p,
-            Err(e) => {
+            Err(_e) => {
                 let _ = self.security.record_action();
                 return Ok(ToolResult {
                     success: false,
@@ -148,7 +195,7 @@ impl ExcelTool {
         // 检查文件存在和大小
         let metadata = match tokio::fs::metadata(&resolved_path).await {
             Ok(m) => m,
-            Err(e) => {
+            Err(_e) => {
                 let _ = self.security.record_action();
                 return Ok(ToolResult {
                     success: false,
@@ -177,12 +224,12 @@ impl ExcelTool {
         }
 
         // 使用 calamine 读取 Excel 文件
-        let mut workbook: calamine::Sheets<calamine::Data<_>> =
-            calamine::open_workbook(&resolved_path)
+        let mut workbook: calamine::Sheets<_> =
+            calamine::open_workbook_auto(&resolved_path)
                 .map_err(|e| anyhow::anyhow!("Failed to open workbook: {e}"))?;
 
         // 检查工作表是否为空
-        let sheet_names = workbook.sheet_names();
+        let sheet_names = workbook.sheet_names().to_vec();
         if sheet_names.is_empty() {
             return Ok(ToolResult {
                 success: false,
@@ -239,7 +286,7 @@ impl ExcelTool {
                     calamine::Data::Bool(b) => row_data.push(json!(b)),
                     calamine::Data::DateTime(dt) => row_data.push(json!(dt.to_string())),
                     calamine::Data::DateTimeIso(s) => row_data.push(json!(s)),
-                    calamine::Data::DurationMs(d) => row_data.push(json!(d)),
+                    calamine::Data::DurationIso(d) => row_data.push(json!(d)),
                     calamine::Data::Error(e) => row_data.push(json!(format!("ERROR: {e}"))),
                 }
             }
@@ -338,18 +385,19 @@ impl ExcelTool {
         let mut workbook = rust_xlsxwriter::Workbook::new();
 
         // 添加工作表
-        let worksheet = workbook.add_worksheet().set_name(sheet_name)
+        let worksheet = workbook.add_worksheet();
+        worksheet.set_name(sheet_name)
             .map_err(|e| anyhow::anyhow!("Failed to create worksheet: {e}"))?;
 
         // 创建格式
-        let mut header_format = rust_xlsxwriter::Format::new();
-        header_format.set_bold(true);
-        header_format.set_font_color(rust_xlsxwriter::Color::RGB(0xFFFFFF));
-        header_format.set_background_color(rust_xlsxwriter::Color::RGB(0x4472C4));
-        header_format.set_align(rust_xlsxwriter::FormatAlign::Center);
+        let header_format = rust_xlsxwriter::Format::new()
+            .set_bold()
+            .set_font_color(rust_xlsxwriter::Color::RGB(0xFFFFFF))
+            .set_background_color(rust_xlsxwriter::Color::RGB(0x4472C4))
+            .set_align(rust_xlsxwriter::FormatAlign::Center);
 
-        let mut data_format = rust_xlsxwriter::Format::new();
-        data_format.set_align(rust_xlsxwriter::FormatAlign::Left);
+        let data_format = rust_xlsxwriter::Format::new()
+            .set_align(rust_xlsxwriter::FormatAlign::Left);
 
         // 写入数据
         let mut row_num: u32 = 0;
@@ -360,7 +408,7 @@ impl ExcelTool {
             for (col_idx, value) in header_row.iter().enumerate() {
                 let cell_value = value.as_str().unwrap_or("");
                 worksheet
-                    .write_string(row_num, col_idx as u16, cell_value, &header_format)
+                    .write_with_format(row_num, col_idx as u16, cell_value, &header_format)
                     .map_err(|e| anyhow::anyhow!("Failed to write header: {e}"))?;
             }
             row_num += 1;
@@ -374,28 +422,28 @@ impl ExcelTool {
 
                     match value {
                         serde_json::Value::Null => {
-                            worksheet.write_blank(row_num, col_num, &data_format)
+                            worksheet.write_with_format(row_num, col_num, "", &data_format)
                                 .map_err(|e| anyhow::anyhow!("Failed to write cell: {e}"))?;
                         }
                         serde_json::Value::Bool(b) => {
-                            worksheet.write_boolean(row_num, col_num, *b, &data_format)
+                            worksheet.write_with_format(row_num, col_num, *b, &data_format)
                                 .map_err(|e| anyhow::anyhow!("Failed to write cell: {e}"))?;
                         }
                         serde_json::Value::Number(n) => {
                             if let Some(i) = n.as_i64() {
-                                worksheet.write_number(row_num, col_num, i as f64, &data_format)
+                                worksheet.write_with_format(row_num, col_num, i as f64, &data_format)
                                     .map_err(|e| anyhow::anyhow!("Failed to write cell: {e}"))?;
                             } else if let Some(f) = n.as_f64() {
-                                worksheet.write_number(row_num, col_num, f, &data_format)
+                                worksheet.write_with_format(row_num, col_num, f, &data_format)
                                     .map_err(|e| anyhow::anyhow!("Failed to write cell: {e}"))?;
                             }
                         }
                         serde_json::Value::String(s) => {
-                            worksheet.write_string(row_num, col_num, s, &data_format)
+                            worksheet.write_with_format(row_num, col_num, s, &data_format)
                                 .map_err(|e| anyhow::anyhow!("Failed to write cell: {e}"))?;
                         }
                         _ => {
-                            worksheet.write_string(row_num, col_num, &value.to_string(), &data_format)
+                            worksheet.write_with_format(row_num, col_num, value.to_string(), &data_format)
                                 .map_err(|e| anyhow::anyhow!("Failed to write cell: {e}"))?;
                         }
                     }
@@ -489,34 +537,33 @@ impl ExcelTool {
         }
 
         let mut workbook = rust_xlsxwriter::Workbook::new();
-        let worksheet = workbook.add_worksheet()
-            .map_err(|e| anyhow::anyhow!("Failed to create worksheet: {e}"))?;
+        let worksheet = workbook.add_worksheet();
 
         // 创建格式
-        let mut title_format = rust_xlsxwriter::Format::new();
-        title_format.set_font_size(18);
-        title_format.set_bold(true);
-        title_format.set_font_color(rust_xlsxwriter::Color::RGB(0x0000FF));
-        title_format.set_align(rust_xlsxwriter::FormatAlign::Center);
+        let title_format = rust_xlsxwriter::Format::new()
+            .set_font_size(18)
+            .set_bold()
+            .set_font_color(rust_xlsxwriter::Color::RGB(0x0000FF))
+            .set_align(rust_xlsxwriter::FormatAlign::Center);
 
-        let mut heading_format = rust_xlsxwriter::Format::new();
-        heading_format.set_font_size(12);
-        heading_format.set_bold(true);
-        heading_format.set_align(rust_xlsxwriter::FormatAlign::Left);
+        let heading_format = rust_xlsxwriter::Format::new()
+            .set_font_size(12)
+            .set_bold()
+            .set_align(rust_xlsxwriter::FormatAlign::Left);
 
-        let mut data_format = rust_xlsxwriter::Format::new();
-        data_format.set_font_size(10);
-        data_format.set_align(rust_xlsxwriter::FormatAlign::Left);
+        let data_format = rust_xlsxwriter::Format::new()
+            .set_font_size(10)
+            .set_align(rust_xlsxwriter::FormatAlign::Left);
 
         let mut row_num: u32 = 0;
         let mut was_truncated = false;
 
         // 添加标题
         worksheet
-            .write_string(row_num, 0, title, &title_format)
+            .write_with_format(row_num, 0, title, &title_format)
             .map_err(|e| anyhow::anyhow!("Failed to write title: {e}"))?;
         worksheet
-            .merge_range(row_num, 0, row_num, 4, title)
+            .merge_range(row_num, 0, row_num, 4, title, &title_format)
             .map_err(|e| anyhow::anyhow!("Failed to merge title cells: {e}"))?;
         row_num += 2;
 
@@ -526,16 +573,17 @@ impl ExcelTool {
                 .as_str()
                 .unwrap_or("Section");
 
+            let empty_vec = vec![];
             let section_data = section["data"]
                 .as_array()
-                .unwrap_or(&vec![]);
+                .unwrap_or(&empty_vec);
 
             // 添加 section 标题
             worksheet
-                .write_string(row_num, 0, section_title, &heading_format)
+                .write_with_format(row_num, 0, section_title, &heading_format)
                 .map_err(|e| anyhow::anyhow!("Failed to write section title: {e}"))?;
             worksheet
-                .merge_range(row_num, 0, row_num, 4, section_title)
+                .merge_range(row_num, 0, row_num, 4, section_title, &heading_format)
                 .map_err(|e| anyhow::anyhow!("Failed to merge section cells: {e}"))?;
             row_num += 1;
 
@@ -553,28 +601,28 @@ impl ExcelTool {
 
                         match cell {
                             serde_json::Value::Null => {
-                                worksheet.write_blank(row_num, col_num, &data_format)
+                                worksheet.write_with_format(row_num, col_num, "", &data_format)
                                     .map_err(|e| anyhow::anyhow!("Failed to write cell: {e}"))?;
                             }
                             serde_json::Value::String(s) => {
-                                worksheet.write_string(row_num, col_num, s, &data_format)
+                                worksheet.write_with_format(row_num, col_num, s, &data_format)
                                     .map_err(|e| anyhow::anyhow!("Failed to write cell: {e}"))?;
                             }
                             serde_json::Value::Number(n) => {
                                 if let Some(i) = n.as_i64() {
-                                    worksheet.write_number(row_num, col_num, i as f64, &data_format)
+                                    worksheet.write_with_format(row_num, col_num, i as f64, &data_format)
                                         .map_err(|e| anyhow::anyhow!("Failed to write cell: {e}"))?;
                                 } else if let Some(f) = n.as_f64() {
-                                    worksheet.write_number(row_num, col_num, f, &data_format)
+                                    worksheet.write_with_format(row_num, col_num, f, &data_format)
                                         .map_err(|e| anyhow::anyhow!("Failed to write cell: {e}"))?;
                                 }
                             }
                             serde_json::Value::Bool(b) => {
-                                worksheet.write_boolean(row_num, col_num, *b, &data_format)
+                                worksheet.write_with_format(row_num, col_num, *b, &data_format)
                                     .map_err(|e| anyhow::anyhow!("Failed to write cell: {e}"))?;
                             }
                             _ => {
-                                worksheet.write_string(row_num, col_num, &cell.to_string(), &data_format)
+                                worksheet.write_with_format(row_num, col_num, cell.to_string(), &data_format)
                                     .map_err(|e| anyhow::anyhow!("Failed to write cell: {e}"))?;
                             }
                         }
@@ -626,7 +674,7 @@ impl ExcelTool {
             .ok_or_else(|| anyhow::anyhow!("file_path is required"))?;
 
         // 解析并验证文件路径
-        let full_path = self.security.resolve_tool_path(file_path)?;
+        let full_path = self.security.resolve_tool_path(file_path);
         if !self.security.is_resolved_path_allowed(&full_path) {
             let _ = self.security.record_action();
             return Ok(ToolResult {
@@ -639,7 +687,7 @@ impl ExcelTool {
         // 检查文件存在和大小
         let metadata = match tokio::fs::metadata(&full_path).await {
             Ok(m) => m,
-            Err(e) => {
+            Err(_e) => {
                 let _ = self.security.record_action();
                 return Ok(ToolResult {
                     success: false,
@@ -665,8 +713,8 @@ impl ExcelTool {
         }
 
         // 尝试打开工作簿验证格式
-        let _workbook: calamine::Sheets<calamine::Data<_>> =
-            match calamine::open_workbook(&full_path) {
+        let _workbook: calamine::Sheets<_> =
+            match calamine::open_workbook_auto(&full_path) {
                 Ok(wb) => wb,
                 Err(e) => {
                     let _ = self.security.record_action();
@@ -703,7 +751,7 @@ impl ExcelTool {
             .ok_or_else(|| anyhow::anyhow!("file_path is required"))?;
 
         // 解析并验证文件路径
-        let full_path = self.security.resolve_tool_path(file_path)?;
+        let full_path = self.security.resolve_tool_path(file_path);
         if !self.security.is_resolved_path_allowed(&full_path) {
             let _ = self.security.record_action();
             return Ok(ToolResult {
@@ -730,8 +778,8 @@ impl ExcelTool {
         };
 
         // 打开工作簿获取信息
-        let workbook: calamine::Sheets<calamine::Data<_>> =
-            match calamine::open_workbook(&full_path) {
+        let mut workbook: calamine::Sheets<_> =
+            match calamine::open_workbook_auto(&full_path) {
                 Ok(wb) => wb,
                 Err(e) => {
                     let _ = self.security.record_action();
@@ -745,7 +793,7 @@ impl ExcelTool {
                 }
             };
 
-        let sheet_names = workbook.sheet_names();
+        let sheet_names = workbook.sheet_names().to_vec();
         let mut sheet_info = Vec::new();
 
         for sheet_name in &sheet_names {
@@ -778,9 +826,12 @@ mod tests {
     use zeroclaw_config::autonomy::AutonomyLevel;
 
     fn test_security() -> Arc<SecurityPolicy> {
+        let temp_dir = std::env::temp_dir();
         Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Full,
-            workspace_dir: std::env::temp_dir(),
+            workspace_dir: temp_dir.clone(),
+            workspace_only: false,
+            allowed_roots: vec![temp_dir],
             ..SecurityPolicy::default()
         })
     }
@@ -812,7 +863,7 @@ mod tests {
         // 创建测试文件
         let test_file = std::env::temp_dir().join("test_import.xlsx");
         let mut workbook = rust_xlsxwriter::Workbook::new();
-        let worksheet = workbook.add_worksheet().unwrap();
+        let worksheet = workbook.add_worksheet();
         worksheet.write_string(0, 0, "Name").unwrap();
         worksheet.write_string(0, 1, "Age").unwrap();
         worksheet.write_string(1, 0, "Alice").unwrap();
@@ -871,9 +922,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(result.success);
+        if !result.success {
+            eprintln!("Error: {:?}", result.error);
+        }
+        assert!(result.success, "export failed: {:?}", result.error);
         let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
-        assert_eq!(output["rows_written"], 2);
+        assert_eq!(output["rows_written"], 3); // 1 header + 2 data rows
 
         // 验证文件存在
         let full_path = std::env::temp_dir().join(test_file);
@@ -920,8 +974,8 @@ mod tests {
 
         // 创建测试文件
         let test_file = std::env::temp_dir().join("test_validate.xlsx");
-        let workbook = rust_xlsxwriter::Workbook::new();
-        workbook.add_worksheet().unwrap();
+        let mut workbook = rust_xlsxwriter::Workbook::new();
+        workbook.add_worksheet();
         workbook.save(&test_file).unwrap();
 
         let result = tool
@@ -947,7 +1001,7 @@ mod tests {
         // 创建测试文件
         let test_file = std::env::temp_dir().join("test_info.xlsx");
         let mut workbook = rust_xlsxwriter::Workbook::new();
-        let worksheet = workbook.add_worksheet().unwrap();
+        let worksheet = workbook.add_worksheet();
         worksheet.write_string(0, 0, "Test").unwrap();
         worksheet.write_string(1, 0, "Data").unwrap();
         workbook.save(&test_file).unwrap();
@@ -963,7 +1017,7 @@ mod tests {
         assert!(result.success);
         let output: serde_json::Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(output["sheet_count"], 1);
-        assert!(output["sheets"].as_array().unwrap()[0]["rows"] >= 2);
+        assert!(output["sheets"].as_array().unwrap()[0]["rows"].as_u64().unwrap() >= 2);
 
         // 清理
         let _ = std::fs::remove_file(&test_file);

@@ -45,6 +45,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 use uuid::Uuid;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_api::provider::StreamEvent;
@@ -2632,7 +2633,7 @@ pub async fn run(
 
                 let task = tokio::spawn(async move {
                     while let Some(req) = reload_rx.recv().await {
-                        tracing::info!("Received skill reload request (force={})", req.force);
+                        info!("Received skill reload request (force={})", req.force);
 
                         // Reload skills from disk
                         let new_skills = crate::skills::load_skills_with_config(
@@ -2650,7 +2651,7 @@ pub async fn run(
                             tools
                         });
 
-                        tracing::info!("Skills reloaded, new version: {}", new_version);
+                        info!("Skills reloaded, new version: {}", new_version);
                     }
                 });
 

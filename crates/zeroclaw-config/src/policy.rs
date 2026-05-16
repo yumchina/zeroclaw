@@ -1095,6 +1095,7 @@ impl SecurityPolicy {
     /// - Blocks dangerous arguments (e.g. `find -exec`, `git config`)
     pub fn is_command_allowed(&self, command: &str) -> bool {
         if self.autonomy == AutonomyLevel::ReadOnly {
+            tracing::warn!("[policy] Command blocked: ReadOnly mode, command: {}", command);
             return false;
         }
 
@@ -1117,6 +1118,7 @@ impl SecurityPolicy {
             || command.contains("<(")
             || command.contains(">(")
         {
+            tracing::warn!("[policy] Command blocked: subshell/expansion operators, command: {}", command);
             return false;
         }
 
@@ -1125,9 +1127,11 @@ impl SecurityPolicy {
         //   - `2>&1`, `1>&2` (fd merging)
         //   - `<<` heredocs, `<<<` here-strings (input literals)
         if contains_unsafe_output_redirect(command) {
+            tracing::warn!("[policy] Command blocked: unsafe output redirect, command: {}", command);
             return false;
         }
         if contains_unquoted_input_redirect(command) {
+            tracing::warn!("[policy] Command blocked: unsafe input redirect, command: {}", command);
             return false;
         }
 
@@ -1177,6 +1181,13 @@ impl SecurityPolicy {
                 .iter()
                 .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd))
             {
+                tracing::warn!(
+                    "[policy] Command blocked: '{}' not in allowlist (segment: '{}', full command: '{}')",
+                    base_cmd,
+                    segment,
+                    command
+                );
+                tracing::warn!("[policy] Allowed commands: {:?}", self.allowed_commands);
                 return false;
             }
 
@@ -1187,6 +1198,12 @@ impl SecurityPolicy {
             let args_cased: Vec<String> = words.map(|w| w.to_string()).collect();
             let args: Vec<String> = args_cased.iter().map(|w| w.to_ascii_lowercase()).collect();
             if !self.is_args_safe(base_cmd, &args, &args_cased) {
+                tracing::warn!(
+                    "[policy] Command blocked: unsafe args for '{}' (args: {:?}, segment: '{}')",
+                    base_cmd,
+                    args,
+                    segment
+                );
                 return false;
             }
         }
