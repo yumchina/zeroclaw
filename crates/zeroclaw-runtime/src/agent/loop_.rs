@@ -33,7 +33,7 @@ use crate::cost::types::BudgetCheck;
 use crate::observability::{self, Observer, ObserverEvent, runtime_trace};
 use crate::platform;
 use crate::security::{AutonomyLevel, SecurityPolicy};
-use crate::tools::{self, Tool, ToolRegistryManager};
+use crate::tools::{self, Tool};
 use crate::util::truncate_with_ellipsis;
 use anyhow::Result;
 use futures_util::StreamExt;
@@ -2218,7 +2218,8 @@ pub async fn run(
         &config.workspace_dir,
     ));
 
-    let fallback_provider_loop = config.providers.fallback_provider();
+    let fallback_provider_loop = config.providers.fallback_provider()
+        .cloned();
 
     // ── Memory (the brain) ────────────────────────────────────────
     let mem: Arc<dyn Memory> = Arc::from(zeroclaw_memory::create_memory_with_storage_and_routes(
@@ -2226,7 +2227,7 @@ pub async fn run(
         &config.providers.embedding_routes,
         Some(&config.storage.provider.config),
         &config.workspace_dir,
-        fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
+        fallback_provider_loop.as_ref().and_then(|e| e.api_key.as_deref()),
     )?);
     tracing::info!(backend = mem.name(), "Memory initialized");
 
@@ -2266,7 +2267,7 @@ pub async fn run(
         &config.web_fetch,
         &config.workspace_dir,
         &config.agents,
-        fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
+        fallback_provider_loop.as_ref().and_then(|e| e.api_key.as_deref()),
         &config,
         None,
     );
@@ -2281,9 +2282,6 @@ pub async fn run(
         tools_registry.extend(peripheral_tools);
     }
 
-    // ── Wrap tools in ToolRegistryManager for hot reload support ─────
-    let tools_mgr = std::sync::Arc::new(tools::ToolRegistryManager::new(tools_registry));
-
     // ── Capability-based tool access control ─────────────────────
     // When `allowed_tools` is `Some(list)`, restrict the tool registry to only
     // those tools whose name appears in the list. Unknown names are silently
@@ -2295,11 +2293,12 @@ pub async fn run(
             allowed = allow_list.len(),
             "Capability-based tool access filter specified"
         );
-    }
+        let original_len = tools_registry.len();
         tools_registry.retain(|t| allow_list.iter().any(|name| name == t.name()));
         tracing::info!(
             allowed = allow_list.len(),
             retained = tools_registry.len(),
+            filtered_out = original_len - tools_registry.len(),
             "Applied capability-based tool access filter"
         );
     }
@@ -2387,7 +2386,7 @@ pub async fn run(
 
     let mut model_name = model_override
         .as_deref()
-        .or(fallback_provider_loop.and_then(|e| e.model.as_deref()))
+        .or(fallback_provider_loop.as_ref().and_then(|e| e.model.as_deref()))
         .unwrap_or("anthropic/claude-sonnet-4")
         .to_string();
 
@@ -2396,8 +2395,8 @@ pub async fn run(
 
     let mut provider: Box<dyn Provider> = zeroclaw_providers::create_routed_provider_with_options(
         &provider_name,
-        fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
-        fallback_provider_loop.and_then(|e| e.base_url.as_deref()),
+        fallback_provider_loop.as_ref().and_then(|e| e.api_key.as_deref()),
+        fallback_provider_loop.as_ref().and_then(|e| e.base_url.as_deref()),
         &config.reliability,
         &config.providers.model_routes,
         &model_name,
@@ -2442,11 +2441,6 @@ pub async fn run(
 
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
-
-    // Register skill-defined tools via ToolRegistryManager atomic swap
-    let mut tools_with_skills = tools_mgr.get_current().to_vec();
-    tools::register_skill_tools(&mut tools_with_skills, &skills, security.clone());
-    tools_mgr.atomic_swap(tools_with_skills);
 
     let mut tool_descs: Vec<(&str, &str)> = vec![
         (
@@ -2591,6 +2585,15 @@ pub async fn run(
         system_prompt.push_str(&build_tool_instructions(&tools_registry));
     }
 
+    // ── Wrap tools in ToolRegistryManager for hot reload support ─────
+    let tools_mgr = std::sync::Arc::new(tools::ToolRegistryManager::new(tools_registry));
+
+    // ── Register skill-defined tools via ToolRegistryManager atomic swap
+    tools_mgr.modify(|mut tools| {
+        tools::register_skill_tools(&mut tools, &skills, security.clone());
+        tools
+    });
+
     // Append deferred MCP tool names so the LLM knows what is available
     if !deferred_section.is_empty() {
         system_prompt.push('\n');
@@ -2614,39 +2617,40 @@ pub async fn run(
     });
 
     // ── Skill hot reload watcher (if enabled) ─────────────────────
-    let reload_task = if config.skills.hot_reload.enabled {
+    let _reload_task = if config.skills.hot_reload.enabled {
         let watcher_config = crate::skills::WatcherConfig::from_config(
             config.workspace_dir.join("skills"),
             &config.skills.hot_reload,
         );
 
         match crate::skills::spawn_skill_watcher(watcher_config) {
-            Ok((handle, mut reload_rx)) => {
+            Ok((_handle, mut reload_rx)) => {
                 let tools_mgr_for_task = std::sync::Arc::clone(&tools_mgr);
                 let config_dir = config.workspace_dir.clone();
+                let config_for_task = config.clone();
                 let security_for_task = security.clone();
 
                 let task = tokio::spawn(async move {
                     while let Some(req) = reload_rx.recv().await {
-                        info!("Received skill reload request (force={})", req.force);
+                        tracing::info!("Received skill reload request (force={})", req.force);
 
                         // Reload skills from disk
                         let new_skills = crate::skills::load_skills_with_config(
                             &config_dir,
-                            &config,
+                            &config_for_task,
                         );
 
-                        // Get current tools and add skill tools
-                        let mut new_tools = tools_mgr_for_task.get_current().to_vec();
-                        crate::tools::register_skill_tools(
-                            &mut new_tools,
-                            &new_skills,
-                            security_for_task.clone(),
-                        );
+                        // Update tools with new skill tools
+                        let new_version = tools_mgr_for_task.modify(|mut tools| {
+                            crate::tools::register_skill_tools(
+                                &mut tools,
+                                &new_skills,
+                                security_for_task.clone(),
+                            );
+                            tools
+                        });
 
-                        // Atomic swap
-                        let new_version = tools_mgr_for_task.atomic_swap(new_tools);
-                        info!("Skills reloaded, new version: {}", new_version);
+                        tracing::info!("Skills reloaded, new version: {}", new_version);
                     }
                 });
 
@@ -2758,7 +2762,7 @@ pub async fn run(
 
         // Compute per-turn excluded MCP tools from tool_filter_groups.
         let excluded_tools = compute_excluded_mcp_tools(
-            &tools_registry,
+            &tools_mgr.get_current(),
             &config.agent.tool_filter_groups,
             &effective_msg,
         );
@@ -2772,7 +2776,7 @@ pub async fn run(
                     run_tool_call_loop(
                         provider.as_ref(),
                         &mut history,
-                        &tools_registry,
+                        &tools_mgr.get_current(),
                         observer.as_ref(),
                         &provider_name,
                         &model_name,
@@ -2817,8 +2821,8 @@ pub async fn run(
 
                         provider = zeroclaw_providers::create_routed_provider_with_options(
                             &new_provider,
-                            fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
-                            fallback_provider_loop.and_then(|e| e.base_url.as_deref()),
+                            fallback_provider_loop.as_ref().and_then(|e| e.api_key.as_deref()),
+                            fallback_provider_loop.as_ref().and_then(|e| e.base_url.as_deref()),
                             &config.reliability,
                             &config.providers.model_routes,
                             &new_model,
@@ -3037,7 +3041,7 @@ pub async fn run(
 
             // Compute per-turn excluded MCP tools from tool_filter_groups.
             let excluded_tools = compute_excluded_mcp_tools(
-                &tools_registry,
+                &tools_mgr.get_current(),
                 &config.agent.tool_filter_groups,
                 &effective_input,
             );
@@ -3087,7 +3091,7 @@ pub async fn run(
                         run_tool_call_loop(
                             provider.as_ref(),
                             &mut history,
-                            &tools_registry,
+                            &tools_mgr.get_current(),
                             observer.as_ref(),
                             &provider_name,
                             &model_name,
@@ -3133,8 +3137,8 @@ pub async fn run(
 
                             provider = zeroclaw_providers::create_routed_provider_with_options(
                                 &new_provider,
-                                fallback_provider_loop.and_then(|e| e.api_key.as_deref()),
-                                fallback_provider_loop.and_then(|e| e.base_url.as_deref()),
+                                fallback_provider_loop.as_ref().and_then(|e| e.api_key.as_deref()),
+                                fallback_provider_loop.as_ref().and_then(|e| e.base_url.as_deref()),
                                 &config.reliability,
                                 &config.providers.model_routes,
                                 &new_model,

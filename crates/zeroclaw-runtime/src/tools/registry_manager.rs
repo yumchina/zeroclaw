@@ -4,9 +4,9 @@
 //! allowing atomic replacement without locking. Agent sessions clone
 //! the Arc and naturally observe new tools after a swap.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicU64, Ordering};
-use zeroclaw_api::Tool;
+use crate::tools::Tool;
 
 /// Thread-safe tool registry with atomic swap capability.
 ///
@@ -18,7 +18,7 @@ use zeroclaw_api::Tool;
 /// ```
 pub struct ToolRegistryManager {
     /// The current tool registry. Wrapped in Arc for cheap cloning.
-    inner: Arc<Vec<Box<dyn Tool>>>,
+    inner: Mutex<Arc<Vec<Box<dyn Tool>>>>,
 
     /// Monotonically increasing version number for each swap.
     /// Useful for debugging and event logging.
@@ -30,7 +30,7 @@ impl ToolRegistryManager {
     pub fn new(tools: Vec<Box<dyn Tool>>) -> Self {
         tracing::info!("Creating ToolRegistryManager with {} tools, version 1", tools.len());
         Self {
-            inner: Arc::new(tools),
+            inner: Mutex::new(Arc::new(tools)),
             version: AtomicU64::new(1),
         }
     }
@@ -41,15 +41,13 @@ impl ToolRegistryManager {
     /// until all holders drop them.
     pub fn atomic_swap(&self, new_tools: Vec<Box<dyn Tool>>) -> u64 {
         let new_arc = Arc::new(new_tools);
-        // SAFETY: This is a lock-free atomic swap of Arc pointers.
-        // The old Arc is returned and will be dropped when all references are released.
-        let old_arc = std::mem::replace(&mut self.inner, new_arc);
+        let old_arc = std::mem::replace(&mut *self.inner.lock().unwrap(), new_arc);
         let new_version = self.version.fetch_add(1, Ordering::SeqCst) + 1;
 
         tracing::info!(
             "Tool registry swapped: version {}, {} tools, {} old refs pending drop",
             new_version,
-            self.inner.len(),
+            self.inner.lock().unwrap().len(),
             Arc::strong_count(&old_arc)
         );
 
@@ -61,7 +59,7 @@ impl ToolRegistryManager {
     /// This is a cheap pointer-sized clone. The returned Arc can be
     /// freely passed between threads/tasks.
     pub fn get_current(&self) -> Arc<Vec<Box<dyn Tool>>> {
-        Arc::clone(&self.inner)
+        Arc::clone(&self.inner.lock().unwrap())
     }
 
     /// Get the current version number.
@@ -71,12 +69,40 @@ impl ToolRegistryManager {
 
     /// Get the current number of tools.
     pub fn len(&self) -> usize {
-        self.inner.len()
+        self.inner.lock().unwrap().len()
     }
 
     /// Check if the registry is empty.
     pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+        self.inner.lock().unwrap().is_empty()
+    }
+
+    /// Execute a function with mutable access to the tools, then atomically swap.
+    ///
+    /// This is useful for hot reload where you need to modify the tool list
+    /// without having to clone individual tools.
+    ///
+    /// The function receives the current tools Vec and returns a new Vec.
+    pub fn modify<F>(&self, f: F) -> u64
+    where
+        F: FnOnce(Vec<Box<dyn Tool>>) -> Vec<Box<dyn Tool>>,
+    {
+        let mut guard = self.inner.lock().unwrap();
+        let current = std::mem::replace(&mut *guard, Arc::new(Vec::new()));
+        let tools = match Arc::try_unwrap(current) {
+            Ok(v) => v,
+            Err(_arc) => {
+                // There are other Arc references - create a new Vec
+                // Since Tool doesn't implement Clone, we start with empty Vec
+                // The caller should handle this appropriately
+                tracing::warn!("Cannot unwrap Arc (other references exist), starting with empty Vec");
+                Vec::new()
+            }
+        };
+        let new_tools = f(tools);
+        let new_version = self.version.fetch_add(1, Ordering::SeqCst) + 1;
+        *guard = Arc::new(new_tools);
+        new_version
     }
 }
 

@@ -36,6 +36,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png"]
 indicatif = "0.18"
 lru = "0.16"
 nanohtml2text = "0.2"
+notify = "7"
 parking_lot = "0.12"
 portable-atomic = "1"
 rand = "0.10"
