@@ -99,6 +99,138 @@ impl PptTool {
             error: None,
         })
     }
+
+    async fn cmd_export(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.security
+            .enforce_tool_operation(zeroclaw_config::policy::ToolOperation::Act, "ppt.export")
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let file_path = args["file_path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("file_path is required"))?;
+
+        let title = args["title"].as_str().unwrap_or("Presentation");
+
+        let slides = args["slides"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("slides array is required for export"))?;
+
+        if slides.is_empty() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("slides array cannot be empty".to_string()),
+            });
+        }
+
+        if slides.len() > MAX_SLIDES {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Too many slides: {} (max {})", slides.len(), MAX_SLIDES)),
+            });
+        }
+
+        // Resolve and validate output path
+        let full_path = self.security.resolve_tool_path(file_path);
+        if !self.security.is_resolved_path_allowed(&full_path) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(self.security.resolved_path_violation_message(&full_path)),
+            });
+        }
+
+        // Check rate limit
+        if !self.security.record_action() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
+            });
+        }
+
+        // Create PPTX using office_oxide PptxWriter
+        use office_oxide::pptx::write::PptxWriter;
+
+        let mut writer = PptxWriter::new();
+
+        for slide_data in slides {
+            let slide_title = slide_data["title"]
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("Each slide must have a title"))?;
+
+            let mut slide_builder = writer.add_slide();
+            slide_builder.set_title(slide_title);
+
+            // Add subtitle if present
+            if let Some(subtitle) = slide_data["subtitle"].as_str() {
+                slide_builder.add_text(subtitle);
+            }
+
+            // Process content items
+            if let Some(content) = slide_data["content"].as_array() {
+                for item in content {
+                    let item_type = item["type"].as_str().unwrap_or("text");
+
+                    match item_type {
+                        "text" => {
+                            if let Some(text) = item["text"].as_str() {
+                                slide_builder.add_text(text);
+                            }
+                        }
+                        "bullet_list" => {
+                            if let Some(items) = item["items"].as_array() {
+                                let bullet_items: Vec<&str> = items
+                                    .iter()
+                                    .filter_map(|i| i.as_str())
+                                    .collect();
+                                if !bullet_items.is_empty() {
+                                    slide_builder.add_bullet_list(&bullet_items);
+                                }
+                            }
+                        }
+                        "table" => {
+                            // Tables require special handling - add as text for now
+                            // Full table support requires more complex API usage
+                            if let Some(header) = item["header"].as_array() {
+                                let header_text = header
+                                    .iter()
+                                    .filter_map(|h| h.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(" | ");
+                                slide_builder.add_text(format!("Table: {}", header_text));
+                            }
+                        }
+                        "image" => {
+                            // Image insertion requires path validation and embedding
+                            // Add placeholder for now - full implementation needs more research
+                            if let Some(img_path) = item["path"].as_str() {
+                                slide_builder.add_text(format!("[Image: {}]", img_path));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Save the presentation
+        writer
+            .save(&full_path)
+            .map_err(|e| anyhow::anyhow!("Failed to save presentation: {e}"))?;
+
+        Ok(ToolResult {
+            success: true,
+            output: json!({
+                "file": file_path,
+                "title": title,
+                "slides_written": slides.len(),
+                "message": "PPTX file exported successfully"
+            }).to_string(),
+            error: None,
+        })
+    }
 }
 
 #[async_trait]
