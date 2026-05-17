@@ -354,3 +354,67 @@ impl Tool for PptTool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use zeroclaw_config::policy::SecurityPolicy;
+
+    fn create_test_tool() -> PptTool {
+        let security = Arc::new(SecurityPolicy::default());
+        let workspace = std::env::temp_dir();
+        PptTool::new(security, workspace)
+    }
+
+    #[test]
+    fn test_tool_name() {
+        let tool = create_test_tool();
+        assert_eq!(tool.name(), "ppt");
+    }
+
+    #[test]
+    fn test_tool_description() {
+        let tool = create_test_tool();
+        assert!(!tool.description().is_empty());
+    }
+
+    #[test]
+    fn test_parameters_schema_has_required_fields() {
+        let tool = create_test_tool();
+        let schema = tool.parameters_schema();
+
+        let required = schema["required"].as_array().unwrap();
+        assert!(required.contains(&serde_json::json!("command")));
+        assert!(required.contains(&serde_json::json!("file_path")));
+
+        let commands = schema["properties"]["command"]["enum"].as_array().unwrap();
+        assert!(commands.contains(&serde_json::json!("import")));
+        assert!(commands.contains(&serde_json::json!("export")));
+    }
+
+    #[tokio::test]
+    async fn test_missing_command_returns_error() {
+        let tool = create_test_tool();
+        let args = json!({
+            "file_path": "test.pptx"
+        });
+
+        let result = tool.execute(args).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("'command' parameter is required"));
+    }
+
+    #[tokio::test]
+    async fn test_unknown_command_returns_error() {
+        let tool = create_test_tool();
+        let args = json!({
+            "command": "invalid",
+            "file_path": "test.pptx"
+        });
+
+        let result = tool.execute(args).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("Unknown command"));
+    }
+}
