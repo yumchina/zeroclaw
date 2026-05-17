@@ -27,6 +27,78 @@ impl PptTool {
             workspace_dir,
         }
     }
+
+    async fn cmd_import(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.security
+            .enforce_tool_operation(zeroclaw_config::policy::ToolOperation::Read, "ppt.import")
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let file_path = args["file_path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("file_path is required"))?;
+
+        // Resolve and validate file path
+        let full_path = self.security.resolve_tool_path(file_path);
+
+        let resolved_path = match tokio::fs::canonicalize(&full_path).await {
+            Ok(p) => p,
+            Err(_) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(json!({
+                        "error": format!("File not found: {}", file_path),
+                        "suggestion": "Check the file path is correct and the file exists in workspace",
+                        "path": file_path
+                    }).to_string()),
+                });
+            }
+        };
+
+        if !self.security.is_resolved_path_allowed(&resolved_path) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(self.security.resolved_path_violation_message(&resolved_path)),
+            });
+        }
+
+        // Check file size
+        let metadata = tokio::fs::metadata(&resolved_path).await?;
+        if metadata.len() as usize > MAX_FILE_BYTES {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(json!({
+                    "error": format!("File too large: {} bytes (max {})", metadata.len(), MAX_FILE_BYTES),
+                    "suggestion": "Consider splitting the presentation into smaller parts",
+                    "size_bytes": metadata.len(),
+                    "max_bytes": MAX_FILE_BYTES
+                }).to_string()),
+            });
+        }
+
+        // Use office_oxide to read and convert to Markdown
+        let doc = office_oxide::Document::open(&resolved_path)
+            .map_err(|e| anyhow::anyhow!("Failed to open presentation: {e}"))?;
+
+        let markdown = doc.to_markdown();
+
+        // Build output with metadata
+        let format_name = doc.format_name();
+        let output = format!(
+            "# Presentation: {}\n\n**Format:** {}\n\n{}",
+            file_path,
+            format_name,
+            markdown
+        );
+
+        Ok(ToolResult {
+            success: true,
+            output,
+            error: None,
+        })
+    }
 }
 
 #[async_trait]
