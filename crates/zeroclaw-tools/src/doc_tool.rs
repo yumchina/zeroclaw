@@ -99,6 +99,152 @@ impl DocTool {
             error: None,
         })
     }
+
+    async fn cmd_export(&self, args: &serde_json::Value) -> anyhow::Result<ToolResult> {
+        self.security
+            .enforce_tool_operation(zeroclaw_config::policy::ToolOperation::Act, "doc.export")
+            .map_err(|e| anyhow::anyhow!(e))?;
+
+        let file_path = args["file_path"]
+            .as_str()
+            .ok_or_else(|| anyhow::anyhow!("file_path is required"))?;
+
+        let title = args["title"].as_str().unwrap_or("Document");
+
+        let content = args["content"]
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("content array is required for export"))?;
+
+        if content.is_empty() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("content array cannot be empty".to_string()),
+            });
+        }
+
+        if content.len() > MAX_CONTENT_ITEMS {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Too many content items: {} (max {})", content.len(), MAX_CONTENT_ITEMS)),
+            });
+        }
+
+        // Resolve and validate output path
+        let full_path = self.security.resolve_tool_path(file_path);
+        if !self.security.is_resolved_path_allowed(&full_path) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(self.security.resolved_path_violation_message(&full_path)),
+            });
+        }
+
+        // Check rate limit
+        if !self.security.record_action() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Rate limit exceeded: too many actions in the last hour".to_string()),
+            });
+        }
+
+        // Create DOCX using office_oxide DocxWriter
+        use office_oxide::docx::write::{DocxWriter, Run};
+
+        let mut writer = DocxWriter::new();
+
+        for item in content {
+            let item_type = item["type"].as_str().unwrap_or("paragraph");
+
+            match item_type {
+                "heading" => {
+                    let level = item["level"].as_u64().unwrap_or(1) as usize;
+                    let text = item["text"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("heading requires 'text' field"))?;
+                    writer.add_heading(text, level);
+                }
+                "paragraph" => {
+                    let text = item["text"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("paragraph requires 'text' field"))?;
+                    writer.add_paragraph(text);
+                }
+                "list" => {
+                    let items = item["items"]
+                        .as_array()
+                        .ok_or_else(|| anyhow::anyhow!("list requires 'items' array"))?;
+                    let list_items: Vec<&str> = items
+                        .iter()
+                        .filter_map(|i| i.as_str())
+                        .collect();
+                    let ordered = item["ordered"].as_bool().unwrap_or(false);
+                    if !list_items.is_empty() {
+                        writer.add_list(&list_items, ordered);
+                    }
+                }
+                "table" => {
+                    let header = item["header"]
+                        .as_array()
+                        .ok_or_else(|| anyhow::anyhow!("table requires 'header' array"))?;
+                    let data = item["data"]
+                        .as_array()
+                        .ok_or_else(|| anyhow::anyhow!("table requires 'data' array"))?;
+
+                    // Build table rows
+                    let header_row: Vec<String> = header
+                        .iter()
+                        .filter_map(|h| h.as_str().map(|s| s.to_string()))
+                        .collect();
+
+                    let mut table_data: Vec<Vec<String>> = vec![header_row];
+                    for row in data {
+                        let row_data: Vec<String> = row
+                            .as_array()
+                            .unwrap_or(&vec![])
+                            .iter()
+                            .map(|cell| {
+                                match cell {
+                                    serde_json::Value::String(s) => s.clone(),
+                                    serde_json::Value::Number(n) => n.to_string(),
+                                    serde_json::Value::Bool(b) => b.to_string(),
+                                    _ => String::new(),
+                                }
+                            })
+                            .collect();
+                        table_data.push(row_data);
+                    }
+
+                    // Convert to string vectors for add_table
+                    let table_rows: Vec<Vec<&str>> = table_data
+                        .iter()
+                        .map(|row| row.iter().map(|s| s.as_str()).collect())
+                        .collect();
+
+                    writer.add_table(&table_rows);
+                }
+                _ => {}
+            }
+        }
+
+        // Save the document
+        writer
+            .save(&full_path)
+            .map_err(|e| anyhow::anyhow!("Failed to save document: {e}"))?;
+
+        Ok(ToolResult {
+            success: true,
+            output: json!({
+                "file": file_path,
+                "title": title,
+                "items_written": content.len(),
+                "message": "DOCX file exported successfully"
+            }).to_string(),
+            error: None,
+        })
+    }
 }
 
 #[async_trait]
