@@ -61,6 +61,7 @@ pub use zeroclaw_tools::content_search::ContentSearchTool;
 pub use zeroclaw_tools::data_management::DataManagementTool;
 pub use zeroclaw_tools::excel_tool::ExcelTool;
 pub use zeroclaw_tools::ppt_tool::PptTool;
+pub use zeroclaw_tools::doc_tool::DocTool;
 pub use zeroclaw_tools::dawn_s3::DawnS3Tool;
 pub use zeroclaw_tools::discord_search::DiscordSearchTool;
 pub use zeroclaw_tools::escalate::EscalateToHumanTool;
@@ -790,6 +791,12 @@ pub fn all_tools_with_runtime(
     // PPT tool - always available for presentation operations
     tool_arcs.push(Arc::new(RateLimitedTool::new(
         PathGuardedTool::new(PptTool::new(security.clone(), workspace_dir.to_path_buf()), security.clone()),
+        security.clone(),
+    )));
+
+    // DOC tool - always available for document operations
+    tool_arcs.push(Arc::new(RateLimitedTool::new(
+        PathGuardedTool::new(DocTool::new(security.clone(), workspace_dir.to_path_buf()), security.clone()),
         security.clone(),
     )));
 
