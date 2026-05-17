@@ -151,7 +151,7 @@ impl DocTool {
         }
 
         // Create DOCX using office_oxide DocxWriter
-        use office_oxide::docx::write::{DocxWriter, Run};
+        use office_oxide::docx::write::DocxWriter;
 
         let mut writer = DocxWriter::new();
 
@@ -160,7 +160,7 @@ impl DocTool {
 
             match item_type {
                 "heading" => {
-                    let level = item["level"].as_u64().unwrap_or(1) as usize;
+                    let level = item["level"].as_u64().unwrap_or(1) as u8;
                     let text = item["text"]
                         .as_str()
                         .ok_or_else(|| anyhow::anyhow!("heading requires 'text' field"))?;

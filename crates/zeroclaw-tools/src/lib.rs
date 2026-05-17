@@ -22,6 +22,15 @@ pub mod data_management;
 pub mod dawn_s3;
 pub mod discord_search;
 pub mod escalate;
+<<<<<<< HEAD
+=======
+pub mod excel_tool;
+pub mod ppt_tool;
+pub mod doc_tool;
+>>>>>>> 613e3f35f (feat(tools): export doc_tool module)
+=======
+pub mod doc_tool;
+>>>>>>> resolved conflict
 pub mod file_edit;
 pub mod file_write;
 pub mod gemini_cli;
