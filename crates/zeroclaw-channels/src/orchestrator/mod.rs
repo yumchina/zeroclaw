@@ -5850,15 +5850,32 @@ pub async fn start_channels(
             "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single prompt and returns its response.",
         ));
     }
+    tracing::info!(
+        "orchestrator dawn_s3 config: enabled={}, url={}",
+        config.dawn_s3.enabled,
+        config.dawn_s3.url
+    );
+    if config.dawn_s3.enabled {
+        tool_descs.push((
+            "dawn_s3",
+            "Upload a local file to Dawn S3 compatible storage. Returns the full download URL. Use when: user needs a shareable link for generated files (reports, presentations, PDFs, etc.).",
+        ));
+        tracing::info!("orchestrator dawn_s3 added to tool_descs");
+    }
+    tracing::info!("orchestrator tool_descs before filters: {:?}", tool_descs.iter().map(|(n, _)| n).collect::<Vec<_>>());
 
     // Filter out tools excluded for non-CLI channels so the system prompt
     // does not advertise them for channel-driven runs.
     // Skip this filter when autonomy is `Full` — full-autonomy agents keep
     // all tools available regardless of channel.
     let excluded = &config.autonomy.non_cli_excluded_tools;
+    tracing::info!("orchestrator excluded tools: {:?}", excluded);
+    tracing::info!("orchestrator autonomy level: {:?}", config.autonomy.level);
     if !excluded.is_empty() && config.autonomy.level != AutonomyLevel::Full {
         tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
+        tracing::info!("orchestrator tool_descs after excluded filter: {:?}", tool_descs.iter().map(|(n, _)| n).collect::<Vec<_>>());
     }
+    tracing::info!("orchestrator tools_registry names: {:?}", tools_registry.iter().map(|t| t.name()).collect::<Vec<_>>());
     let effective_tool_names: HashSet<&str> = tools_registry
         .iter()
         .map(|tool| tool.name())
@@ -5867,7 +5884,9 @@ pub async fn start_channels(
                 || !excluded.iter().any(|excluded| excluded.as_str() == *name)
         })
         .collect();
+    tracing::info!("orchestrator effective_tool_names: {:?}", effective_tool_names);
     tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
+    tracing::info!("orchestrator tool_descs after retain: {:?}", tool_descs.iter().map(|(n, _)| n).collect::<Vec<_>>());
 
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)

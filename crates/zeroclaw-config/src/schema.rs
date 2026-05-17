@@ -1839,7 +1839,7 @@ impl HasPropKind for SkillsHotReloadConfig {
 impl Default for SkillsHotReloadConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             debounce_ms: 300,
             watch_mode: "notify".to_string(),
             poll_interval_secs: 30,
@@ -12867,6 +12867,11 @@ hooks: HooksConfig::default(),
             shell_tool: ShellToolConfig::default(),
             escalation: EscalationConfig::default(),
         };
+
+        // Serialize to TOML and deserialize back
+        let toml_str = toml::to_string(&config).unwrap();
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+
         assert_eq!(parsed.providers.fallback, config.providers.fallback);
         assert_eq!(parsed.observability.backend, "log");
         assert_eq!(parsed.observability.runtime_trace_mode, "none");
@@ -13416,6 +13421,7 @@ default_temperature = 0.7
             workspace: WorkspaceConfig::default(),
             onboard_state: OnboardStateConfig::default(),
             notion: NotionConfig::default(),
+            dawn_s3: DawnS3Config::default(),
             jira: JiraConfig::default(),
             node_transport: NodeTransportConfig::default(),
             knowledge: KnowledgeConfig::default(),

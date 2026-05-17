@@ -242,7 +242,9 @@ pub fn build_system_prompt_with_mode_and_autonomy(
     prompt.push('\n');
 
     // ── 2c. File Sharing ─────────────────────────────────────────────
+    tracing::info!("tools passed to system_prompt: {:?}", tools.iter().map(|(n, _)| n).collect::<Vec<_>>());
     let has_dawn_s3 = tools.iter().any(|(name, _)| *name == "dawn_s3");
+    tracing::info!("has_dawn_s3 check result: {}", has_dawn_s3);
     if has_dawn_s3 {
         prompt.push_str(
             "## File Sharing\n\n\

@@ -21,7 +21,10 @@ impl DawnS3Tool {
     }
 
     fn upload_url(&self) -> String {
-        format!("{}/v1/assistant/file/upload", self.endpoint.trim_end_matches('/'))
+        format!(
+            "{}/v1/assistant/file/upload",
+            self.endpoint.trim_end_matches('/')
+        )
     }
 
     async fn do_upload(
@@ -80,13 +83,10 @@ impl DawnS3Tool {
         let json: serde_json::Value = response.json().await?;
         tracing::debug!(target: "dawn_s3", "response JSON: {:?}", json);
 
-        let remote_path = json
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| {
-                tracing::error!(target: "dawn_s3", "response missing 'path' field");
-                anyhow::anyhow!("Invalid response: missing 'path' field")
-            })?;
+        let remote_path = json.get("path").and_then(|v| v.as_str()).ok_or_else(|| {
+            tracing::error!(target: "dawn_s3", "response missing 'path' field");
+            anyhow::anyhow!("Invalid response: missing 'path' field")
+        })?;
 
         let base_url = format!("{}/v1", self.endpoint.trim_end_matches('/'));
         let result = serde_json::json!({
@@ -232,7 +232,10 @@ impl Tool for DawnS3Tool {
             }
         };
 
-        match self.do_upload(&remote_path, &file_name, content, &content_type).await {
+        match self
+            .do_upload(&remote_path, &file_name, content, &content_type)
+            .await
+        {
             Ok(download_url) => {
                 tracing::info!(target: "dawn_s3", "upload completed successfully");
                 Ok(ToolResult {

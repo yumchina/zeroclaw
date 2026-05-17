@@ -83,6 +83,8 @@ fn spawn_notify_watcher(
 ) -> Result<tokio::task::JoinHandle<()>> {
     let skills_dir = config.skills_dir.clone();
 
+    info!("Spawning notify watcher for skills directory: {:?} (watch_mode: {})", skills_dir, config.watch_mode);
+
     if !skills_dir.exists() {
         warn!(
             "Skills directory does not exist: {:?}. Will retry when created.",
@@ -137,25 +139,41 @@ async fn run_notify_watcher(
         skills_dir, config.debounce_ms
     );
 
-    // Debounce loop
-    let mut last_event = Instant::now();
+    // Debounce loop: wait for a quiet period after the last event
     let debounce_duration = Duration::from_millis(config.debounce_ms);
+    let mut pending_event = false;
+    let mut last_event_time = Instant::now();
 
-    while let Some(event) = event_rx.recv().await {
-        debug!("Got file event: {:?}", event);
-
-        let now = Instant::now();
-        let elapsed = now.duration_since(last_event);
-
-        if elapsed >= debounce_duration {
-            info!("Skills directory changed, triggering reload");
-            if reload_tx.send(ReloadRequest { force: false }).await.is_err() {
-                warn!("Reload request channel closed, stopping watcher");
-                break;
+    loop {
+        tokio::select! {
+            // Receive new file event
+            event = event_rx.recv() => {
+                match event {
+                    Some(event) => {
+                        debug!("Got file event: {:?}", event);
+                        pending_event = true;
+                        last_event_time = Instant::now();
+                    }
+                    None => {
+                        warn!("Watcher event channel closed, stopping");
+                        break;
+                    }
+                }
             }
-            last_event = now;
-        } else {
-            debug!("Debouncing event ({}ms elapsed)", elapsed.as_millis());
+
+            // Debounce timer - fire after quiet period
+            _ = tokio::time::sleep(debounce_duration), if pending_event => {
+                // Check if enough time has passed since last event
+                let elapsed = Instant::now().duration_since(last_event_time);
+                if elapsed >= debounce_duration {
+                    info!("Skills directory changed, triggering reload (debounced)");
+                    if reload_tx.send(ReloadRequest { force: false }).await.is_err() {
+                        warn!("Reload request channel closed, stopping watcher");
+                        break;
+                    }
+                    pending_event = false;
+                }
+            }
         }
     }
 

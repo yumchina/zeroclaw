@@ -266,6 +266,59 @@ pub async fn run(
         tracing::info!("Cron disabled; scheduler supervisor not started");
     }
 
+    // ── Skill hot reload watcher ───────────────────────────────────────
+    tracing::info!(
+        "[DAEMON_SKILL_HOT_RELOAD] enabled={}, watch_mode={}",
+        config.skills.hot_reload.enabled,
+        config.skills.hot_reload.watch_mode
+    );
+    if config.skills.hot_reload.enabled {
+        let skills_dir = config.workspace_dir.join("skills");
+        let watcher_config = crate::skills::WatcherConfig::from_config(
+            skills_dir.clone(),
+            &config.skills.hot_reload,
+        );
+
+        tracing::info!(
+            "Watching skills directory: {} (debounce: {}ms, mode: {})",
+            skills_dir.display(),
+            watcher_config.debounce_ms,
+            watcher_config.watch_mode
+        );
+
+        // Clone reload_tx so watcher can trigger daemon reload
+        let skill_reload_tx = reload_tx.clone();
+
+        match crate::skills::spawn_skill_watcher(watcher_config) {
+            Ok((_watcher_handle, mut reload_rx)) => {
+                // When skills change, trigger daemon reload to pick up new skills.
+                // This restarts channels subsystem but preserves gateway connection.
+                let skill_reload_handler = tokio::spawn(async move {
+                    while let Some(req) = reload_rx.recv().await {
+                        tracing::info!(
+                            "🔄 Skills directory changed, triggering daemon reload to pick up new skills (force={})",
+                            req.force
+                        );
+                        // Trigger daemon reload - channels will restart with fresh skills
+                        if let Err(e) = skill_reload_tx.send(true) {
+                            tracing::warn!("Failed to send reload signal: {}", e);
+                            break;
+                        }
+                        // Only trigger once per batch of changes; subsequent events
+                        // will be processed after reload completes
+                        break;
+                    }
+                });
+                handles.push(skill_reload_handler);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to spawn skill watcher: {}", e);
+            }
+        }
+    } else {
+        tracing::info!("Skill hot reload disabled");
+    }
+
     println!("🧠 ZeroClaw daemon started");
     println!("   Gateway:  http://{host}:{port}");
     println!("   Components: gateway, channels, heartbeat, scheduler");

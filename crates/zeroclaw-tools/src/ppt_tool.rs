@@ -78,18 +78,54 @@ impl PptTool {
             });
         }
 
-        // Use office_oxide to read and convert to Markdown
-        let doc = office_oxide::Document::open(&resolved_path)
-            .map_err(|e| anyhow::anyhow!("Failed to open presentation: {e}"))?;
+        // Detect format and use appropriate API
+        let ext = resolved_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .unwrap_or_default();
 
-        let markdown = doc.to_markdown();
+        let (format_name, slide_count, markdown) = if ext == "pptx" {
+            // Use PptxDocument directly for better text extraction
+            use office_oxide::pptx::PptxDocument;
+            let pptx = PptxDocument::open(&resolved_path)
+                .map_err(|e| anyhow::anyhow!("Failed to open PPTX: {e}"))?;
+
+            let count = pptx.slides.len();
+            // Build detailed markdown per slide
+            let mut parts = Vec::new();
+            for i in 0..count {
+                if let Some(md) = pptx.slide_to_markdown(i) {
+                    if !md.is_empty() {
+                        parts.push(md);
+                    }
+                }
+            }
+            ("PPTX", count, parts.join("\n\n---\n\n"))
+        } else if ext == "ppt" {
+            // Use PptDocument for legacy PPT files
+            use office_oxide::ppt::PptDocument;
+            let ppt = PptDocument::open(&resolved_path)
+                .map_err(|e| anyhow::anyhow!("Failed to open PPT: {e}"))?;
+
+            // PPT only supports plain_text extraction
+            let text = ppt.plain_text();
+            ("PPT", 0, text)
+        } else {
+            // Fallback to generic Document API
+            let doc = office_oxide::Document::open(&resolved_path)
+                .map_err(|e| anyhow::anyhow!("Failed to open presentation: {e}"))?;
+
+            let md = doc.to_markdown();
+            ("Unknown", 0, md)
+        };
 
         // Build output with metadata
-        let format_name = doc.format();
         let output = format!(
-            "# Presentation: {}\n\n**Format:** {:?}\n\n{}",
+            "# Presentation: {}\n\n**Format:** {}\n\n**Slides:** {}\n\n{}",
             file_path,
             format_name,
+            slide_count,
             markdown
         );
 

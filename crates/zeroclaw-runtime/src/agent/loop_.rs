@@ -1090,10 +1090,27 @@ pub async fn run_tool_call_loop(
             }),
         );
 
-        // 打印完整的 LLM 请求
-        for (i, msg) in prepared_messages.messages.iter().enumerate() {
-            let content_preview = if msg.content.chars().count() > 500 {
-                truncate_with_ellipsis(&msg.content, 500)
+        // 打印 LLM 请求摘要（从最后一个 user 消息开始，避免重复打印历史）
+        let total_messages = prepared_messages.messages.len();
+        let last_user_index = prepared_messages.messages
+            .iter()
+            .enumerate()
+            .rfind(|(_, msg)| msg.role == "user")
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        tracing::info!(
+            iteration = iteration + 1,
+            total_messages = total_messages,
+            printing_from = last_user_index,
+            message_count = total_messages - last_user_index,
+            "llm.request_summary"
+        );
+
+        // 从最后一个 user 消息开始打印
+        for (i, msg) in prepared_messages.messages.iter().enumerate().skip(last_user_index) {
+            let content_preview = if msg.content.chars().count() > 1000 {
+                truncate_with_ellipsis(&msg.content, 1000)
             } else {
                 msg.content.clone()
             };
@@ -1138,7 +1155,7 @@ pub async fn run_tool_call_loop(
         let should_consume_provider_stream = on_delta.is_some()
             && provider.supports_streaming()
             && (request_tools.is_none() || provider.supports_streaming_tool_events());
-        tracing::debug!(
+        tracing::info!(
             has_on_delta = on_delta.is_some(),
             supports_streaming = provider.supports_streaming(),
             should_consume_provider_stream,
@@ -1328,12 +1345,8 @@ pub async fn run_tool_call_loop(
                     calls = fallback_calls;
                 }
 
-                // 打印 LLM 响应内容
-                let response_preview = if response_text.len() > 1000 {
-                    format!("{}...", &response_text[..1000])
-                } else {
-                    response_text.clone()
-                };
+                // 打印 LLM 响应内容（使用字符边界安全的截断）
+                let response_preview = truncate_with_ellipsis(&response_text, 1000);
                 tracing::info!(
                     iteration = iteration + 1,
                     response_text = %scrub_credentials(&response_preview),
@@ -1838,7 +1851,7 @@ pub async fn run_tool_call_loop(
                 } else {
                     format!("\u{23f3} {}: {hint}\n", tool_name)
                 };
-                tracing::debug!(tool = %tool_name, "Sending progress start to draft");
+                tracing::info!(tool = %tool_name, "Sending progress start to draft");
                 let _ = tx.send(StreamDelta::Status(progress)).await;
             }
 
@@ -1919,7 +1932,7 @@ pub async fn run_tool_call_loop(
                 } else {
                     format!("\u{274c} {} ({secs}s)\n", call.name)
                 };
-                tracing::debug!(tool = %call.name, secs, "Sending progress complete to draft");
+                tracing::info!(tool = %call.name, secs, "Sending progress complete to draft");
                 let _ = tx.send(StreamDelta::Status(progress_msg)).await;
             }
 
@@ -1982,7 +1995,7 @@ pub async fn run_tool_call_loop(
             let mut result_output = truncate_tool_result(&canonical_output, max_tool_result_chars);
             // Append HMAC receipt to tool result when receipts are enabled (#4830)
             if let Some(ref receipt) = outcome.receipt {
-                tracing::debug!(tool = %tool_name, receipt = %receipt, "Tool receipt generated");
+                tracing::info!(tool = %tool_name, receipt = %receipt, "Tool receipt generated");
                 result_output = format!("{result_output}\n\n[receipt: {receipt}]");
                 if let Some(store) = collected_receipts
                     && let Ok(mut v) = store.lock()
@@ -2560,6 +2573,12 @@ pub async fn run(
             "Query connected hardware for reported GPIO pins and LED pin. Use when: user asks what pins are available.",
         ));
     }
+    if config.dawn_s3.enabled {
+        tool_descs.push((
+            "dawn_s3",
+            "Upload a local file to Dawn S3 compatible storage. Returns the full download URL. Use when: user needs a shareable link for generated files (reports, presentations, PDFs, etc.).",
+        ));
+    }
     retain_registered_tool_descriptions(&mut tool_descs, &tools_registry);
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
@@ -2618,12 +2637,18 @@ pub async fn run(
     });
 
     // ── Skill hot reload watcher (if enabled) ─────────────────────
+    tracing::info!(
+        "[HOT_RELOAD_CHECK] enabled={}, watch_mode={}",
+        config.skills.hot_reload.enabled,
+        config.skills.hot_reload.watch_mode
+    );
     let _reload_task = if config.skills.hot_reload.enabled {
         let watcher_config = crate::skills::WatcherConfig::from_config(
             config.workspace_dir.join("skills"),
             &config.skills.hot_reload,
         );
 
+        tracing::info!("Spawning skill watcher...");
         match crate::skills::spawn_skill_watcher(watcher_config) {
             Ok((_handle, mut reload_rx)) => {
                 let tools_mgr_for_task = std::sync::Arc::clone(&tools_mgr);
@@ -2860,7 +2885,7 @@ pub async fn run(
                         tracing::info!(slug, "Auto-created skill from execution");
                     }
                     Ok(None) => {
-                        tracing::debug!("Skill creation skipped (duplicate or disabled)");
+                        tracing::info!("Skill creation skipped (duplicate or disabled)");
                     }
                     Err(e) => tracing::warn!("Skill creation failed: {e}"),
                 }
@@ -3535,6 +3560,12 @@ pub async fn process_message(
             "Query connected hardware for reported GPIO pins and LED pin. Use when user asks what pins are available.",
         ));
     }
+    if config.dawn_s3.enabled {
+        tool_descs.push((
+            "dawn_s3",
+            "Upload a local file to Dawn S3 compatible storage. Returns the full download URL. Use when: user needs a shareable link for generated files (reports, presentations, PDFs, etc.).",
+        ));
+    }
 
     // Filter out tools excluded for non-CLI channels (gateway counts as non-CLI).
     // Skip when autonomy is `Full` — full-autonomy agents keep all tools.
@@ -3557,6 +3588,7 @@ pub async fn process_message(
         })
         .collect();
     tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
+    tracing::info!("gateway tool_descs after retain: {:?}", tool_descs.iter().map(|(n, _)| n).collect::<Vec<_>>());
 
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
