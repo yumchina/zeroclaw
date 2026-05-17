@@ -85,9 +85,9 @@ impl PptTool {
         let markdown = doc.to_markdown();
 
         // Build output with metadata
-        let format_name = doc.format_name();
+        let format_name = doc.format();
         let output = format!(
-            "# Presentation: {}\n\n**Format:** {}\n\n{}",
+            "# Presentation: {}\n\n**Format:** {:?}\n\n{}",
             file_path,
             format_name,
             markdown
@@ -160,7 +160,7 @@ impl PptTool {
                 .as_str()
                 .ok_or_else(|| anyhow::anyhow!("Each slide must have a title"))?;
 
-            let mut slide_builder = writer.add_slide();
+            let slide_builder = writer.add_slide();
             slide_builder.set_title(slide_title);
 
             // Add subtitle if present
@@ -199,14 +199,14 @@ impl PptTool {
                                     .filter_map(|h| h.as_str())
                                     .collect::<Vec<_>>()
                                     .join(" | ");
-                                slide_builder.add_text(format!("Table: {}", header_text));
+                                slide_builder.add_text(&format!("Table: {}", header_text));
                             }
                         }
                         "image" => {
                             // Image insertion requires path validation and embedding
                             // Add placeholder for now - full implementation needs more research
                             if let Some(img_path) = item["path"].as_str() {
-                                slide_builder.add_text(format!("[Image: {}]", img_path));
+                                slide_builder.add_text(&format!("[Image: {}]", img_path));
                             }
                         }
                         _ => {}

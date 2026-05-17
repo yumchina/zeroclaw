@@ -22,6 +22,14 @@ pub mod data_management;
 pub mod dawn_s3;
 pub mod discord_search;
 pub mod escalate;
+<<<<<<< HEAD
+=======
+pub mod excel_tool;
+pub mod ppt_tool;
+>>>>>>> 99170becd (feat(tools): export ppt_tool module and fix compilation errors)
+=======
+pub mod ppt_tool;
+>>>>>>> resolved conflict
 pub mod file_edit;
 pub mod file_write;
 pub mod gemini_cli;
