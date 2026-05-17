@@ -41,6 +41,15 @@ tracing = { version = "0.1", default-features = false }
 urlencoding = "2.1"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 which = "8.0"
+<<<<<<< HEAD
+=======
+calamine = "0.26"
+rust_xlsxwriter = "0.82"
+office_oxide = "0.1"
+>>>>>>> aa19b81df (feat(tools): add office_oxide dependency for PPT/PPTX support)
+=======
+office_oxide = "0.1"
+>>>>>>> resolved conflict
 
 [features]
 default = []
