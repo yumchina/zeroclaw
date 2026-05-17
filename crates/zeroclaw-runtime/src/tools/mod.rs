@@ -56,6 +56,15 @@ pub use zeroclaw_tools::codex_cli::CodexCliTool;
 pub use zeroclaw_tools::composio::ComposioTool;
 pub use zeroclaw_tools::content_search::ContentSearchTool;
 pub use zeroclaw_tools::data_management::DataManagementTool;
+<<<<<<< HEAD
+=======
+pub use zeroclaw_tools::excel_tool::ExcelTool;
+pub use zeroclaw_tools::ppt_tool::PptTool;
+pub use zeroclaw_tools::doc_tool::DocTool;
+>>>>>>> 44d9f0839 (feat(runtime): register DocTool with RateLimitedTool and PathGuardedTool wrappers)
+=======
+pub use zeroclaw_tools::doc_tool::DocTool;
+>>>>>>> resolved conflict
 pub use zeroclaw_tools::dawn_s3::DawnS3Tool;
 pub use zeroclaw_tools::discord_search::DiscordSearchTool;
 pub use zeroclaw_tools::escalate::EscalateToHumanTool;
@@ -776,6 +785,35 @@ pub fn all_tools_with_runtime(
         security.clone(),
     )));
 
+<<<<<<< HEAD
+=======
+    // Excel tool - always available for spreadsheet operations
+    tool_arcs.push(Arc::new(RateLimitedTool::new(
+        PathGuardedTool::new(ExcelTool::new(security.clone(), workspace_dir.to_path_buf()), security.clone()),
+        security.clone(),
+    )));
+
+    // PPT tool - always available for presentation operations
+    tool_arcs.push(Arc::new(RateLimitedTool::new(
+        PathGuardedTool::new(PptTool::new(security.clone(), workspace_dir.to_path_buf()), security.clone()),
+        security.clone(),
+    )));
+
+    // DOC tool - always available for document operations
+    tool_arcs.push(Arc::new(RateLimitedTool::new(
+        PathGuardedTool::new(DocTool::new(security.clone(), workspace_dir.to_path_buf()), security.clone()),
+        security.clone(),
+    )));
+
+>>>>>>> 44d9f0839 (feat(runtime): register DocTool with RateLimitedTool and PathGuardedTool wrappers)
+=======
+    // DOC tool - always available for document operations
+    tool_arcs.push(Arc::new(RateLimitedTool::new(
+        PathGuardedTool::new(DocTool::new(security.clone(), workspace_dir.to_path_buf()), security.clone()),
+        security.clone(),
+    )));
+
+>>>>>>> resolved conflict
     // Session tools share the channel orchestrator's backend via the
     // `make_session_backend` factory, keyed off `[channels].session_backend`.
     // Previously the tools opened the JSONL `SessionStore` while the
