@@ -23,6 +23,7 @@ pub mod dawn_s3;
 pub mod discord_search;
 pub mod escalate;
 pub mod excel_tool;
+pub mod ppt_tool;
 pub mod file_edit;
 pub mod file_write;
 pub mod gemini_cli;
