@@ -3,9 +3,12 @@
 //! - office_oxide: read .ppt/.pptx files, write .pptx files
 
 use async_trait::async_trait;
+use quick_xml::events::Event;
 use serde_json::json;
+use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
+use zip::ZipArchive;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
 
@@ -13,6 +16,10 @@ use zeroclaw_config::policy::SecurityPolicy;
 const MAX_FILE_BYTES: usize = 50 * 1024 * 1024;
 /// Maximum slides to process or export.
 const MAX_SLIDES: usize = 200;
+/// Maximum size for a single slide XML file (5 MB).
+const MAX_SLIDE_XML_BYTES: usize = 5 * 1024 * 1024;
+/// Maximum slides to process in direct ZIP extraction.
+const MAX_DIRECT_SLIDES: usize = 200;
 
 pub struct PptTool {
     security: Arc<SecurityPolicy>,
@@ -78,18 +85,42 @@ impl PptTool {
             });
         }
 
-        // Use office_oxide to read and convert to Markdown
-        let doc = office_oxide::Document::open(&resolved_path)
-            .map_err(|e| anyhow::anyhow!("Failed to open presentation: {e}"))?;
+        // Detect format and use appropriate API
+        let ext = resolved_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase())
+            .unwrap_or_default();
 
-        let markdown = doc.to_markdown();
+        let (format_name, slide_count, markdown) = if ext == "pptx" {
+            // Workaround: office_oxide has a bug where it only reads 1 slide
+            // from PPTX files with p14:sectionLst extensions.
+            // We directly parse the ZIP file to extract text from all slides.
+            extract_pptx_slides_directly(&resolved_path)?
+        } else if ext == "ppt" {
+            // Use PptDocument for legacy PPT files
+            use office_oxide::ppt::PptDocument;
+            let ppt = PptDocument::open(&resolved_path)
+                .map_err(|e| anyhow::anyhow!("Failed to open PPT: {e}"))?;
+
+            // PPT only supports plain_text extraction
+            let text = ppt.plain_text();
+            ("PPT", 0, text)
+        } else {
+            // Fallback to generic Document API
+            let doc = office_oxide::Document::open(&resolved_path)
+                .map_err(|e| anyhow::anyhow!("Failed to open presentation: {e}"))?;
+
+            let md = doc.to_markdown();
+            ("Unknown", 0, md)
+        };
 
         // Build output with metadata
-        let format_name = doc.format();
         let output = format!(
-            "# Presentation: {}\n\n**Format:** {:?}\n\n{}",
+            "# Presentation: {}\n\n**Format:** {}\n\n**Slides:** {}\n\n{}",
             file_path,
             format_name,
+            slide_count,
             markdown
         );
 
@@ -353,6 +384,137 @@ impl Tool for PptTool {
             }),
         }
     }
+}
+
+/// Directly extract text from PPTX slides by parsing the ZIP file.
+///
+/// office_oxide's presentation.xml parser has a bug where it matches all
+/// `<XXX:sldIdLst>` elements (including p14:sectionLst), overwriting the
+/// slides list. This function directly parses the ZIP to extract text from
+/// each slide XML file.
+fn extract_pptx_slides_directly(path: &std::path::Path) -> anyhow::Result<(&'static str, usize, String)> {
+    let file = std::fs::File::open(path)?;
+    let mut archive = ZipArchive::new(file)?;
+
+    // Find all slide files (ppt/slides/slide*.xml)
+    let slide_files: Vec<(usize, String)> = archive
+        .file_names()
+        .filter(|name| {
+            let normalized = name.replace('\\', "/");
+            normalized.starts_with("ppt/slides/slide")
+                && normalized.ends_with(".xml")
+                && !normalized.contains("_rels")
+        })
+        .filter_map(|name| {
+            // Extract slide number from filename
+            let normalized = name.replace('\\', "/");
+            let num = normalized
+                .trim_start_matches("ppt/slides/slide")
+                .trim_end_matches(".xml")
+                .parse::<usize>()
+                .ok()?;
+            Some((num, normalized))
+        })
+        .collect();
+
+    // Sort by slide number
+    let mut sorted_slides = slide_files;
+    sorted_slides.sort_by_key(|(num, _)| *num);
+
+    // Limit number of slides to prevent memory exhaustion
+    let total_slides = sorted_slides.len();
+    if sorted_slides.len() > MAX_DIRECT_SLIDES {
+        tracing::warn!(
+            "PPTX has {} slides, truncating to {} for extraction",
+            total_slides,
+            MAX_DIRECT_SLIDES
+        );
+        sorted_slides.truncate(MAX_DIRECT_SLIDES);
+    }
+
+    // Extract text from each slide
+    let mut parts = Vec::new();
+    for (slide_num, zip_path) in sorted_slides {
+        let index = archive.index_for_name(&zip_path).ok_or_else(|| {
+            anyhow::anyhow!("Slide file not found: {}", zip_path)
+        })?;
+
+        let file = archive.by_index(index)?;
+
+        // Check individual XML file size
+        let file_size = file.size() as usize;
+        if file_size > MAX_SLIDE_XML_BYTES {
+            tracing::warn!(
+                "Slide {} XML too large ({} bytes), skipping",
+                slide_num,
+                file_size
+            );
+            continue;
+        }
+
+        let mut content = Vec::new();
+        // Use take() as extra protection against oversized files
+        file.take(MAX_SLIDE_XML_BYTES as u64).read_to_end(&mut content)?;
+
+        let text = extract_text_from_slide_xml(&content);
+        if !text.is_empty() {
+            parts.push(format!("## Slide {}\n\n{}", slide_num, text));
+        }
+    }
+
+    Ok(("PPTX", total_slides, parts.join("\n\n---\n\n")))
+}
+
+/// Extract text content from a slide XML file.
+///
+/// Parses DrawingML text elements (<a:t>) to extract plain text.
+fn extract_text_from_slide_xml(xml_data: &[u8]) -> String {
+    let mut reader = quick_xml::Reader::from_reader(xml_data);
+    reader.config_mut().trim_text(true);
+
+    let mut texts = Vec::new();
+    let mut in_text_elem = false;
+    let mut current_paragraph: Vec<String> = Vec::new();
+
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(ref e)) | Ok(Event::Empty(ref e)) => {
+                // <a:t> contains actual text
+                if e.local_name().as_ref() == b"t" {
+                    in_text_elem = true;
+                }
+                // <a:p> is a paragraph - we'll add a newline when we exit
+                if e.local_name().as_ref() == b"p" {
+                    current_paragraph.clear();
+                }
+            }
+            Ok(Event::End(ref e)) => {
+                if e.local_name().as_ref() == b"t" {
+                    in_text_elem = false;
+                }
+                if e.local_name().as_ref() == b"p" && !current_paragraph.is_empty() {
+                    texts.push(current_paragraph.join(" "));
+                    current_paragraph.clear();
+                }
+            }
+            Ok(Event::Text(ref t)) if in_text_elem => {
+                let text = t.decode().map(|s| s.to_string()).unwrap_or_default();
+                if !text.is_empty() {
+                    current_paragraph.push(text);
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+
+    // Add any remaining paragraph
+    if !current_paragraph.is_empty() {
+        texts.push(current_paragraph.join(" "));
+    }
+
+    texts.join("\n")
 }
 
 #[cfg(test)]
