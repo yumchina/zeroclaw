@@ -2573,12 +2573,6 @@ pub async fn run(
             "Query connected hardware for reported GPIO pins and LED pin. Use when: user asks what pins are available.",
         ));
     }
-    if config.dawn_s3.enabled {
-        tool_descs.push((
-            "dawn_s3",
-            "Upload a local file to Dawn S3 compatible storage. Returns the full download URL. Use when: user needs a shareable link for generated files (reports, presentations, PDFs, etc.).",
-        ));
-    }
     retain_registered_tool_descriptions(&mut tool_descs, &tools_registry);
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
@@ -2608,7 +2602,10 @@ pub async fn run(
     // ── Wrap tools in ToolRegistryManager for hot reload support ─────
     // Build complete tool registry including skill-defined tools
     let complete_tools = tools::build_tools_with_skills(tools_registry, &skills, security.clone());
-    let tools_mgr = std::sync::Arc::new(tools::ToolRegistryManager::new(complete_tools));
+
+    // Use global registry if available (daemon mode), otherwise create local (CLI mode)
+    let tools_mgr = tools::get_global_registry()
+        .unwrap_or_else(|| std::sync::Arc::new(tools::ToolRegistryManager::new(complete_tools)));
 
     // Append deferred MCP tool names so the LLM knows what is available
     if !deferred_section.is_empty() {
@@ -2628,17 +2625,29 @@ pub async fn run(
         if raw.is_empty() {
             None
         } else {
-            Some(format!("cli:{raw}"))
+            // Match the sanitized form persisted by memory backend migrations.
+            Some(zeroclaw_api::session_keys::sanitize_session_key(&format!(
+                "cli:{raw}"
+            )))
         }
     });
 
-    // ── Skill hot reload watcher (if enabled) ─────────────────────
-    tracing::info!(
-        "[HOT_RELOAD_CHECK] enabled={}, watch_mode={}",
-        config.skills.hot_reload.enabled,
-        config.skills.hot_reload.watch_mode
-    );
-    let _reload_task = if config.skills.hot_reload.enabled {
+    // ── Skill hot reload watcher (CLI mode only) ───────────────────
+    // In daemon mode, the watcher is managed by daemon/mod.rs as a
+    // daemon-level singleton. Only start a per-invocation watcher in
+    // CLI mode where run() is the entry point.
+    struct WatcherGuard(Vec<tokio::task::JoinHandle<()>>);
+    impl Drop for WatcherGuard {
+        fn drop(&mut self) {
+            for h in &self.0 {
+                h.abort();
+            }
+        }
+    }
+
+    let mut _watcher_guard = WatcherGuard(Vec::new());
+    let is_daemon_mode = tools::get_global_registry().is_some();
+    if !is_daemon_mode && config.skills.hot_reload.enabled {
         let watcher_config = crate::skills::WatcherConfig::from_config(
             config.workspace_dir.join("skills"),
             &config.skills.hot_reload,
@@ -2646,7 +2655,8 @@ pub async fn run(
 
         tracing::info!("Spawning skill watcher...");
         match crate::skills::spawn_skill_watcher(watcher_config) {
-            Ok((_handle, mut reload_rx)) => {
+            Ok((watcher_handle, mut reload_rx)) => {
+                _watcher_guard.0.push(watcher_handle);
                 let tools_mgr_for_task = std::sync::Arc::clone(&tools_mgr);
                 let config_dir = config.workspace_dir.clone();
                 let config_for_task = config.clone();
@@ -2720,16 +2730,13 @@ pub async fn run(
                     }
                 });
 
-                Some(task)
+                _watcher_guard.0.push(task);
             }
             Err(e) => {
                 tracing::warn!("Failed to spawn skill watcher: {}", e);
-                None
             }
         }
-    } else {
-        None
-    };
+    }
 
     // ── Cost tracking context (scoped for CLI / cron / web agents) ──
     let cost_tracking_context: Option<ToolLoopCostTrackingContext> =
@@ -2770,6 +2777,18 @@ pub async fn run(
         // Prepend thinking system prompt prefix when present.
         if let Some(ref prefix) = thinking_params.system_prompt_prefix {
             system_prompt = format!("{prefix}\n\n{system_prompt}");
+        }
+
+        if let Some(suggestion) = crate::skills::render_missing_skill_install_suggestion(
+            &effective_msg,
+            &skills,
+            &config.workspace_dir,
+            config.skills.install_suggestions.enabled,
+        ) {
+            final_output = suggestion.clone();
+            println!("{suggestion}");
+            observer.record_event(&ObserverEvent::TurnComplete);
+            return Ok(final_output);
         }
 
         // Auto-save user message to memory (skip short/trivial messages)
@@ -3061,6 +3080,31 @@ pub async fn run(
                 {
                     sys_msg.content = turn_system_prompt.clone();
                 }
+            }
+
+            if let Some(suggestion) = crate::skills::render_missing_skill_install_suggestion(
+                &effective_input,
+                &skills,
+                &config.workspace_dir,
+                config.skills.install_suggestions.enabled,
+            ) {
+                final_output = suggestion.clone();
+                if let Err(e) = zeroclaw_api::channel::Channel::send(
+                    &*cli,
+                    &zeroclaw_api::channel::SendMessage::new(format!("\n{suggestion}\n"), "user"),
+                )
+                .await
+                {
+                    eprintln!("\nError sending CLI response: {e}\n");
+                }
+                observer.record_event(&ObserverEvent::TurnComplete);
+                if thinking_params.system_prompt_prefix.is_some()
+                    && let Some(sys_msg) = history.first_mut()
+                    && sys_msg.role == "system"
+                {
+                    sys_msg.content.clone_from(&base_system_prompt);
+                }
+                continue;
             }
 
             // Auto-save conversation turns (skip short/trivial messages)
@@ -3600,12 +3644,6 @@ pub async fn process_message(
             "Query connected hardware for reported GPIO pins and LED pin. Use when user asks what pins are available.",
         ));
     }
-    if config.dawn_s3.enabled {
-        tool_descs.push((
-            "dawn_s3",
-            "Upload a local file to Dawn S3 compatible storage. Returns the full download URL. Use when: user needs a shareable link for generated files (reports, presentations, PDFs, etc.).",
-        ));
-    }
 
     // Filter out tools excluded for non-CLI channels (gateway counts as non-CLI).
     // Skip when autonomy is `Full` — full-autonomy agents keep all tools.
@@ -3628,7 +3666,6 @@ pub async fn process_message(
         })
         .collect();
     tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
-    tracing::info!("gateway tool_descs after retain: {:?}", tool_descs.iter().map(|(n, _)| n).collect::<Vec<_>>());
 
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
@@ -3690,6 +3727,15 @@ pub async fn process_message(
     }
 
     let effective_msg_ref = effective_message.as_str();
+    if let Some(suggestion) = crate::skills::render_missing_skill_install_suggestion(
+        effective_msg_ref,
+        &skills,
+        &config.workspace_dir,
+        config.skills.install_suggestions.enabled,
+    ) {
+        return Ok(suggestion);
+    }
+
     // process_message is the channel entrypoint (Discord, Telegram, gateway,
     // etc.) — recall is scoped to the channel's session_id, so retrieving the
     // user's own Conversation history within their session is intended.

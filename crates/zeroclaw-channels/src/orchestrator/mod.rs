@@ -5930,20 +5930,33 @@ pub async fn start_channels(
         }
     }
 
+    // ── Tool registry: use global singleton for hot reload support ─────
+    // In daemon mode, the global registry was initialized by daemon/mod.rs
+    // before channels started. This enables hot reload updates to be
+    // visible to all channel message handlers.
     let skills = zeroclaw_runtime::skills::load_skills_with_config(&workspace, &config);
 
-    // Register skill-defined tools so the gateway can execute them (not just
-    // describe them in the prompt). Without this, skill tools like email.send
-    // appear in the system prompt but return "Unknown tool" when called.
-    zeroclaw_runtime::tools::register_skill_tools(&mut built_tools, &skills, security.clone());
+    let tools_registry = match zeroclaw_runtime::tools::get_global_registry() {
+        Some(registry) => {
+            tracing::info!("Channels using global tool registry (hot reload enabled)");
+            // Store registry reference for hot reload support
+            registry.get_current()
+        }
+        None => {
+            // Fallback: build tools locally (for standalone channels testing)
+            tracing::info!("Channels building local tool registry (daemon mode not detected)");
 
-    // Extract (name, description) specs from built tools for channel command registration.
-    let tool_specs: Vec<(String, String)> = built_tools
+            zeroclaw_runtime::tools::register_skill_tools(&mut built_tools, &skills, security.clone());
+
+            Arc::new(built_tools)
+        }
+    };
+
+    // Extract (name, description) specs from tools for channel command registration.
+    let tool_specs: Vec<(String, String)> = tools_registry
         .iter()
         .map(|t| (t.name().to_string(), t.description().to_string()))
         .collect();
-
-    let tools_registry = Arc::new(built_tools);
 
     // ── Initialize locale-aware tool descriptions ──────────────────
     let i18n_locale = config

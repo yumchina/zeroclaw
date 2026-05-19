@@ -106,14 +106,13 @@ async fn run_notify_watcher(
     config: WatcherConfig,
     reload_tx: mpsc::Sender<ReloadRequest>,
 ) -> Result<()> {
-    use std::sync::Mutex;
-
     // Increased channel capacity to handle burst of file events
     let (event_tx, mut event_rx) = mpsc::channel(64);
-    let event_tx = Arc::new(Mutex::new(event_tx));
+    let event_tx = Arc::new(event_tx);
     // Track if we dropped events due to channel overflow
     let dropped_events = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let dropped_events_clone = Arc::clone(&dropped_events);
+    let event_tx_clone = Arc::clone(&event_tx);
 
     let mut watcher = RecommendedWatcher::new(move |res: Result<Event, _>| {
         if let Ok(event) = res {
@@ -122,7 +121,7 @@ async fn run_notify_watcher(
                 event.kind,
                 EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
             ) {
-                if let Err(_) = event_tx.lock().unwrap().try_send(event) {
+                if let Err(_) = event_tx_clone.try_send(event) {
                     // Channel full - increment counter and trigger reload later
                     dropped_events_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     debug!("Watcher event channel full, dropping event (will force reload)");

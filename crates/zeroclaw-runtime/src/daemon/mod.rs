@@ -160,6 +160,132 @@ pub async fn run(
 
     let mut handles: Vec<JoinHandle<()>> = vec![spawn_state_writer(config.clone())];
 
+    // ── Initialize global tool registry for daemon mode ───────────────
+    // This must happen BEFORE gateway/channels start so they can access it.
+    // The global singleton enables hot reload updates to be visible across
+    // all daemon components (gateway, channels, heartbeat).
+    crate::tools::init_global_watcher_guard();
+
+    // Load skills and build initial tool set
+    let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+    let security = std::sync::Arc::new(crate::security::SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+
+    // Build tools using the standard builder (same as orchestrator uses)
+    let runtime_adapter = std::sync::Arc::from(crate::platform::create_runtime(&config.runtime)?);
+    let memory = std::sync::Arc::from(zeroclaw_memory::create_memory(
+        &config.memory,
+        &config.workspace_dir,
+        config.providers.fallback_provider().and_then(|e| e.api_key.as_deref()),
+    )?);
+    let (composio_key, composio_entity_id) = if config.composio.enabled {
+        (config.composio.api_key.as_deref(), Some(config.composio.entity_id.as_str()))
+    } else {
+        (None, None)
+    };
+
+    let (mut daemon_tools, _, _, _, _, _) = crate::tools::all_tools_with_runtime(
+        std::sync::Arc::new(config.clone()),
+        &security,
+        std::sync::Arc::clone(&runtime_adapter),
+        memory,
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.web_fetch,
+        &config.workspace_dir,
+        &config.agents,
+        config.providers.fallback_provider().and_then(|e| e.api_key.as_deref()),
+        &config,
+        None,
+    );
+    crate::tools::register_skill_tools(&mut daemon_tools, &skills, security.clone());
+    let _registry = crate::tools::init_global_registry(daemon_tools);
+
+    // Store components needed for hot reload in Arc for the reload task
+    let reload_config = std::sync::Arc::new(config.clone());
+    let reload_security = security.clone();
+    let reload_runtime = std::sync::Arc::clone(&runtime_adapter);
+    let reload_workspace = config.workspace_dir.clone();
+
+    // ── Spawn skill watcher for hot reload (daemon-level singleton) ───
+    // Unlike CLI mode where watcher is inside run(), daemon watcher is
+    // started immediately at daemon startup and shared by all components.
+    if config.skills.hot_reload.enabled {
+        let watcher_config = crate::skills::WatcherConfig::from_config(
+            config.workspace_dir.join("skills"),
+            &config.skills.hot_reload,
+        );
+        tracing::info!("🧠 Spawning daemon-level skill watcher...");
+        match crate::skills::spawn_skill_watcher(watcher_config) {
+            Ok((watcher_handle, mut reload_rx)) => {
+                crate::tools::push_global_watcher_handle(watcher_handle);
+
+                let reload_task = tokio::spawn(async move {
+                    while let Some(req) = reload_rx.recv().await {
+                        tracing::info!("Daemon received skill reload request (force={})", req.force);
+
+                        // Reload skills from disk
+                        let new_skills = crate::skills::load_skills_with_config(
+                            &reload_workspace,
+                            reload_config.as_ref(),
+                        );
+
+                        // Rebuild all tools (simplified: use a helper function)
+                        // For hot reload, we rebuild the complete tool set
+                        let (composio_key_r, composio_entity_id_r) = if reload_config.composio.enabled {
+                            (reload_config.composio.api_key.as_deref(), Some(reload_config.composio.entity_id.as_str()))
+                        } else {
+                            (None, None)
+                        };
+
+                        // Create fresh memory instance for reload
+                        let reload_memory = zeroclaw_memory::create_memory(
+                            &reload_config.memory,
+                            &reload_workspace,
+                            reload_config.providers.fallback_provider().and_then(|e| e.api_key.as_deref()),
+                        ).ok().map(|m| std::sync::Arc::from(m));
+
+                        if let Some(mem) = reload_memory {
+                            let (mut new_tools, _, _, _, _, _) = crate::tools::all_tools_with_runtime(
+                                std::sync::Arc::clone(&reload_config),
+                                &reload_security,
+                                reload_runtime.clone(),
+                                mem,
+                                composio_key_r,
+                                composio_entity_id_r,
+                                &reload_config.browser,
+                                &reload_config.http_request,
+                                &reload_config.web_fetch,
+                                &reload_workspace,
+                                &reload_config.agents,
+                                reload_config.providers.fallback_provider().and_then(|e| e.api_key.as_deref()),
+                                reload_config.as_ref(),
+                                None,
+                            );
+                            crate::tools::register_skill_tools(&mut new_tools, &new_skills, reload_security.clone());
+
+                            // Atomic swap in global registry
+                            let new_version = crate::tools::swap_global_registry(new_tools);
+                            tracing::info!("Daemon hot reload complete: version {}, {} tools", new_version, crate::tools::get_global_registry().map(|r| r.len()).unwrap_or(0));
+                        } else {
+                            tracing::warn!("Daemon hot reload skipped: failed to create memory for rebuild");
+                        }
+                    }
+                });
+                crate::tools::push_global_watcher_handle(reload_task);
+            }
+            Err(e) => {
+                tracing::warn!("Failed to spawn daemon skill watcher: {}", e);
+            }
+        }
+    } else {
+        tracing::info!("Skill hot reload disabled for daemon mode");
+    }
+
     // Reload channel: gateway's /admin/reload writes here; our wait loop
     // (below) selects on it alongside OS signals. Cross-platform.
     let (reload_tx, reload_rx) = tokio::sync::watch::channel::<bool>(false);
