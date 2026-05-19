@@ -1089,10 +1089,27 @@ pub async fn run_tool_call_loop(
             }),
         );
 
-        // 打印完整的 LLM 请求
-        for (i, msg) in prepared_messages.messages.iter().enumerate() {
-            let content_preview = if msg.content.chars().count() > 500 {
-                truncate_with_ellipsis(&msg.content, 500)
+        // 打印 LLM 请求摘要（从最后一个 user 消息开始，避免重复打印历史）
+        let total_messages = prepared_messages.messages.len();
+        let last_user_index = prepared_messages.messages
+            .iter()
+            .enumerate()
+            .rfind(|(_, msg)| msg.role == "user")
+            .map(|(i, _)| i)
+            .unwrap_or(0);
+
+        tracing::info!(
+            iteration = iteration + 1,
+            total_messages = total_messages,
+            printing_from = last_user_index,
+            message_count = total_messages - last_user_index,
+            "llm.request_summary"
+        );
+
+        // 从最后一个 user 消息开始打印
+        for (i, msg) in prepared_messages.messages.iter().enumerate().skip(last_user_index) {
+            let content_preview = if msg.content.chars().count() > 1000 {
+                truncate_with_ellipsis(&msg.content, 1000)
             } else {
                 msg.content.clone()
             };
@@ -1838,7 +1855,7 @@ pub async fn run_tool_call_loop(
                 } else {
                     format!("\u{23f3} {}: {hint}\n", tool_name)
                 };
-                tracing::debug!(tool = %tool_name, "Sending progress start to draft");
+                tracing::info!(tool = %tool_name, "Sending progress start to draft");
                 let _ = tx.send(StreamDelta::Status(progress)).await;
             }
 
@@ -1919,7 +1936,7 @@ pub async fn run_tool_call_loop(
                 } else {
                     format!("\u{274c} {} ({secs}s)\n", call.name)
                 };
-                tracing::debug!(tool = %call.name, secs, "Sending progress complete to draft");
+                tracing::info!(tool = %call.name, secs, "Sending progress complete to draft");
                 let _ = tx.send(StreamDelta::Status(progress_msg)).await;
             }
 
@@ -1982,7 +1999,7 @@ pub async fn run_tool_call_loop(
             let mut result_output = truncate_tool_result(&canonical_output, max_tool_result_chars);
             // Append HMAC receipt to tool result when receipts are enabled (#4830)
             if let Some(ref receipt) = outcome.receipt {
-                tracing::debug!(tool = %tool_name, receipt = %receipt, "Tool receipt generated");
+                tracing::info!(tool = %tool_name, receipt = %receipt, "Tool receipt generated");
                 result_output = format!("{result_output}\n\n[receipt: {receipt}]");
                 if let Some(store) = collected_receipts
                     && let Ok(mut v) = store.lock()
