@@ -111,9 +111,9 @@ impl ExcelTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("file_path is required"))?;
 
-        let sheet_name = args["sheet"].as_str().unwrap_or(""); // 空字符串表示使用第一个工作表
+        let sheet_name = args["sheet"].as_str().unwrap_or(""); // Empty string means use first sheet
 
-        // 解析并验证文件路径
+        // Parse and validate file path
         let full_path = self.security.resolve_tool_path(file_path);
 
         // Canonicalize the path for security checks
@@ -145,7 +145,7 @@ impl ExcelTool {
             });
         }
 
-        // 检查文件存在和大小
+        // Check file exists and size
         let metadata = match tokio::fs::metadata(&resolved_path).await {
             Ok(m) => m,
             Err(e) => {
@@ -176,12 +176,12 @@ impl ExcelTool {
             });
         }
 
-        // 使用 calamine 读取 Excel 文件
+        // Read Excel file using calamine
         let mut workbook: calamine::Sheets<calamine::Data<_>> =
             calamine::open_workbook(&resolved_path)
                 .map_err(|e| anyhow::anyhow!("Failed to open workbook: {e}"))?;
 
-        // 检查工作表是否为空
+        // Check if worksheet is empty
         let sheet_names = workbook.sheet_names();
         if sheet_names.is_empty() {
             return Ok(ToolResult {
@@ -636,7 +636,7 @@ impl ExcelTool {
             });
         }
 
-        // 检查文件存在和大小
+        // Check file exists and size
         let metadata = match tokio::fs::metadata(&full_path).await {
             Ok(m) => m,
             Err(e) => {
