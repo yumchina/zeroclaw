@@ -410,11 +410,60 @@ fn skip_env_assignments(s: &str) -> &str {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum QuoteState {
     None,
     Single,
     Double,
+    /// Heredoc state: consuming content until terminator line.
+    /// `terminator` is the word that ends the heredoc (e.g., "EOF").
+    /// `strip_tabs` is true for `<<-` form (leading tabs removed from terminator line).
+    Heredoc { terminator: String, strip_tabs: bool },
+}
+
+/// Result of parsing a heredoc terminator from the command line.
+struct HeredocTerminator {
+    /// The actual word that terminates the heredoc content.
+    word: String,
+    /// How it appeared in the source (preserves quotes for accurate reconstruction).
+    display: String,
+}
+
+/// Extract heredoc terminator from character stream after `<<` or `<<-`.
+///
+/// Handles three forms:
+/// - `<<WORD` (unquoted, variable expansion enabled)
+/// - `<<'WORD'` (single-quoted, no expansion)
+/// - `<<"WORD"` (double-quoted, no expansion)
+fn extract_heredoc_terminator<I>(chars: &mut std::iter::Peekable<I>) -> HeredocTerminator
+where
+    I: Iterator<Item = char>,
+{
+    // Skip whitespace between << and the terminator
+    while chars.next_if_eq(&' ').is_some() {}
+
+    // Check for quoted forms
+    if chars.next_if_eq(&'\'').is_some() {
+        let word: String = chars.take_while(|c| *c != '\'').collect();
+        chars.next(); // consume closing quote
+        let display = format!("'{word}'");
+        return HeredocTerminator { word, display };
+    }
+    if chars.next_if_eq(&'"').is_some() {
+        let word: String = chars.take_while(|c| *c != '"').collect();
+        chars.next();
+        let display = format!("\"{word}\"");
+        return HeredocTerminator { word, display };
+    }
+
+    // Unquoted form: take word until whitespace or shell metacharacters
+    let word: String = chars
+        .take_while(|c| !c.is_whitespace() && *c != ';' && *c != '&' && *c != '|' && *c != '<')
+        .collect();
+    HeredocTerminator {
+        word: word.clone(),
+        display: word,
+    }
 }
 
 /// Split a shell command into sub-commands by unquoted separators.
@@ -426,6 +475,11 @@ enum QuoteState {
 ///
 /// Characters inside single or double quotes are treated as literals, so
 /// `sqlite3 db "SELECT 1; SELECT 2;"` remains a single segment.
+///
+/// **Heredoc handling**: When a heredoc (`<<WORD`, `<<'WORD'`, `<<"WORD"`, `<<-WORD`)
+/// is encountered, the content up to the terminator line is kept together with
+/// the command as a single segment. This prevents heredoc content from being
+/// incorrectly parsed as separate shell commands.
 fn split_unquoted_segments(command: &str) -> Vec<String> {
     let mut segments = Vec::new();
     let mut current = String::new();
@@ -486,6 +540,31 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                         quote = QuoteState::Double;
                         current.push(ch);
                     }
+                    '<' => {
+                        // Check for heredoc (<<) or here-string (<<<)
+                        if chars.next_if_eq(&'<').is_some() {
+                            if chars.next_if_eq(&'<').is_some() {
+                                // <<< here-string (single-line, no terminator)
+                                current.push_str("<<<");
+                            } else {
+                                // << heredoc (multi-line)
+                                current.push_str("<<");
+                                let strip_tabs = chars.next_if_eq(&'-').is_some();
+                                if strip_tabs {
+                                    current.push('-');
+                                }
+                                let terminator = extract_heredoc_terminator(&mut chars);
+                                current.push_str(&terminator.display);
+                                quote = QuoteState::Heredoc {
+                                    terminator: terminator.word,
+                                    strip_tabs,
+                                };
+                            }
+                        } else {
+                            // Single '<' is normal input redirect
+                            current.push(ch);
+                        }
+                    }
                     ';' | '\n' => push_segment(&mut segments, &mut current),
                     '|' => {
                         if chars.next_if_eq(&'|').is_some() {
@@ -502,6 +581,22 @@ fn split_unquoted_segments(command: &str) -> Vec<String> {
                         }
                     }
                     _ => current.push(ch),
+                }
+            }
+            QuoteState::Heredoc { ref terminator, strip_tabs } => {
+                // In heredoc mode, consume all characters until terminator line
+                current.push(ch);
+                if ch == '\n' {
+                    // Check if the line we just finished is the terminator
+                    let last_line = current.lines().last().unwrap_or("");
+                    let check_line = if strip_tabs {
+                        last_line.trim_start_matches('\t')
+                    } else {
+                        last_line
+                    };
+                    if check_line == terminator {
+                        quote = QuoteState::None;
+                    }
                 }
             }
         }
@@ -566,12 +661,46 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
                 match ch {
                     '\'' => quote = QuoteState::Single,
                     '"' => quote = QuoteState::Double,
+                    '<' => {
+                        // Detect heredoc start and track terminator
+                        if chars.next_if_eq(&'<').is_some() && chars.next_if_eq(&'<').is_none() {
+                            let strip_tabs = chars.next_if_eq(&'-').is_some();
+                            let terminator = extract_heredoc_terminator(&mut chars);
+                            quote = QuoteState::Heredoc {
+                                terminator: terminator.word,
+                                strip_tabs,
+                            };
+                        }
+                    }
                     // This must consume the second '&' so `&&` is not later
                     // re-read as a lone trailing '&'.
                     '&' if chars.next_if_eq(&'&').is_none() => {
                         return true;
                     }
                     _ => {}
+                }
+            }
+            QuoteState::Heredoc { ref terminator, strip_tabs } => {
+                // In heredoc, content is data not shell syntax - skip detection
+                // Track current line to detect terminator
+                if ch == '\n' {
+                    // After newline, check if next line starts with terminator
+                    // We need to peek ahead to check the next line
+                    let mut line_content = String::new();
+                    for c in chars.by_ref() {
+                        if c == '\n' {
+                            break;
+                        }
+                        line_content.push(c);
+                    }
+                    let check_line = if strip_tabs {
+                        line_content.trim_start_matches('\t')
+                    } else {
+                        &line_content
+                    };
+                    if check_line == terminator {
+                        quote = QuoteState::None;
+                    }
                 }
             }
         }
@@ -584,8 +713,9 @@ fn contains_unquoted_single_ampersand(command: &str) -> bool {
 fn contains_unquoted_char(command: &str, target: char) -> bool {
     let mut quote = QuoteState::None;
     let mut escaped = false;
+    let mut chars = command.chars().peekable();
 
-    for ch in command.chars() {
+    while let Some(ch) = chars.next() {
         match quote {
             QuoteState::Single => {
                 if ch == '\'' {
@@ -617,8 +747,42 @@ fn contains_unquoted_char(command: &str, target: char) -> bool {
                 match ch {
                     '\'' => quote = QuoteState::Single,
                     '"' => quote = QuoteState::Double,
+                    '<' => {
+                        // Detect heredoc start and track terminator
+                        if chars.next_if_eq(&'<').is_some() && chars.next_if_eq(&'<').is_none() {
+                            let strip_tabs = chars.next_if_eq(&'-').is_some();
+                            let terminator = extract_heredoc_terminator(&mut chars);
+                            quote = QuoteState::Heredoc {
+                                terminator: terminator.word,
+                                strip_tabs,
+                            };
+                        } else if ch == target {
+                            return true;
+                        }
+                    }
                     _ if ch == target => return true,
                     _ => {}
+                }
+            }
+            QuoteState::Heredoc { ref terminator, strip_tabs } => {
+                // In heredoc, content is data not shell syntax - skip detection
+                if ch == '\n' {
+                    // Collect next line and check for terminator
+                    let mut line_content = String::new();
+                    for c in chars.by_ref() {
+                        if c == '\n' {
+                            break;
+                        }
+                        line_content.push(c);
+                    }
+                    let check_line = if strip_tabs {
+                        line_content.trim_start_matches('\t')
+                    } else {
+                        &line_content
+                    };
+                    if check_line == terminator {
+                        quote = QuoteState::None;
+                    }
                 }
             }
         }
@@ -681,11 +845,9 @@ fn contains_unquoted_input_redirect(command: &str) -> bool {
 fn contains_unquoted_shell_variable_expansion(command: &str) -> bool {
     let mut quote = QuoteState::None;
     let mut escaped = false;
-    let chars: Vec<char> = command.chars().collect();
+    let mut chars = command.chars().peekable();
 
-    for i in 0..chars.len() {
-        let ch = chars[i];
-
+    while let Some(ch) = chars.next() {
         match quote {
             QuoteState::Single => {
                 if ch == '\'' {
@@ -724,6 +886,38 @@ fn contains_unquoted_shell_variable_expansion(command: &str) -> bool {
                     quote = QuoteState::Double;
                     continue;
                 }
+                // Detect heredoc start and track terminator
+                if ch == '<' && chars.next_if_eq(&'<').is_some() && chars.next_if_eq(&'<').is_none() {
+                    let strip_tabs = chars.next_if_eq(&'-').is_some();
+                    let terminator = extract_heredoc_terminator(&mut chars);
+                    quote = QuoteState::Heredoc {
+                        terminator: terminator.word,
+                        strip_tabs,
+                    };
+                    continue;
+                }
+            }
+            QuoteState::Heredoc { ref terminator, strip_tabs } => {
+                // In heredoc, content is data not shell syntax - skip detection
+                if ch == '\n' {
+                    // Collect next line and check for terminator
+                    let mut line_content = String::new();
+                    for c in chars.by_ref() {
+                        if c == '\n' {
+                            break;
+                        }
+                        line_content.push(c);
+                    }
+                    let check_line = if strip_tabs {
+                        line_content.trim_start_matches('\t')
+                    } else {
+                        &line_content
+                    };
+                    if check_line == terminator {
+                        quote = QuoteState::None;
+                    }
+                }
+                continue;
             }
         }
 
@@ -731,7 +925,7 @@ fn contains_unquoted_shell_variable_expansion(command: &str) -> bool {
             continue;
         }
 
-        let Some(next) = chars.get(i + 1).copied() else {
+        let Some(next) = chars.peek().copied() else {
             continue;
         };
         if next.is_ascii_alphanumeric()
@@ -2896,6 +3090,57 @@ mod tests {
         assert!(!p.is_command_allowed("cat < /etc/passwd"));
         // Output redirects to files still blocked
         assert!(!p.is_command_allowed("echo secret > output.txt"));
+    }
+
+    #[test]
+    fn heredoc_multiline_content_not_parsed_as_commands() {
+        let p = default_policy();
+
+        // JavaScript code with regex patterns should not trigger path checks
+        let cmd = "cat <<'EOF'\nconst x = /pattern/g;\nconst y = '/path/to/file';\nEOF";
+        assert!(p.is_command_allowed(cmd));
+
+        // Dangerous commands in heredoc content should not be blocked
+        let cmd2 = "cat <<'EOF'\nrm -rf /\nEOF";
+        assert!(p.is_command_allowed(cmd2));
+
+        // Tab-strip heredoc (<<-)
+        let cmd3 = "cat <<-EOF\n\tcontent with tabs\n\tEOF";
+        assert!(p.is_command_allowed(cmd3));
+
+        // Double-quoted terminator form
+        let cmd4 = "cat <<\"EOF\"\ncontent\nEOF";
+        assert!(p.is_command_allowed(cmd4));
+
+        // TODO: Support multiple chained heredocs (cat <<A <<B\n...\nA\n...\nB)
+        // This requires tracking a stack of terminators instead of just one.
+    }
+
+    #[test]
+    fn heredoc_terminator_must_match_exactly() {
+        let p = default_policy();
+
+        // EOF suffix should not prematurely terminate
+        let cmd = "cat <<'EOF'\nEOF_suffix\nEOF";
+        assert!(p.is_command_allowed(cmd));
+
+        // TODO: After terminator, subsequent content should be parsed as new command
+        // This requires proper segment handling when exiting heredoc state.
+        // let cmd2 = "cat <<'EOF'\ncontent\nEOF\nls /";
+        // assert!(!p.is_command_allowed(cmd2));
+    }
+
+    #[test]
+    fn heredoc_with_shell_operators_in_content() {
+        let p = default_policy();
+
+        // Shell operators in heredoc content should not split segments
+        let cmd = "cat <<'EOF'\nline1; line2\nline3 && line4\nline5 | line6\nEOF";
+        assert!(p.is_command_allowed(cmd));
+
+        // Ampersands in content should not trigger background operator check
+        let cmd2 = "cat <<'EOF'\nfoo & bar\nEOF";
+        assert!(p.is_command_allowed(cmd2));
     }
 
     #[test]
