@@ -2,8 +2,12 @@ use async_trait::async_trait;
 use serde_json::json;
 use std::path::Path;
 use std::sync::Arc;
+use tokio::io::AsyncReadExt;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_config::policy::SecurityPolicy;
+
+/// Maximum file size for upload (100 MB).
+const MAX_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
 
 pub struct DawnS3Tool {
     security: Arc<SecurityPolicy>,
@@ -175,10 +179,7 @@ impl Tool for DawnS3Tool {
         }
 
         let file_path = match args.get("file_path").and_then(|v| v.as_str()) {
-            Some(p) => {
-                tracing::debug!(target: "dawn_s3", "file_path: {}", p);
-                p
-            }
+            Some(p) => p,
             None => {
                 tracing::error!(target: "dawn_s3", "missing required parameter: file_path");
                 return Ok(ToolResult {
@@ -189,25 +190,108 @@ impl Tool for DawnS3Tool {
             }
         };
 
+        // Security: resolve the tool path relative to the workspace.
+        let full_path = self.security.resolve_tool_path(file_path);
+
+        // Open file first so we have a stable handle. Then canonicalize the
+        // original path for validation. Reading from the already-open handle
+        // closes the TOCTOU window between path check and file read.
+        let mut file = match tokio::fs::File::open(&full_path).await {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::error!(target: "dawn_s3", "file not found or inaccessible: {}", e);
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(json!({
+                        "error": format!("File not found: {}", file_path),
+                        "suggestion": "Check the file path is correct and the file exists",
+                        "path": file_path
+                    }).to_string()),
+                });
+            }
+        };
+
+        // Validate the canonicalized path is within allowed roots.
+        let resolved_path = match tokio::fs::canonicalize(&full_path).await {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(target: "dawn_s3", "failed to resolve path: {}", e);
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to resolve file path: {}", e)),
+                });
+            }
+        };
+
+        if !self.security.is_resolved_path_allowed(&resolved_path) {
+            tracing::warn!(target: "dawn_s3", "path not allowed: {}", resolved_path.display());
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(self.security.resolved_path_violation_message(&resolved_path)),
+            });
+        }
+
+        // Enforce file size limit to prevent OOM on large uploads.
+        let meta = match file.metadata().await {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!(target: "dawn_s3", "failed to get file metadata: {}", e);
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to read file metadata: {}", e)),
+                });
+            }
+        };
+
+        let file_size = meta.len();
+        if file_size > MAX_UPLOAD_BYTES {
+            tracing::warn!(
+                target: "dawn_s3",
+                "file too large: {} bytes (max: {} bytes)",
+                file_size,
+                MAX_UPLOAD_BYTES
+            );
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "File too large: {} bytes (max: {} MB)",
+                    file_size,
+                    MAX_UPLOAD_BYTES / (1024 * 1024)
+                )),
+            });
+        }
+
         let content_type = args
             .get("content_type")
             .and_then(|v| v.as_str())
             .map(String::from)
             .unwrap_or_else(|| {
-                let ct = guess_content_type(file_path);
+                let ct = guess_content_type(resolved_path.to_string_lossy().as_ref());
                 tracing::debug!(target: "dawn_s3", "auto-detected content_type: {}", ct);
                 ct
             });
 
-        let file_name = Path::new(file_path)
+        let file_name = resolved_path
             .file_name()
             .and_then(|n| n.to_str())
             .map(String::from)
-            .unwrap_or_else(|| "file".to_string());
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    target: "dawn_s3",
+                    "non-UTF-8 filename, falling back to generic name: {}",
+                    resolved_path.display()
+                );
+                "file".to_string()
+            });
 
         tracing::debug!(target: "dawn_s3", "file_name extracted: {}", file_name);
 
-        let ext = Path::new(file_path)
+        let ext = resolved_path
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| format!(".{}", e))
@@ -216,21 +300,17 @@ impl Tool for DawnS3Tool {
         let remote_path = format!("assistant/{}{}", uuid::Uuid::new_v4(), ext);
         tracing::debug!(target: "dawn_s3", "remote_path generated: {}", remote_path);
 
-        tracing::info!(target: "dawn_s3", "reading file: {}", file_path);
-        let content = match tokio::fs::read(file_path).await {
-            Ok(c) => {
-                tracing::debug!(target: "dawn_s3", "file read success, size: {} bytes", c.len());
-                c
-            }
-            Err(e) => {
-                tracing::error!(target: "dawn_s3", "failed to read file: {}", e);
-                return Ok(ToolResult {
-                    success: false,
-                    output: String::new(),
-                    error: Some(format!("Failed to read file: {}", e)),
-                });
-            }
-        };
+        tracing::info!(target: "dawn_s3", "reading file: {} ({} bytes)", resolved_path.display(), file_size);
+        let mut content = Vec::with_capacity(file_size as usize);
+        if let Err(e) = file.read_to_end(&mut content).await {
+            tracing::error!(target: "dawn_s3", "failed to read file: {}", e);
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Failed to read file: {}", e)),
+            });
+        }
+        tracing::debug!(target: "dawn_s3", "file read success, size: {} bytes", content.len());
 
         match self.do_upload(&remote_path, &file_name, content, &content_type).await {
             Ok(download_url) => {

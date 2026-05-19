@@ -607,15 +607,27 @@ pub fn all_tools_with_runtime(
     if root_config.dawn_s3.enabled {
         if root_config.dawn_s3.url.trim().is_empty() {
             tracing::warn!("dawn_s3 tool enabled but dawn_s3.url is empty — skipping registration");
-        } else if root_config.dawn_s3.token.trim().is_empty() {
-            tracing::warn!("dawn_s3 tool enabled but dawn_s3.token is empty — skipping registration");
         } else {
-            tool_arcs.push(Arc::new(DawnS3Tool::new(
-                security.clone(),
-                root_config.dawn_s3.url.trim().to_string(),
-                root_config.dawn_s3.token.trim().to_string(),
-            )));
-            tracing::info!("dawn_s3 tool registered with endpoint: {}", root_config.dawn_s3.url);
+            let token = if root_config.dawn_s3.token.trim().is_empty() {
+                std::env::var("DAWN_S3_TOKEN").unwrap_or_default()
+            } else {
+                root_config.dawn_s3.token.trim().to_string()
+            };
+            if token.trim().is_empty() {
+                tracing::warn!(
+                    "dawn_s3 tool enabled but no token found (set dawn_s3.token or DAWN_S3_TOKEN env var) — skipping registration"
+                );
+            } else {
+                tool_arcs.push(Arc::new(DawnS3Tool::new(
+                    security.clone(),
+                    root_config.dawn_s3.url.trim().to_string(),
+                    token,
+                )));
+                tracing::info!(
+                    "dawn_s3 tool registered with endpoint: {}",
+                    root_config.dawn_s3.url
+                );
+            }
         }
     }
 
