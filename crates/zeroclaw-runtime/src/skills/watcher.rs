@@ -4,7 +4,7 @@
 //! with fallback to polling mode when notify is unavailable.
 
 use anyhow::{Context, Result};
-use notify::{RecursiveMode, Watcher, recommended_watcher, Event, EventKind};
+use notify::{RecommendedWatcher, RecursiveMode, Watcher, Event, EventKind, Config};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -83,6 +83,8 @@ fn spawn_notify_watcher(
 ) -> Result<tokio::task::JoinHandle<()>> {
     let skills_dir = config.skills_dir.clone();
 
+    info!("Spawning notify watcher for skills directory: {:?} (watch_mode: {})", skills_dir, config.watch_mode);
+
     if !skills_dir.exists() {
         warn!(
             "Skills directory does not exist: {:?}. Will retry when created.",
@@ -106,10 +108,14 @@ async fn run_notify_watcher(
 ) -> Result<()> {
     use std::sync::Mutex;
 
-    let (event_tx, mut event_rx) = mpsc::channel(32);
+    // Increased channel capacity to handle burst of file events
+    let (event_tx, mut event_rx) = mpsc::channel(64);
     let event_tx = Arc::new(Mutex::new(event_tx));
+    // Track if we dropped events due to channel overflow
+    let dropped_events = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let dropped_events_clone = Arc::clone(&dropped_events);
 
-    let mut watcher = recommended_watcher(move |res: Result<Event, _>| {
+    let mut watcher = RecommendedWatcher::new(move |res: Result<Event, _>| {
         if let Ok(event) = res {
             // Filter for relevant event kinds (create, modify, remove)
             if matches!(
@@ -117,11 +123,13 @@ async fn run_notify_watcher(
                 EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
             ) {
                 if let Err(_) = event_tx.lock().unwrap().try_send(event) {
-                    debug!("Watcher event channel full, dropping event");
+                    // Channel full - increment counter and trigger reload later
+                    dropped_events_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    debug!("Watcher event channel full, dropping event (will force reload)");
                 }
             }
         }
-    })
+    }, Config::default())
     .context("Failed to create file watcher")?;
 
     // Watch the skills directory
@@ -137,25 +145,47 @@ async fn run_notify_watcher(
         skills_dir, config.debounce_ms
     );
 
-    // Debounce loop
-    let mut last_event = Instant::now();
+    // Debounce loop: wait for a quiet period after the last event
     let debounce_duration = Duration::from_millis(config.debounce_ms);
+    let mut pending_event = false;
+    let mut last_event_time = Instant::now();
 
-    while let Some(event) = event_rx.recv().await {
-        debug!("Got file event: {:?}", event);
-
-        let now = Instant::now();
-        let elapsed = now.duration_since(last_event);
-
-        if elapsed >= debounce_duration {
-            info!("Skills directory changed, triggering reload");
-            if reload_tx.send(ReloadRequest { force: false }).await.is_err() {
-                warn!("Reload request channel closed, stopping watcher");
-                break;
+    loop {
+        tokio::select! {
+            // Receive new file event
+            event = event_rx.recv() => {
+                match event {
+                    Some(event) => {
+                        debug!("Got file event: {:?}", event);
+                        pending_event = true;
+                        last_event_time = Instant::now();
+                    }
+                    None => {
+                        warn!("Watcher event channel closed, stopping");
+                        break;
+                    }
+                }
             }
-            last_event = now;
-        } else {
-            debug!("Debouncing event ({}ms elapsed)", elapsed.as_millis());
+
+            // Debounce timer - fire after quiet period
+            _ = tokio::time::sleep(debounce_duration), if pending_event => {
+                // Check if enough time has passed since last event
+                let elapsed = Instant::now().duration_since(last_event_time);
+                if elapsed >= debounce_duration {
+                    // Check if we dropped events - force reload if so
+                    let dropped = dropped_events.swap(0, std::sync::atomic::Ordering::Relaxed);
+                    let force = dropped > 0;
+                    if force {
+                        warn!("{} events were dropped, forcing reload", dropped);
+                    }
+                    info!("Skills directory changed, triggering reload (debounced, force={})", force);
+                    if reload_tx.send(ReloadRequest { force }).await.is_err() {
+                        warn!("Reload request channel closed, stopping watcher");
+                        break;
+                    }
+                    pending_event = false;
+                }
+            }
         }
     }
 

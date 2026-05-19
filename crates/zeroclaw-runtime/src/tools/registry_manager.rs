@@ -76,34 +76,6 @@ impl ToolRegistryManager {
     pub fn is_empty(&self) -> bool {
         self.inner.lock().unwrap().is_empty()
     }
-
-    /// Execute a function with mutable access to the tools, then atomically swap.
-    ///
-    /// This is useful for hot reload where you need to modify the tool list
-    /// without having to clone individual tools.
-    ///
-    /// The function receives the current tools Vec and returns a new Vec.
-    pub fn modify<F>(&self, f: F) -> u64
-    where
-        F: FnOnce(Vec<Box<dyn Tool>>) -> Vec<Box<dyn Tool>>,
-    {
-        let mut guard = self.inner.lock().unwrap();
-        let current = std::mem::replace(&mut *guard, Arc::new(Vec::new()));
-        let tools = match Arc::try_unwrap(current) {
-            Ok(v) => v,
-            Err(_arc) => {
-                // There are other Arc references - create a new Vec
-                // Since Tool doesn't implement Clone, we start with empty Vec
-                // The caller should handle this appropriately
-                tracing::warn!("Cannot unwrap Arc (other references exist), starting with empty Vec");
-                Vec::new()
-            }
-        };
-        let new_tools = f(tools);
-        let new_version = self.version.fetch_add(1, Ordering::SeqCst) + 1;
-        *guard = Arc::new(new_tools);
-        new_version
-    }
 }
 
 #[cfg(test)]

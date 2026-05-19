@@ -45,6 +45,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 use uuid::Uuid;
 use zeroclaw_api::channel::Channel;
 use zeroclaw_api::provider::StreamEvent;
@@ -1154,7 +1155,7 @@ pub async fn run_tool_call_loop(
         let should_consume_provider_stream = on_delta.is_some()
             && provider.supports_streaming()
             && (request_tools.is_none() || provider.supports_streaming_tool_events());
-        tracing::debug!(
+        tracing::info!(
             has_on_delta = on_delta.is_some(),
             supports_streaming = provider.supports_streaming(),
             should_consume_provider_stream,
@@ -1344,13 +1345,8 @@ pub async fn run_tool_call_loop(
                     calls = fallback_calls;
                 }
 
-                // 打印 LLM 响应内容
-                let response_preview = if response_text.len() > 1000 {
-                    let end = (0..=1000).rev().find(|&i| response_text.is_char_boundary(i)).unwrap_or(0);
-                    format!("{}...", &response_text[..end])
-                } else {
-                    response_text.clone()
-                };
+                // 打印 LLM 响应内容（使用字符边界安全的截断）
+                let response_preview = truncate_with_ellipsis(&response_text, 1000);
                 tracing::info!(
                     iteration = iteration + 1,
                     response_text = %scrub_credentials(&response_preview),
@@ -2276,7 +2272,7 @@ pub async fn run(
     ) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
-        runtime,
+        runtime.clone(),  // Clone runtime to keep reference for hot reload
         mem.clone(),
         composio_key,
         composio_entity_id,
@@ -2577,6 +2573,12 @@ pub async fn run(
             "Query connected hardware for reported GPIO pins and LED pin. Use when: user asks what pins are available.",
         ));
     }
+    if config.dawn_s3.enabled {
+        tool_descs.push((
+            "dawn_s3",
+            "Upload a local file to Dawn S3 compatible storage. Returns the full download URL. Use when: user needs a shareable link for generated files (reports, presentations, PDFs, etc.).",
+        ));
+    }
     retain_registered_tool_descriptions(&mut tool_descs, &tools_registry);
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
@@ -2604,13 +2606,9 @@ pub async fn run(
     }
 
     // ── Wrap tools in ToolRegistryManager for hot reload support ─────
-    let tools_mgr = std::sync::Arc::new(tools::ToolRegistryManager::new(tools_registry));
-
-    // ── Register skill-defined tools via ToolRegistryManager atomic swap
-    tools_mgr.modify(|mut tools| {
-        tools::register_skill_tools(&mut tools, &skills, security.clone());
-        tools
-    });
+    // Build complete tool registry including skill-defined tools
+    let complete_tools = tools::build_tools_with_skills(tools_registry, &skills, security.clone());
+    let tools_mgr = std::sync::Arc::new(tools::ToolRegistryManager::new(complete_tools));
 
     // Append deferred MCP tool names so the LLM knows what is available
     if !deferred_section.is_empty() {
@@ -2630,30 +2628,37 @@ pub async fn run(
         if raw.is_empty() {
             None
         } else {
-            // Match the sanitized form persisted by memory backend migrations.
-            Some(zeroclaw_api::session_keys::sanitize_session_key(&format!(
-                "cli:{raw}"
-            )))
+            Some(format!("cli:{raw}"))
         }
     });
 
     // ── Skill hot reload watcher (if enabled) ─────────────────────
+    tracing::info!(
+        "[HOT_RELOAD_CHECK] enabled={}, watch_mode={}",
+        config.skills.hot_reload.enabled,
+        config.skills.hot_reload.watch_mode
+    );
     let _reload_task = if config.skills.hot_reload.enabled {
         let watcher_config = crate::skills::WatcherConfig::from_config(
             config.workspace_dir.join("skills"),
             &config.skills.hot_reload,
         );
 
+        tracing::info!("Spawning skill watcher...");
         match crate::skills::spawn_skill_watcher(watcher_config) {
             Ok((_handle, mut reload_rx)) => {
                 let tools_mgr_for_task = std::sync::Arc::clone(&tools_mgr);
                 let config_dir = config.workspace_dir.clone();
                 let config_for_task = config.clone();
                 let security_for_task = security.clone();
+                let runtime_for_task = runtime.clone();
+                let mem_for_task = mem.clone();
+                let fallback_api_key_for_task: Option<String> = fallback_provider_loop.as_ref().and_then(|e| e.api_key.clone());
+                let allowed_tools_for_task = allowed_tools.clone();
 
                 let task = tokio::spawn(async move {
                     while let Some(req) = reload_rx.recv().await {
-                        tracing::info!("Received skill reload request (force={})", req.force);
+                        info!("Received skill reload request (force={})", req.force);
 
                         // Reload skills from disk
                         let new_skills = crate::skills::load_skills_with_config(
@@ -2661,17 +2666,57 @@ pub async fn run(
                             &config_for_task,
                         );
 
-                        // Update tools with new skill tools
-                        let new_version = tools_mgr_for_task.modify(|mut tools| {
-                            crate::tools::register_skill_tools(
-                                &mut tools,
-                                &new_skills,
-                                security_for_task.clone(),
-                            );
-                            tools
-                        });
+                        // Rebuild all builtin tools (fresh state for hot reload)
+                        let (composio_key, composio_entity_id) = if config_for_task.composio.enabled {
+                            (
+                                config_for_task.composio.api_key.as_deref(),
+                                Some(config_for_task.composio.entity_id.as_str()),
+                            )
+                        } else {
+                            (None, None)
+                        };
 
-                        tracing::info!("Skills reloaded, new version: {}", new_version);
+                        let (mut new_builtin_tools, _, _, _, _, _) = crate::tools::all_tools_with_runtime(
+                            std::sync::Arc::new(config_for_task.clone()),
+                            &security_for_task,
+                            runtime_for_task.clone(),
+                            mem_for_task.clone(),
+                            composio_key,
+                            composio_entity_id,
+                            &config_for_task.browser,
+                            &config_for_task.http_request,
+                            &config_for_task.web_fetch,
+                            &config_for_task.workspace_dir,
+                            &config_for_task.agents,
+                            fallback_api_key_for_task.as_deref(),
+                            &config_for_task,
+                            None,
+                        );
+
+                        // Add peripheral tools if configured
+                        let peripheral_tools: Vec<Box<dyn Tool>> = if let Some(f) = PERIPHERAL_TOOLS_FN.get() {
+                            f(config_for_task.peripherals.clone()).await.unwrap_or_default()
+                        } else {
+                            vec![]
+                        };
+                        new_builtin_tools.extend(peripheral_tools);
+
+                        // Apply capability-based tool filter if specified
+                        if let Some(ref allow_list) = allowed_tools_for_task {
+                            new_builtin_tools.retain(|t| allow_list.iter().any(|name| name == t.name()));
+                        }
+
+                        // Build complete tools with new skill tools
+                        let new_tools = crate::tools::build_tools_with_skills(
+                            new_builtin_tools,
+                            &new_skills,
+                            security_for_task.clone(),
+                        );
+
+                        // Atomic swap
+                        let new_version = tools_mgr_for_task.atomic_swap(new_tools);
+
+                        info!("Skills reloaded, new version: {}", new_version);
                     }
                 });
 
@@ -2725,18 +2770,6 @@ pub async fn run(
         // Prepend thinking system prompt prefix when present.
         if let Some(ref prefix) = thinking_params.system_prompt_prefix {
             system_prompt = format!("{prefix}\n\n{system_prompt}");
-        }
-
-        if let Some(suggestion) = crate::skills::render_missing_skill_install_suggestion(
-            &effective_msg,
-            &skills,
-            &config.workspace_dir,
-            config.skills.install_suggestions.enabled,
-        ) {
-            final_output = suggestion.clone();
-            println!("{suggestion}");
-            observer.record_event(&ObserverEvent::TurnComplete);
-            return Ok(final_output);
         }
 
         // Auto-save user message to memory (skip short/trivial messages)
@@ -2892,7 +2925,7 @@ pub async fn run(
                         tracing::info!(slug, "Auto-created skill from execution");
                     }
                     Ok(None) => {
-                        tracing::debug!("Skill creation skipped (duplicate or disabled)");
+                        tracing::info!("Skill creation skipped (duplicate or disabled)");
                     }
                     Err(e) => tracing::warn!("Skill creation failed: {e}"),
                 }
@@ -3028,31 +3061,6 @@ pub async fn run(
                 {
                     sys_msg.content = turn_system_prompt.clone();
                 }
-            }
-
-            if let Some(suggestion) = crate::skills::render_missing_skill_install_suggestion(
-                &effective_input,
-                &skills,
-                &config.workspace_dir,
-                config.skills.install_suggestions.enabled,
-            ) {
-                final_output = suggestion.clone();
-                if let Err(e) = zeroclaw_api::channel::Channel::send(
-                    &*cli,
-                    &zeroclaw_api::channel::SendMessage::new(format!("\n{suggestion}\n"), "user"),
-                )
-                .await
-                {
-                    eprintln!("\nError sending CLI response: {e}\n");
-                }
-                observer.record_event(&ObserverEvent::TurnComplete);
-                if thinking_params.system_prompt_prefix.is_some()
-                    && let Some(sys_msg) = history.first_mut()
-                    && sys_msg.role == "system"
-                {
-                    sys_msg.content.clone_from(&base_system_prompt);
-                }
-                continue;
             }
 
             // Auto-save conversation turns (skip short/trivial messages)
@@ -3592,6 +3600,12 @@ pub async fn process_message(
             "Query connected hardware for reported GPIO pins and LED pin. Use when user asks what pins are available.",
         ));
     }
+    if config.dawn_s3.enabled {
+        tool_descs.push((
+            "dawn_s3",
+            "Upload a local file to Dawn S3 compatible storage. Returns the full download URL. Use when: user needs a shareable link for generated files (reports, presentations, PDFs, etc.).",
+        ));
+    }
 
     // Filter out tools excluded for non-CLI channels (gateway counts as non-CLI).
     // Skip when autonomy is `Full` — full-autonomy agents keep all tools.
@@ -3614,6 +3628,7 @@ pub async fn process_message(
         })
         .collect();
     tool_descs.retain(|(name, _)| effective_tool_names.contains(name));
+    tracing::info!("gateway tool_descs after retain: {:?}", tool_descs.iter().map(|(n, _)| n).collect::<Vec<_>>());
 
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
@@ -3675,15 +3690,6 @@ pub async fn process_message(
     }
 
     let effective_msg_ref = effective_message.as_str();
-    if let Some(suggestion) = crate::skills::render_missing_skill_install_suggestion(
-        effective_msg_ref,
-        &skills,
-        &config.workspace_dir,
-        config.skills.install_suggestions.enabled,
-    ) {
-        return Ok(suggestion);
-    }
-
     // process_message is the channel entrypoint (Discord, Telegram, gateway,
     // etc.) — recall is scoped to the channel's session_id, so retrieving the
     // user's own Conversation history within their session is intended.

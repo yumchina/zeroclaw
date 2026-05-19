@@ -59,6 +59,9 @@ pub use zeroclaw_tools::codex_cli::CodexCliTool;
 pub use zeroclaw_tools::composio::ComposioTool;
 pub use zeroclaw_tools::content_search::ContentSearchTool;
 pub use zeroclaw_tools::data_management::DataManagementTool;
+pub use zeroclaw_tools::excel_tool::ExcelTool;
+pub use zeroclaw_tools::ppt_tool::PptTool;
+pub use zeroclaw_tools::doc_tool::DocTool;
 pub use zeroclaw_tools::dawn_s3::DawnS3Tool;
 pub use zeroclaw_tools::discord_search::DiscordSearchTool;
 pub use zeroclaw_tools::escalate::EscalateToHumanTool;
@@ -275,6 +278,24 @@ pub fn register_skill_tools(
             tools_registry.push(tool);
         }
     }
+}
+
+/// Build a complete tool registry with skill-defined tools appended.
+///
+/// Takes ownership of the base tool list and returns a new Vec with
+/// skill tools appended. Skill tools that would shadow a built-in tool
+/// name are skipped with a warning.
+///
+/// This is used for hot reload where we need to build a fresh tool list
+/// without mutating an existing registry.
+pub fn build_tools_with_skills(
+    base_tools: Vec<Box<dyn Tool>>,
+    skills: &[crate::skills::Skill],
+    security: Arc<SecurityPolicy>,
+) -> Vec<Box<dyn Tool>> {
+    let mut tools = base_tools;
+    register_skill_tools(&mut tools, skills, security);
+    tools
 }
 
 /// Always-on built-in tools that surface in the integrations panel as
@@ -776,6 +797,24 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(RateLimitedTool::new(
         PathGuardedTool::new(ImageInfoTool::new(security.clone()), security.clone()),
+        security.clone(),
+    )));
+
+    // Excel tool - always available for spreadsheet operations
+    tool_arcs.push(Arc::new(RateLimitedTool::new(
+        PathGuardedTool::new(ExcelTool::new(security.clone(), workspace_dir.to_path_buf()), security.clone()),
+        security.clone(),
+    )));
+
+    // PPT tool - always available for presentation operations
+    tool_arcs.push(Arc::new(RateLimitedTool::new(
+        PathGuardedTool::new(PptTool::new(security.clone(), workspace_dir.to_path_buf()), security.clone()),
+        security.clone(),
+    )));
+
+    // DOC tool - always available for document operations
+    tool_arcs.push(Arc::new(RateLimitedTool::new(
+        PathGuardedTool::new(DocTool::new(security.clone(), workspace_dir.to_path_buf()), security.clone()),
         security.clone(),
     )));
 
