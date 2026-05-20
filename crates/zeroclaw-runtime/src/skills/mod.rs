@@ -26,6 +26,34 @@ pub(crate) use suggestions::render_missing_skill_install_suggestion;
 #[cfg(test)]
 mod watcher_tests;
 
+// ── Global skills cache (updated by hot reload, read by orchestrator) ────
+// Avoids reloading skills from disk on every conversation turn.
+static GLOBAL_SKILLS_CACHE: std::sync::OnceLock<std::sync::Arc<std::sync::RwLock<Vec<Skill>>>> =
+    std::sync::OnceLock::new();
+
+/// Initialize the global skills cache. Called once at daemon/CLI startup.
+pub fn init_global_skills_cache(skills: Vec<Skill>) {
+    GLOBAL_SKILLS_CACHE
+        .set(std::sync::Arc::new(std::sync::RwLock::new(skills)))
+        .ok();
+}
+
+/// Get current skills from the global cache.
+/// Returns empty Vec if not initialized (e.g., standalone tests).
+pub fn get_global_skills() -> Vec<Skill> {
+    GLOBAL_SKILLS_CACHE
+        .get()
+        .map(|cache| cache.read().unwrap().clone())
+        .unwrap_or_default()
+}
+
+/// Atomically replace skills in the global cache (called by hot reload).
+pub fn update_global_skills(skills: Vec<Skill>) {
+    if let Some(cache) = GLOBAL_SKILLS_CACHE.get() {
+        *cache.write().unwrap() = skills;
+    }
+}
+
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
 const OPEN_SKILLS_SYNC_MARKER: &str = ".zeroclaw-open-skills-sync";
 const OPEN_SKILLS_SYNC_INTERVAL_SECS: u64 = 60 * 60 * 24 * 7;

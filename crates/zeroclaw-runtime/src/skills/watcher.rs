@@ -85,13 +85,6 @@ fn spawn_notify_watcher(
 
     info!("Spawning notify watcher for skills directory: {:?} (watch_mode: {})", skills_dir, config.watch_mode);
 
-    if !skills_dir.exists() {
-        warn!(
-            "Skills directory does not exist: {:?}. Will retry when created.",
-            skills_dir
-        );
-    }
-
     let handle = tokio::spawn(async move {
         if let Err(e) = run_notify_watcher(config, reload_tx).await {
             error!("Notify watcher failed: {}", e);
@@ -131,21 +124,29 @@ async fn run_notify_watcher(
     }, Config::default())
     .context("Failed to create file watcher")?;
 
-    // Watch the skills directory
+    // Watch the skills directory if it exists; otherwise enter a retry loop
+    // that periodically checks for directory creation.
     let skills_dir = &config.skills_dir;
+    let mut watching = false;
     if skills_dir.exists() {
         watcher
             .watch(skills_dir, RecursiveMode::Recursive)
             .context("Failed to watch skills directory")?;
+        watching = true;
+        info!(
+            "Watching skills directory: {:?} (debounce: {}ms)",
+            skills_dir, config.debounce_ms
+        );
+    } else {
+        warn!(
+            "Skills directory does not exist: {:?}. Will retry every 30s.",
+            skills_dir
+        );
     }
-
-    info!(
-        "Watching skills directory: {:?} (debounce: {}ms)",
-        skills_dir, config.debounce_ms
-    );
 
     // Debounce loop: wait for a quiet period after the last event
     let debounce_duration = Duration::from_millis(config.debounce_ms);
+    let dir_retry_interval = Duration::from_secs(30);
     let mut pending_event = false;
     let mut last_event_time = Instant::now();
 
@@ -185,6 +186,34 @@ async fn run_notify_watcher(
                     pending_event = false;
                 }
             }
+
+            // Directory existence retry — when the skills dir didn't exist at
+            // startup, periodically check whether it has been created so we can
+            // register the watcher.
+            _ = tokio::time::sleep(dir_retry_interval), if !watching => {
+                if skills_dir.exists() {
+                    match watcher.watch(skills_dir, RecursiveMode::Recursive) {
+                        Ok(()) => {
+                            watching = true;
+                            info!(
+                                "Skills directory appeared, now watching: {:?}",
+                                skills_dir
+                            );
+                            // Trigger an immediate reload to pick up any existing skills
+                            if reload_tx.send(ReloadRequest { force: true }).await.is_err() {
+                                warn!("Reload request channel closed, stopping watcher");
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Skills directory found but watch failed: {}. Retrying in 30s.",
+                                e
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -210,6 +239,7 @@ async fn run_poll_watcher(
     config: WatcherConfig,
     reload_tx: mpsc::Sender<ReloadRequest>,
 ) -> Result<()> {
+    use std::collections::HashSet;
     use std::fs;
 
     let skills_dir = config.skills_dir;
@@ -230,11 +260,13 @@ async fn run_poll_watcher(
         }
 
         let mut changed = false;
+        let mut current_paths = HashSet::new();
 
         if let Ok(entries) = fs::read_dir(&skills_dir) {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
+                    current_paths.insert(path.clone());
                     if let Ok(metadata) = fs::metadata(&path) {
                         if let Ok(modified) = metadata.modified() {
                             let mtime = modified
@@ -242,10 +274,16 @@ async fn run_poll_watcher(
                                 .unwrap_or_default()
                                 .as_secs();
 
-                            if let Some(&last_mtime) = last_mtimes.get(&path) {
-                                if mtime != last_mtime {
+                            match last_mtimes.get(&path) {
+                                // Modified: mtime changed since last poll
+                                Some(&last_mtime) if mtime != last_mtime => {
                                     changed = true;
                                 }
+                                // New directory: not seen in previous poll
+                                None => {
+                                    changed = true;
+                                }
+                                _ => {}
                             }
                             last_mtimes.insert(path, mtime);
                         }
@@ -253,6 +291,17 @@ async fn run_poll_watcher(
                 }
             }
         }
+
+        // Detect removed directories (paths in last_mtimes but not on disk)
+        for path in last_mtimes.keys() {
+            if !current_paths.contains(path) {
+                changed = true;
+                break;
+            }
+        }
+
+        // Remove stale entries for directories that no longer exist
+        last_mtimes.retain(|path, _| current_paths.contains(path));
 
         if changed {
             info!("Skills directory changed (detected by poll), triggering reload");

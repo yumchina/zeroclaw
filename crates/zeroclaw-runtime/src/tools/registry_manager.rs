@@ -194,9 +194,12 @@ pub fn push_global_watcher_handle(handle: tokio::task::JoinHandle<()>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::ToolResult;
+    use async_trait::async_trait;
 
     struct DummyTool;
 
+    #[async_trait]
     impl Tool for DummyTool {
         fn name(&self) -> &str {
             "dummy"
@@ -210,8 +213,8 @@ mod tests {
             serde_json::json!({"type": "object"})
         }
 
-        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<zeroclaw_api::ToolResult> {
-            Ok(zeroclaw_api::ToolResult {
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
                 success: true,
                 output: "dummy".to_string(),
                 error: None,
@@ -292,7 +295,7 @@ mod tests {
         ]));
 
         let mut handles = vec![];
-        for i in 0..10 {
+        for _i in 0..10 {
             let mgr_clone = StdArc::clone(&mgr);
             let handle = tokio::spawn(async move {
                 let tools = vec![

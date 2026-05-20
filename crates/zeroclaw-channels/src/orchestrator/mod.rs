@@ -1260,11 +1260,9 @@ fn replace_available_skills_section(base_prompt: &str, refreshed_skills: &str) -
 }
 
 fn refreshed_new_session_system_prompt(ctx: &ChannelRuntimeContext) -> String {
+    let skills = zeroclaw_runtime::skills::get_global_skills();
     let refreshed_skills = zeroclaw_runtime::skills::skills_to_prompt_with_mode(
-        &zeroclaw_runtime::skills::load_skills_with_config(
-            ctx.workspace_dir.as_ref(),
-            ctx.prompt_config.as_ref(),
-        ),
+        &skills,
         ctx.workspace_dir.as_ref(),
         ctx.prompt_config.skills.prompt_injection_mode,
     );
@@ -2986,16 +2984,6 @@ async fn process_channel_message(
         clear_sender_history(ctx.as_ref(), &history_key);
     }
 
-    let had_prior_history = if force_fresh_session {
-        false
-    } else {
-        ctx.conversation_histories
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .peek(&history_key)
-            .is_some_and(|turns| !turns.is_empty())
-    };
-
     // Preserve user turn before the LLM call so interrupted requests keep context.
     append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
 
@@ -3133,14 +3121,10 @@ async fn process_channel_message(
         format!("{sender_memory}\n{group_memory}")
     };
 
-    // Use refreshed system prompt for new sessions (master's /new support),
-    // and inject memory into system prompt (not user message) so it
-    // doesn't pollute session history and is re-fetched each turn.
-    let base_system_prompt = if had_prior_history {
-        ctx.system_prompt.as_str().to_string()
-    } else {
-        refreshed_new_session_system_prompt(ctx.as_ref())
-    };
+    // Always refresh the available_skills section of the system prompt from
+    // disk so that skill hot reload changes (new/removed/modified skills)
+    // are visible in the LLM context immediately, even for existing sessions.
+    let base_system_prompt = refreshed_new_session_system_prompt(ctx.as_ref());
     let mut system_prompt = build_channel_system_prompt(
         &base_system_prompt,
         &msg.channel,
@@ -5935,6 +5919,7 @@ pub async fn start_channels(
     // before channels started. This enables hot reload updates to be
     // visible to all channel message handlers.
     let skills = zeroclaw_runtime::skills::load_skills_with_config(&workspace, &config);
+    zeroclaw_runtime::skills::init_global_skills_cache(skills.clone());
 
     let tools_registry = match zeroclaw_runtime::tools::get_global_registry() {
         Some(registry) => {

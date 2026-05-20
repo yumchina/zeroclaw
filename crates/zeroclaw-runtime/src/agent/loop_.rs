@@ -2455,6 +2455,7 @@ pub async fn run(
 
     // ── Build system prompt from workspace MD files (OpenClaw framework) ──
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+    crate::skills::init_global_skills_cache(skills.clone());
 
     let mut tool_descs: Vec<(&str, &str)> = vec![
         (
@@ -2594,18 +2595,20 @@ pub async fn run(
         config.agent.max_system_prompt_chars,
     );
 
-    // Append structured tool-use instructions with schemas (only for non-native providers)
-    if !native_tools {
-        system_prompt.push_str(&build_tool_instructions(&tools_registry));
-    }
-
     // ── Wrap tools in ToolRegistryManager for hot reload support ─────
-    // Build complete tool registry including skill-defined tools
+    // Build complete tool registry including skill-defined tools.
+    // Must happen BEFORE build_tool_instructions so skill tool schemas
+    // are included in the system prompt for non-native providers.
     let complete_tools = tools::build_tools_with_skills(tools_registry, &skills, security.clone());
 
     // Use global registry if available (daemon mode), otherwise create local (CLI mode)
     let tools_mgr = tools::get_global_registry()
         .unwrap_or_else(|| std::sync::Arc::new(tools::ToolRegistryManager::new(complete_tools)));
+
+    // Append structured tool-use instructions with schemas (only for non-native providers)
+    if !native_tools {
+        system_prompt.push_str(&build_tool_instructions(&tools_mgr.get_current()));
+    }
 
     // Append deferred MCP tool names so the LLM knows what is available
     if !deferred_section.is_empty() {
@@ -2636,16 +2639,7 @@ pub async fn run(
     // In daemon mode, the watcher is managed by daemon/mod.rs as a
     // daemon-level singleton. Only start a per-invocation watcher in
     // CLI mode where run() is the entry point.
-    struct WatcherGuard(Vec<tokio::task::JoinHandle<()>>);
-    impl Drop for WatcherGuard {
-        fn drop(&mut self) {
-            for h in &self.0 {
-                h.abort();
-            }
-        }
-    }
-
-    let mut _watcher_guard = WatcherGuard(Vec::new());
+    let _watcher_guard = tools::WatcherGuard::new();
     let is_daemon_mode = tools::get_global_registry().is_some();
     if !is_daemon_mode && config.skills.hot_reload.enabled {
         let watcher_config = crate::skills::WatcherConfig::from_config(
@@ -2656,7 +2650,7 @@ pub async fn run(
         tracing::info!("Spawning skill watcher...");
         match crate::skills::spawn_skill_watcher(watcher_config) {
             Ok((watcher_handle, mut reload_rx)) => {
-                _watcher_guard.0.push(watcher_handle);
+                _watcher_guard.push(watcher_handle);
                 let tools_mgr_for_task = std::sync::Arc::clone(&tools_mgr);
                 let config_dir = config.workspace_dir.clone();
                 let config_for_task = config.clone();
@@ -2675,8 +2669,13 @@ pub async fn run(
                             &config_dir,
                             &config_for_task,
                         );
+                        crate::skills::update_global_skills(new_skills.clone());
 
-                        // Rebuild all builtin tools (fresh state for hot reload)
+                        // Rebuild all builtin tools (fresh state for hot reload).
+                        //
+                        // NOTE: The system prompt (skill prompt injections) is
+                        // refreshed from the global skills cache on the next turn,
+                        // so new/removed skills appear in the LLM context quickly.
                         let (composio_key, composio_entity_id) = if config_for_task.composio.enabled {
                             (
                                 config_for_task.composio.api_key.as_deref(),
@@ -2730,7 +2729,7 @@ pub async fn run(
                     }
                 });
 
-                _watcher_guard.0.push(task);
+                _watcher_guard.push(task);
             }
             Err(e) => {
                 tracing::warn!("Failed to spawn skill watcher: {}", e);

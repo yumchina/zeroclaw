@@ -1,6 +1,5 @@
 //! Integration tests for skill hot reload.
 
-use std::path::PathBuf;
 use std::time::Duration;
 use tempfile::TempDir;
 
@@ -28,12 +27,12 @@ mod hot_reload_tests {
         let skill_dir = skills_dir.join("test_skill");
         std::fs::create_dir(&skill_dir).unwrap();
 
-        // Wait for poll to detect change
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Wait for poll to detect change (need 2 poll cycles)
+        tokio::time::sleep(Duration::from_secs(3)).await;
 
         // Check if reload was triggered
         let reload_req = tokio::time::timeout(
-            Duration::from_secs(3),
+            Duration::from_secs(5),
             reload_rx.recv()
         ).await;
 
@@ -42,19 +41,21 @@ mod hot_reload_tests {
 
     #[tokio::test]
     async fn test_registry_manager_concurrent_swap() {
-        use crate::tools::ToolRegistryManager;
+        use crate::tools::{ToolRegistryManager, Tool, ToolResult};
+        use async_trait::async_trait;
         use std::sync::Arc;
 
-        struct DummyTool(usize);
+        struct DummyTool { _n: usize }
 
-        impl zeroclaw_api::Tool for DummyTool {
+        #[async_trait]
+        impl Tool for DummyTool {
             fn name(&self) -> &str { "dummy" }
             fn description(&self) -> &str { "dummy tool" }
             fn parameters_schema(&self) -> serde_json::Value {
                 serde_json::json!({"type": "object"})
             }
-            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<zeroclaw_api::ToolResult> {
-                Ok(zeroclaw_api::ToolResult {
+            async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                Ok(ToolResult {
                     success: true,
                     output: "dummy".to_string(),
                     error: None,
@@ -63,7 +64,7 @@ mod hot_reload_tests {
         }
 
         let mgr = Arc::new(ToolRegistryManager::new(vec![
-            Box::new(DummyTool(1)) as Box<dyn zeroclaw_api::Tool>
+            Box::new(DummyTool { _n: 1 }) as Box<dyn Tool>
         ]));
 
         // Spawn multiple tasks that swap concurrently
@@ -72,7 +73,7 @@ mod hot_reload_tests {
             let mgr_clone = Arc::clone(&mgr);
             let handle = tokio::spawn(async move {
                 let tools = vec![
-                    Box::new(DummyTool(i)) as Box<dyn zeroclaw_api::Tool>
+                    Box::new(DummyTool { _n: i }) as Box<dyn Tool>
                 ];
                 mgr_clone.atomic_swap(tools)
             });

@@ -168,6 +168,7 @@ pub async fn run(
 
     // Load skills and build initial tool set
     let skills = crate::skills::load_skills_with_config(&config.workspace_dir, &config);
+    crate::skills::init_global_skills_cache(skills.clone());
     let security = std::sync::Arc::new(crate::security::SecurityPolicy::from_config(
         &config.autonomy,
         &config.workspace_dir,
@@ -233,9 +234,14 @@ pub async fn run(
                             &reload_workspace,
                             reload_config.as_ref(),
                         );
+                        crate::skills::update_global_skills(new_skills.clone());
 
                         // Rebuild all tools (simplified: use a helper function)
-                        // For hot reload, we rebuild the complete tool set
+                        // For hot reload, we rebuild the complete tool set.
+                        //
+                        // NOTE: The system prompt (skill prompt injections) is
+                        // refreshed from the global skills cache on the next turn,
+                        // so new/removed skills appear in the LLM context quickly.
                         let (composio_key_r, composio_entity_id_r) = if reload_config.composio.enabled {
                             (reload_config.composio.api_key.as_deref(), Some(reload_config.composio.entity_id.as_str()))
                         } else {
