@@ -336,6 +336,7 @@ impl Tool for DawnS3Tool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zeroclaw_config::autonomy::AutonomyLevel;
 
     #[test]
     fn upload_url_format() {
@@ -391,6 +392,202 @@ mod tests {
         assert_eq!(
             guess_content_type("/path/to/file"),
             "application/octet-stream"
+        );
+    }
+
+    // ── execute() path tests ────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn execute_missing_file_path() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = DawnS3Tool::new(
+            security,
+            "http://localhost:8091".into(),
+            "test-token".into(),
+        );
+        let result = tool.execute(json!({})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("Missing required parameter"));
+    }
+
+    #[tokio::test]
+    async fn execute_readonly_autonomy_blocked() {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::ReadOnly,
+            ..SecurityPolicy::default()
+        });
+        let tool = DawnS3Tool::new(
+            security,
+            "http://localhost:8091".into(),
+            "test-token".into(),
+        );
+        let result = tool.execute(json!({"file_path": "/any/file.txt"})).await.unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("read-only"));
+    }
+
+    #[tokio::test]
+    async fn execute_file_not_found() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = DawnS3Tool::new(
+            security,
+            "http://localhost:8091".into(),
+            "test-token".into(),
+        );
+        let result = tool
+            .execute(json!({"file_path": "/nonexistent/path/file.txt"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(err.contains("File not found"), "expected file-not-found, got: {err}");
+    }
+
+    #[tokio::test]
+    async fn execute_path_outside_workspace_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let outside_file = outside.join("secret.txt");
+        std::fs::write(&outside_file, b"sensitive data").unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        });
+        let tool = DawnS3Tool::new(
+            security,
+            "http://localhost:8091".into(),
+            "test-token".into(),
+        );
+        let result = tool
+            .execute(json!({"file_path": outside_file.to_str().unwrap()}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(
+            err.contains("not allowed") || err.contains("outside"),
+            "expected path rejection, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_upload_success() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/assistant/file/upload"))
+            .and(header("X-Assistant-Token", "test-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "path": "assistant/abc-123.pptx"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let test_file = workspace.join("report.pptx");
+        std::fs::write(&test_file, b"fake pptx content").unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        });
+        let tool = DawnS3Tool::new(
+            security,
+            server.uri(),
+            "test-token".into(),
+        );
+        let result = tool
+            .execute(json!({"file_path": test_file.to_str().unwrap()}))
+            .await
+            .unwrap();
+
+        assert!(result.success, "error: {:?}", result.error);
+        let out: serde_json::Value = serde_json::from_str(&result.output).unwrap();
+        assert_eq!(out["name"], "report.pptx");
+        assert_eq!(out["path"], "assistant/abc-123.pptx");
+        assert_eq!(out["base_url"], format!("{}/v1", server.uri()));
+    }
+
+    #[tokio::test]
+    async fn execute_upload_http_500() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(500).set_body_string("Internal Error"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let test_file = workspace.join("data.json");
+        std::fs::write(&test_file, b"{}").unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        });
+        let tool = DawnS3Tool::new(
+            security,
+            server.uri(),
+            "test-token".into(),
+        );
+        let result = tool
+            .execute(json!({"file_path": test_file.to_str().unwrap()}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(err.contains("500"), "expected 500 error, got: {err}");
+    }
+
+    #[tokio::test]
+    async fn execute_file_too_large() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let test_file = workspace.join("huge.bin");
+
+        // Create a sparse/allocation file larger than 100MB
+        let f = std::fs::File::create(&test_file).unwrap();
+        f.set_len(MAX_UPLOAD_BYTES + 1).unwrap();
+        drop(f);
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            ..SecurityPolicy::default()
+        });
+        let tool = DawnS3Tool::new(
+            security,
+            "http://localhost:8091".into(),
+            "test-token".into(),
+        );
+        let result = tool
+            .execute(json!({"file_path": test_file.to_str().unwrap()}))
+            .await
+            .unwrap();
+
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(
+            err.contains("too large") || err.contains("MB"),
+            "expected size-limit error, got: {err}"
         );
     }
 }
