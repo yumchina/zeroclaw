@@ -16,6 +16,7 @@
 //! [`all_tools_with_runtime`]. See `AGENTS.md` §7.3 for the full change playbook.
 
 pub mod cron_add;
+pub(crate) mod cron_common;
 pub mod cron_list;
 pub mod cron_remove;
 pub mod cron_run;
@@ -580,6 +581,8 @@ pub fn all_tools_with_runtime(
             root_config.web_search.brave_api_key.clone(),
             root_config.web_search.tavily_api_key.clone(),
             root_config.web_search.searxng_instance_url.clone(),
+            root_config.web_search.yumc_search_api_key.clone(),
+            root_config.web_search.yumc_search_base_url.clone(),
             root_config.web_search.max_results,
             root_config.web_search.timeout_secs,
             root_config.config_path.clone(),
