@@ -204,9 +204,8 @@ impl Tool for DawnS3Tool {
                     success: false,
                     output: String::new(),
                     error: Some(json!({
-                        "error": format!("File not found: {}", file_path),
+                        "error": "File not found or inaccessible",
                         "suggestion": "Check the file path is correct and the file exists",
-                        "path": file_path
                     }).to_string()),
                 });
             }
