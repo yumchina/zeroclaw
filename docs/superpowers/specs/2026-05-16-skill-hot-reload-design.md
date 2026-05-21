@@ -77,8 +77,10 @@ register_skill_tools()     // 现有函数
 ToolRegistryManager::atomic_swap(new_tools)
     │
     ▼
-广播 "skills:reloaded" 事件
+tracing 记录重载结果 (count, version)
 ```
+
+> **备注意见**: 原设计包含 `SkillReloadEvent` 枚举和广播 channel，但实际实现中无订阅者且 tracing 已完整记录所有状态。事件机制暂不实现，待有组件需要订阅 reload 事件时再添加。
 
 ---
 
@@ -200,19 +202,13 @@ let current_tools = tools_mgr.get_current();
 | 场景 | 处理方式 |
 |------|----------|
 | skill 文件格式错误 | 跳过该 skill，记录警告日志 |
-| skills 目录不存在 | 使用空 Vec，记录警告 |
+| skills 目录不存在 | watcher 每 30s 重试检测，不存在时不触发重载 |
 | 监控失败 (notify 错误) | 降级为轮询模式 (每 30s) |
-| 重载失败 (parse 错误) | 保持旧 registry，发送错误事件 |
+| 重载失败 (parse 错误) | 保持旧 registry，错误通过 tracing 记录 |
 
-### 事件定义
-
-```rust
-pub enum SkillReloadEvent {
-    Started,
-    Success { count: usize, version: u64 },
-    Failed { error: String },
-    Skipped { skill: String, reason: String },
-}
+重载状态通过 `tracing::info!` 结构化日志输出，格式如:
+```
+Skills reloaded, count=5, version=42
 ```
 
 ---
@@ -260,7 +256,7 @@ poll_interval_secs = 30  # 降级轮询间隔
 ### Phase 3: Integration
 - 连接 SkillWatcher 和 ToolRegistryManager
 - 添加配置项
-- 实现事件广播
+- 重载状态通过 tracing 日志记录
 
 ### Phase 4: Testing
 - 单元测试覆盖

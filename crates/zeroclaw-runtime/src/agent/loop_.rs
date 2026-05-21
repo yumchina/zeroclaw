@@ -2725,7 +2725,7 @@ pub async fn run(
                         // Atomic swap
                         let new_version = tools_mgr_for_task.atomic_swap(new_tools);
 
-                        info!("Skills reloaded, new version: {}", new_version);
+                        info!("Skills reloaded, count={}, version={}", new_skills.len(), new_version);
                     }
                 });
 
