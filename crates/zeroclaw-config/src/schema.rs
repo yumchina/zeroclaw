@@ -16111,6 +16111,7 @@ auto_save = true
                 #[cfg(feature = "voice-wake")]
                 voice_wake: HashMap::new(),
                 mqtt: HashMap::new(),
+                wukongim: HashMap::new(),
                 message_timeout_secs: 300,
                 ack_reactions: true,
                 show_tool_calls: true,
@@ -17343,6 +17344,7 @@ allowed_users = ["@u:matrix.org"]
             #[cfg(feature = "voice-wake")]
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
+            wukongim: HashMap::new(),
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
@@ -17728,6 +17730,7 @@ allowed_numbers = ["+1", "+2"]
             #[cfg(feature = "voice-wake")]
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
+            wukongim: HashMap::new(),
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
