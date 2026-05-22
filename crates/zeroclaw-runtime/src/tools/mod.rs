@@ -113,6 +113,10 @@ pub use zeroclaw_tools::web_fetch::WebFetchTool;
 pub use zeroclaw_tools::web_search_tool::WebSearchTool;
 pub use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
 
+// Optional Dawn SaaS integration tools (separate crate, feature-gated).
+#[cfg(feature = "dawn-tools")]
+pub use dawn_tools::DawnS3Tool;
+
 // Traits from zeroclaw-api
 pub use zeroclaw_api::schema::{CleaningStrategy, SchemaCleanr};
 pub use zeroclaw_api::tool::{Tool, ToolResult, ToolSpec};
@@ -619,6 +623,43 @@ pub fn all_tools_with_runtime(
             ),
             security.clone(),
         )));
+    }
+
+    #[cfg(feature = "dawn-tools")]
+    if root_config.dawn_s3.enabled {
+        let token = if root_config.dawn_s3.token.is_empty() {
+            std::env::var("DAWN_S3_TOKEN").unwrap_or_default()
+        } else {
+            root_config.dawn_s3.token.clone()
+        };
+        if root_config.dawn_s3.url.is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "dawn_s3: enabled but [dawn_s3].url is empty, skipping registration"
+            );
+        } else if token.is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "dawn_s3: enabled but token missing (neither [dawn_s3].token nor $DAWN_S3_TOKEN set), skipping registration"
+            );
+        } else {
+            tool_arcs.push(Arc::new(DawnS3Tool::new(
+                security.clone(),
+                root_config.dawn_s3.url.clone(),
+                token,
+            )));
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Register)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({"endpoint": root_config.dawn_s3.url})),
+                "dawn_s3: tool registered"
+            );
+        }
     }
 
     if web_fetch_config.enabled {

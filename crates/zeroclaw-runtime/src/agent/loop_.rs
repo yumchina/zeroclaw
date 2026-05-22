@@ -3257,6 +3257,13 @@ pub async fn run(
             "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to discover, 'execute' to run (optionally with connected_account_id), 'connect' to OAuth.",
         ));
         }
+        #[cfg(feature = "dawn-tools")]
+        if config.dawn_s3.enabled {
+            tool_descs.push((
+                "dawn_s3",
+                "Upload a local file to Dawn S3 compatible storage. Returns a download URL. Use when: user needs a shareable link for generated files (reports, presentations, PDFs). Don't use for temporary or intermediate files.",
+            ));
+        }
         tool_descs.push((
         "schedule",
         "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
@@ -4411,6 +4418,13 @@ pub async fn process_message(
         }
         if config.composio.enabled {
             tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
+        }
+        #[cfg(feature = "dawn-tools")]
+        if config.dawn_s3.enabled {
+            tool_descs.push((
+                "dawn_s3",
+                "Upload a local file to Dawn S3 and return a shareable URL.",
+            ));
         }
         if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
             tool_descs.push(("gpio_read", "Read GPIO pin value on connected hardware."));

@@ -131,6 +131,8 @@ pub enum ToolKind {
     SopStatus,
     SopHistory,
     Wait,
+    #[strum(serialize = "dawn_s3")]
+    DawnS3,
     Plugin,
 }
 

@@ -315,6 +315,11 @@ pub struct Config {
     #[nested]
     pub web_fetch: WebFetchConfig,
 
+    /// Dawn S3 file-upload tool configuration (`[dawn_s3]`).
+    #[serde(default)]
+    #[nested]
+    pub dawn_s3: DawnS3Config,
+
     /// Link enricher configuration (`[link_enricher]`).
     #[serde(default)]
     #[nested]
@@ -5747,6 +5752,29 @@ pub struct WebFetchConfig {
     #[serde(default)]
     #[nested]
     pub firecrawl: FirecrawlConfig,
+}
+
+/// Dawn S3 file-upload tool configuration.
+///
+/// Configures the `dawn_s3` tool (provided by the `dawn-tools` crate).
+/// The tool uploads local files to a Dawn S3-compatible storage endpoint
+/// and returns a download URL the model can share with the user.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "dawn-s3"]
+pub struct DawnS3Config {
+    /// Enable the `dawn_s3` tool. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Dawn API base URL (e.g. `http://dawn.example.com:8091`).
+    #[serde(default)]
+    pub url: String,
+    /// Assistant token for authentication. Falls back to the
+    /// `DAWN_S3_TOKEN` environment variable when empty.
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub token: String,
 }
 
 /// Firecrawl fallback mode: scrape a single page or crawl linked pages.
@@ -12821,6 +12849,7 @@ impl Default for Config {
             multimodal: MultimodalConfig::default(),
             media_pipeline: MediaPipelineConfig::default(),
             web_fetch: WebFetchConfig::default(),
+            dawn_s3: DawnS3Config::default(),
             link_enricher: LinkEnricherConfig::default(),
             text_browser: TextBrowserConfig::default(),
             web_search: WebSearchConfig::default(),
@@ -16093,6 +16122,7 @@ auto_save = true
             multimodal: MultimodalConfig::default(),
             media_pipeline: MediaPipelineConfig::default(),
             web_fetch: WebFetchConfig::default(),
+            dawn_s3: DawnS3Config::default(),
             link_enricher: LinkEnricherConfig::default(),
             text_browser: TextBrowserConfig::default(),
             web_search: WebSearchConfig::default(),
@@ -16686,6 +16716,7 @@ default_temperature = 0.7
             multimodal: MultimodalConfig::default(),
             media_pipeline: MediaPipelineConfig::default(),
             web_fetch: WebFetchConfig::default(),
+            dawn_s3: DawnS3Config::default(),
             link_enricher: LinkEnricherConfig::default(),
             text_browser: TextBrowserConfig::default(),
             web_search: WebSearchConfig::default(),

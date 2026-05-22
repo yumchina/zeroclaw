@@ -16,6 +16,7 @@ zeroclaw-memory.workspace = true
 zeroclaw-tools.workspace = true
 zeroclaw-plugins = { workspace = true, optional = true }
 zeroclaw-tool-call-parser.workspace = true
+dawn-tools = { workspace = true, optional = true }
 fluent = "0.16"
 anyhow = "1.0"
 async-trait = "0.1"
@@ -100,6 +101,7 @@ rag-pdf = ["dep:pdf-extract"]
 plugins-wasm = ["dep:zeroclaw-plugins"]
 webauthn = []
 sandbox-bubblewrap = []
+dawn-tools = ["dep:dawn-tools"]
 
 [dev-dependencies]
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }

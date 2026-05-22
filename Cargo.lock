@@ -2235,6 +2235,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c03c416ed1a30fbb027ef484ba6ab6f80e1eada675e1a2b92fd673c045a1f1d"
 
 [[package]]
+name = "dawn-tools"
+version = "0.8.0-beta-1"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "reqwest 0.12.28",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "urlencoding",
+ "uuid",
+ "wiremock",
+ "zeroclaw-api",
+ "zeroclaw-config",
+ "zeroclaw-log",
+]
+
+[[package]]
 name = "deadpool"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13536,6 +13554,7 @@ dependencies = [
  "chrono-tz",
  "console",
  "cron",
+ "dawn-tools",
  "dialoguer",
  "directories",
  "flate2",
