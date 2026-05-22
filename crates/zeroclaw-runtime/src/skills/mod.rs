@@ -65,6 +65,12 @@ pub struct Skill {
     pub tools: Vec<SkillTool>,
     #[serde(default)]
     pub prompts: Vec<String>,
+    /// When `false`, the skill is loaded so it shows in `zeroclaw skills list`
+    /// (with a `[disabled]` badge), but its prompt content is NOT injected
+    /// into the system prompt and its tool definitions are NOT registered.
+    /// Default: `true`.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     #[serde(skip)]
     pub location: Option<PathBuf>,
 }
@@ -121,6 +127,8 @@ struct SkillMeta {
     tags: Vec<String>,
     #[serde(default)]
     prompts: Vec<String>,
+    #[serde(default = "default_true")]
+    enabled: bool,
 }
 
 /// Provenance metadata emitted by the SkillForge integrator (see
@@ -171,10 +179,15 @@ struct SkillMarkdownMeta {
     version: Option<String>,
     author: Option<String>,
     tags: Vec<String>,
+    enabled: Option<bool>,
 }
 
 fn default_version() -> String {
     "0.1.0".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Trust tier of a skill listed in the `zeroclaw-skills` registry.
@@ -959,6 +972,7 @@ fn load_skill_toml(path: &Path) -> Result<Skill> {
         tags: manifest.skill.tags,
         tools: manifest.tools,
         prompts,
+        enabled: manifest.skill.enabled,
         location: Some(path.to_path_buf()),
     })
 }
@@ -985,6 +999,7 @@ fn load_skill_md(path: &Path, dir: &Path) -> Result<Skill> {
         tags: parsed.meta.tags,
         tools: Vec::new(),
         prompts: vec![parsed.body],
+        enabled: parsed.meta.enabled.unwrap_or(true),
         location: Some(path.to_path_buf()),
     })
 }
@@ -1024,6 +1039,7 @@ fn load_open_skill_md(path: &Path) -> Result<Skill> {
         tags: parsed.meta.tags,
         tools: Vec::new(),
         prompts: vec![parsed.body],
+        enabled: true, // open-skills ignore per-file enabled; controlled at the repo level
         location: Some(path.to_path_buf()),
     }))
 }
@@ -1120,6 +1136,13 @@ fn parse_simple_frontmatter(s: &str) -> SkillMarkdownMeta {
                         .filter(|t| !t.is_empty())
                         .collect();
                 }
+            }
+            "enabled" => {
+                meta.enabled = match val.to_ascii_lowercase().as_str() {
+                    "true" | "1" | "yes" | "on" => Some(true),
+                    "false" | "0" | "no" | "off" => Some(false),
+                    _ => None,
+                };
             }
             _ => {}
         }
@@ -1234,6 +1257,9 @@ pub fn skills_to_prompt_with_mode(
     };
 
     for skill in skills {
+        if !skill.enabled {
+            continue;
+        }
         let _ = writeln!(prompt, "  <skill>");
         write_xml_text_element(&mut prompt, 4, "name", &skill.name);
         write_xml_text_element(&mut prompt, 4, "description", &skill.description);
@@ -1328,6 +1354,9 @@ pub fn skills_to_tools(
 ) -> Vec<Box<dyn zeroclaw_api::tool::Tool>> {
     let mut tools: Vec<Box<dyn zeroclaw_api::tool::Tool>> = Vec::new();
     for skill in skills {
+        if !skill.enabled {
+            continue;
+        }
         for tool in &skill.tools {
             match tool.kind.as_str() {
                 "shell" | "script" => {
@@ -2663,6 +2692,75 @@ description = "fine"
         assert!(
             !names.contains(&"bad-open"),
             "bad open-skill must be skipped, not silently accepted; got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn enabled_false_is_parsed_from_md_frontmatter() {
+        let content = "---\nname: test-skill\ndescription: test\nenabled: false\n---\n\nBody";
+        let parsed = parse_skill_markdown(content);
+        assert_eq!(parsed.meta.enabled, Some(false));
+    }
+
+    #[test]
+    fn enabled_true_is_parsed_from_md_frontmatter() {
+        let content = "---\nname: test-skill\ndescription: test\nenabled: true\n---\n\nBody";
+        let parsed = parse_skill_markdown(content);
+        assert_eq!(parsed.meta.enabled, Some(true));
+    }
+
+    #[test]
+    fn enabled_defaults_to_none_when_absent() {
+        let content = "---\nname: test-skill\ndescription: test\n---\n\nBody";
+        let parsed = parse_skill_markdown(content);
+        assert_eq!(parsed.meta.enabled, None); // None → caller defaults to true
+    }
+
+    #[test]
+    fn enabled_aliases_are_parsed_correctly() {
+        for (input, expected) in [
+            ("yes", Some(true)),
+            ("on", Some(true)),
+            ("1", Some(true)),
+            ("no", Some(false)),
+            ("off", Some(false)),
+            ("0", Some(false)),
+            ("maybe", None),
+        ] {
+            let content =
+                format!("---\nname: test\ndescription: test\nenabled: {input}\n---\n\nBody");
+            let parsed = parse_skill_markdown(&content);
+            assert_eq!(
+                parsed.meta.enabled, expected,
+                "enabled: {input} should parse to {expected:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_skill_excluded_from_prompt() {
+        use tempfile::TempDir;
+        let tmp = TempDir::new().unwrap();
+        // Write a disabled skill
+        let skill_dir = tmp.path().join("my-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: my-skill\ndescription: disabled\nenabled: false\n---\n\nDo stuff.",
+        )
+        .unwrap();
+
+        let skills = load_skills_from_directory(tmp.path(), false);
+        // Disabled skills must still be loaded (so `skills list` can show them as [disabled]).
+        // The filtering happens in skills_to_prompt, not in load_skills_from_directory.
+        assert_eq!(skills.len(), 1);
+        assert!(!skills[0].enabled);
+
+        // but excluded from prompt
+        let prompt = skills_to_prompt(&skills, tmp.path());
+        assert!(
+            !prompt.contains("my-skill"),
+            "disabled skill must not appear in prompt"
         );
     }
 }

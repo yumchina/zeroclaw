@@ -4047,6 +4047,7 @@ mod tests {
                 })
                 .collect(),
             prompts: vec![],
+            enabled: true,
             location: None,
         }
     }

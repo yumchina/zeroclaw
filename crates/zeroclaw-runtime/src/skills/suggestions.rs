@@ -277,6 +277,7 @@ mod tests {
             tags: vec![],
             tools: vec![],
             prompts: vec![],
+            enabled: true,
             location: None,
         }
     }

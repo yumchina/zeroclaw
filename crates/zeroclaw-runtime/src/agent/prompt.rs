@@ -485,6 +485,7 @@ mod tests {
                 args: std::collections::HashMap::new(),
             }],
             prompts: vec!["Run smoke tests before deploy.".into()],
+            enabled: true,
             location: None,
         }];
 
@@ -529,6 +530,7 @@ mod tests {
                 args: std::collections::HashMap::new(),
             }],
             prompts: vec!["Run smoke tests before deploy.".into()],
+            enabled: true,
             location: Some(Path::new("/tmp/workspace/skills/deploy/SKILL.md").to_path_buf()),
         }];
 
@@ -603,6 +605,7 @@ mod tests {
                 args: std::collections::HashMap::new(),
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
+            enabled: true,
             location: None,
         }];
         let ctx = PromptContext {

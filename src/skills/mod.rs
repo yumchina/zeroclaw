@@ -45,9 +45,15 @@ pub async fn handle_command(
                 println!("Installed skills ({}):", skills.len());
                 println!();
                 for skill in &skills {
+                    let disabled_tag = if skill.enabled {
+                        String::new()
+                    } else {
+                        format!(" {}", console::style("[disabled]").red().dim())
+                    };
                     println!(
-                        "  {} {} — {}",
+                        "  {}{} {} — {}",
                         console::style(&skill.name).white().bold(),
+                        disabled_tag,
                         console::style(format!("v{}", skill.version)).dim(),
                         skill.description
                     );
