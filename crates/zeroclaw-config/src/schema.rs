@@ -9934,6 +9934,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub mqtt: HashMap<String, MqttConfig>,
+    /// WuKongIM channel instances (`[channels.wukongim.<alias>]`).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[nested]
+    pub wukongim: HashMap<String, WuKongIMConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -10075,6 +10079,10 @@ impl ChannelsConfig {
                 Box::new(ConfigWrapper::new(self.mqtt.get("default"))),
                 !self.mqtt.is_empty(),
             ),
+            (
+                Box::new(ConfigWrapper::new(self.wukongim.get("default"))),
+                !self.wukongim.is_empty(),
+            ),
         ]
     }
 
@@ -10133,6 +10141,7 @@ impl Default for ChannelsConfig {
             voice_wake: HashMap::new(),
             voice_duplex: HashMap::new(),
             mqtt: HashMap::new(),
+            wukongim: HashMap::new(),
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
             show_tool_calls: false,
@@ -10540,6 +10549,97 @@ impl ChannelConfig for WebhookConfig {
     fn desc() -> &'static str {
         "HTTP endpoint"
     }
+}
+
+/// WuKongIM channel configuration.
+///
+/// WuKongIM is a high-performance open-source instant messaging engine.
+/// Bot communicates with the WuKongIM server over WebSocket using JSON-RPC 2.0.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels.wukongim"]
+pub struct WuKongIMConfig {
+    /// Whether this channel is active. The runtime only loads channels whose
+    /// `enabled = true`. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// WebSocket URL for WuKongIM (e.g. `ws://host:5200`).
+    pub ws_url: String,
+    /// Bot user ID registered on the WuKongIM server.
+    pub uid: String,
+    /// Auth token for the user.
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub token: String,
+    /// Device ID (e.g. `"web-001"`).
+    pub device_id: String,
+    /// Device flag: `0=App`, `1=Web`, `2=Sys`. Default: `1` (Web).
+    #[serde(default = "default_wukongim_device_flag")]
+    pub device_flag: i32,
+    /// Allowed user IDs (empty = deny all, `"*"` = allow all).
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// When true, only respond to messages that @-mention the bot in groups.
+    /// Direct messages (channel_type=1) are always processed.
+    #[serde(default)]
+    pub mention_only: bool,
+    /// How long (seconds) to wait for the operator to approve a tool call. Default: `300`.
+    #[serde(default = "default_wukongim_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
+    /// Directory for downloaded files (relative to workspace or absolute path).
+    /// Default: `"downloads"` (i.e., `{workspace_dir}/downloads`).
+    #[serde(default = "default_wukongim_downloads_dir")]
+    pub downloads_dir: String,
+    /// Dawn API base URL for history synchronization and unread clearing.
+    #[serde(default)]
+    pub dawn_url: String,
+    /// Assistant token for Dawn API authentication.
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub dawn_token: String,
+    /// Whether to send a quick acknowledgment message on message receipt. Default: `true`.
+    #[serde(default = "default_true")]
+    pub ack_reactions: bool,
+    /// Quick acknowledgment message text. Defaults to `"👌 收到，我想想..."` when empty.
+    #[serde(default)]
+    pub ack_reactions_message: String,
+    /// Minimum interval (seconds) between acknowledgment messages for the same sender.
+    /// Messages received within this window will not trigger a quick reply. Default: `300`.
+    #[serde(default = "default_wukongim_ack_reactions_delay")]
+    pub ack_reactions_delay: u64,
+    /// Whether to opt in to receiving real-time agent-progress updates
+    /// (the `send_status_update` Channel hook). Default: `false`.
+    ///
+    /// Currently unwired in the 0.8.0 port — reserved for future re-implementation
+    /// when the status streaming surface lands on the new architecture.
+    #[serde(default)]
+    pub progress_streaming: bool,
+}
+
+impl ChannelConfig for WuKongIMConfig {
+    fn name() -> &'static str {
+        "WuKongIM"
+    }
+    fn desc() -> &'static str {
+        "WuKongIM messaging channel"
+    }
+}
+
+fn default_wukongim_device_flag() -> i32 {
+    1
+}
+
+fn default_wukongim_approval_timeout_secs() -> u64 {
+    300
+}
+
+fn default_wukongim_downloads_dir() -> String {
+    "downloads".to_string()
+}
+
+fn default_wukongim_ack_reactions_delay() -> u64 {
+    300
 }
 
 /// iMessage channel configuration (macOS only).

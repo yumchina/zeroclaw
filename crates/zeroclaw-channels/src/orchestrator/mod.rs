@@ -61,6 +61,8 @@ pub use crate::webhook::WebhookChannel;
 pub use crate::wechat::WeChatChannel;
 pub use crate::wecom::WeComChannel;
 pub use crate::whatsapp::WhatsAppChannel;
+#[cfg(feature = "channel-wukongim")]
+pub use crate::wukongim::WuKongIMChannel;
 pub use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 // Local channel types (in misc, not zeroclaw-channels)
 pub use crate::cli::CliChannel;
@@ -5689,6 +5691,47 @@ fn collect_configured_channels(
                 .with_proxy_url(mm.proxy_url.clone())
                 .with_transcription(config.transcription.clone()),
             ),
+        });
+    }
+
+    #[cfg(feature = "channel-wukongim")]
+    for (alias, wk) in &config.channels.wukongim {
+        if !active_channel_aliases.contains(&format!("wukongim.{alias}")) {
+            continue;
+        }
+        if !wk.enabled {
+            continue;
+        }
+        let memory: Arc<dyn zeroclaw_api::memory_traits::Memory> =
+            match zeroclaw_memory::SqliteMemory::new_named(
+                "sqlite",
+                &config.data_dir,
+                &format!("wukongim_{alias}"),
+            ) {
+                Ok(mem) => Arc::new(mem),
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "error": format!("{}", e),
+                                "alias": alias,
+                            })),
+                        "wukongim: failed to open sqlite memory backend"
+                    );
+                    continue;
+                }
+            };
+        channels.push(ConfiguredChannel {
+            display_name: "WuKongIM",
+            alias: Some(alias.clone()),
+            channel: Arc::new(WuKongIMChannel::from_config(
+                wk,
+                alias.clone(),
+                &config.data_dir,
+                memory,
+            )),
         });
     }
 
