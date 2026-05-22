@@ -26,7 +26,7 @@ This report tracks which local-fork functionality has been ported to the
 | **E. progress-observer crate** | 13 | ⏸️ Deferred (superseded by `zeroclaw-log`/Observer bridge) | — |
 | **F. Windows/PowerShell hardening** | 5 | ✅ Migrated (squashed) | `7eaed77e4` |
 | **G. Skills `enabled` field** | 6 | ✅ Migrated (squashed; upstream had no equivalent) | `f6199e8bb` |
-| **H. Provider routing extensions** | 1 | ❌ Pending | — |
+| **H. Provider routing extensions** | 1 | 🟡 Partial (temperature ported; max_tokens superseded by upstream alias mechanism) | `7e3c5da73` |
 | **I. Channel/orchestrator misc** | 8 | ❌ Pending | — |
 | **J. Multimodal / Lark image fixes** | 11 | ❌ Pending (may be redundant with upstream) | — |
 | **K. UTF-8 / truncation fixes** | 2 | ✅ Migrated (1 ported, 1 moot — upstream removed code path) | `225d3a670` |
@@ -314,17 +314,39 @@ All 6 master commits squashed into **`f6199e8bb` feat(skills): support per-skill
 
 ---
 
-## H. Provider routing — per-route max_tokens / temperature (❌ Pending)
+## H. Provider routing — per-route temperature (🟡 Partial — 1 commit on 0.8.0)
+
+Master commit covered both `max_tokens` and `temperature`; ported only
+the temperature half. Reason: upstream 0.8.0 already supports per-route
+max-token budgets via per-alias config — declaring two aliases for the
+same provider family with distinct `max_tokens` and pointing two routes
+at them yields the same outcome as master's synthetic
+`{provider}::max_tokens::{n}` mechanism, without the new code path.
+Upstream temperature, on the other hand, is read once at agent setup
+(`agent.rs:928-932`) and is not switchable per-route — that gap is
+what this port closes.
+
+Owner of completion: **`7e3c5da73` feat(providers): per-route temperature override on model_routes**.
 
 | Status | Commit | Title |
 |--------|--------|-------|
-| ❌ | `68109993d` | feat(providers): per-route max_tokens and temperature overrides in model_routes |
+| 🟡 | `68109993d` | feat(providers): per-route max_tokens and temperature overrides in model_routes — temperature half ported; max_tokens half deliberately skipped |
 
-**Migration plan**: re-implement on top of upstream's new
-`RouterModelProvider` (the trait was renamed `Provider` → `ModelProvider`
-and the router signature changed). The `max_tokens`/`temperature` config
-schema fields already exist locally and need to be added to upstream's
-`ModelRouteConfig`. Non-trivial — touches `providers/{lib,router}.rs`.
+> **Precedence**: when a route's `temperature` is set, it wins over the
+> caller-supplied value (typically the agent's resolved
+> `[model_providers.<alias>].temperature`). When unset, the caller
+> value passes through. Bare model names (no `"hint:"` prefix) always
+> pass through. 4 new router unit tests lock the contract.
+
+> **For per-route max_tokens** on this branch, declare additional
+> aliases under the same family, e.g.
+> `[model_providers.openrouter.fast] max_tokens = 512` plus
+> `[model_providers.openrouter.creative] max_tokens = 4096`, then point
+> the two routes at `openrouter.fast` and `openrouter.creative`. The
+> `options_for_provider_ref` machinery (`providers/lib.rs:779`) builds
+> a distinct `ModelProviderRuntimeOptions` per alias, with its own
+> `provider_max_tokens`, which the factory threads into each provider
+> build.
 
 ---
 
@@ -424,7 +446,7 @@ Based on dependency and risk:
 3. ~~**C. YumcSearch route**~~ — ✅ done (`d608b8f1b`)
 4. ~~**B. dawn_s3**~~ — ✅ done (`688cd30a7`)
 5. ~~**G. Skills `enabled` field**~~ — ✅ done (`f6199e8bb`)
-6. **H. Per-route max_tokens/temperature** — needs adaptation to new ModelProvider API
+6. ~~**H. Per-route temperature**~~ — ✅ done (`7e3c5da73`); per-route max_tokens left to upstream alias mechanism
 7. **I. Channels/orchestrator misc** — case-by-case
 8. **J. Multimodal/Lark fixes** — diff against upstream first; many may be redundant
 9. **L. Node.js prompt addition + skill_directory** — small, port after I lands
