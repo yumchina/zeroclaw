@@ -29,7 +29,7 @@ This report tracks which local-fork functionality has been ported to the
 | **H. Provider routing extensions** | 1 | ❌ Pending | — |
 | **I. Channel/orchestrator misc** | 8 | ❌ Pending | — |
 | **J. Multimodal / Lark image fixes** | 11 | ❌ Pending (may be redundant with upstream) | — |
-| **K. UTF-8 / truncation fixes** | 2 | ❌ Pending | — |
+| **K. UTF-8 / truncation fixes** | 2 | ✅ Migrated (1 ported, 1 moot — upstream removed code path) | `225d3a670` |
 | **L. System-prompt additions (S3, Node.js)** | 3 | ❌ Pending | — |
 | **M. Docs / housekeeping** | 5 | ❌ Pending (low priority) | — |
 | **N. Merge / chore glue** | ~75 | 🟪 N/A | — |
@@ -350,12 +350,14 @@ before porting — upstream may have done similar work independently.
 
 ---
 
-## K. UTF-8 / truncation fixes (❌ Pending — low risk, port directly)
+## K. UTF-8 / truncation fixes (✅ Migrated — 1 commit on 0.8.0)
+
+Ported via **`225d3a670` fix(tools/linkedin): prevent UTF-8 boundary panic when truncating**.
 
 | Status | Commit | Title |
 |--------|--------|-------|
-| ❌ | `b0f06b470` | fix(tools): prevent UTF-8 boundary panic in LinkedIn string truncation |
-| ❌ | `6226cbc05` | fix(runtime): prevent panic when truncating multi-byte UTF-8 responses |
+| ✅ | `b0f06b470` | fix(tools): prevent UTF-8 boundary panic in LinkedIn string truncation — both `linkedin.rs:246` and `linkedin_client.rs:1188` slice sites fixed with `is_char_boundary` walk-back |
+| ⏸️ | `6226cbc05` | fix(runtime): prevent panic when truncating multi-byte UTF-8 responses — **moot**: upstream 0.8.0 removed the buggy `&response_text[..1000]` debug-log path in `agent/loop_.rs` entirely, no port needed |
 
 ---
 
@@ -404,7 +406,7 @@ Examples:
 
 Based on dependency and risk:
 
-1. **K. UTF-8 fixes** — small, mechanical, no risk
+1. ~~**K. UTF-8 fixes**~~ — ✅ done (`225d3a670`)
 2. **F. Windows/PowerShell hardening** — small, mostly mechanical (drop the one already-upstream commit)
 3. ~~**C. YumcSearch route**~~ — ✅ done (`d608b8f1b`)
 4. ~~**B. dawn_s3**~~ — ✅ done (`688cd30a7`)
