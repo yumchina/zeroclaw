@@ -25,7 +25,7 @@ This report tracks which local-fork functionality has been ported to the
 | **D. Local logging refactor** | 9 | ⏸️ Deferred (superseded by `zeroclaw-log`) | — |
 | **E. progress-observer crate** | 13 | ⏸️ Deferred (superseded by `zeroclaw-log`/Observer bridge) | — |
 | **F. Windows/PowerShell hardening** | 5 | ✅ Migrated (squashed) | `7eaed77e4` |
-| **G. Skills `enabled` field** | 6 | ❌ Pending (upstream may have equivalent) | — |
+| **G. Skills `enabled` field** | 6 | ✅ Migrated (squashed; upstream had no equivalent) | `f6199e8bb` |
 | **H. Provider routing extensions** | 1 | ❌ Pending | — |
 | **I. Channel/orchestrator misc** | 8 | ❌ Pending | — |
 | **J. Multimodal / Lark image fixes** | 11 | ❌ Pending (may be redundant with upstream) | — |
@@ -289,20 +289,28 @@ All 5 master commits squashed into **`7eaed77e4` feat(shell,security): Windows/P
 
 ---
 
-## G. Skills `enabled` field (❌ Pending — verify against upstream first)
+## G. Skills `enabled` field (✅ Migrated — 1 commit on 0.8.0)
+
+Confirmed: upstream 0.8.0's skills refactor (new submodules bundle.rs,
+constants.rs, document.rs, frontmatter.rs, reference.rs, scaffold.rs,
+service.rs) did NOT add an enabled/disabled field — port was needed.
+
+All 6 master commits squashed into **`f6199e8bb` feat(skills): support per-skill enabled flag**.
 
 | Status | Commit | Title |
 |--------|--------|-------|
-| ❌ | `52a93c369` | test(skills): add failing tests for enabled field (TDD) |
-| ❌ | `a3b493ad1` | test(skills): clarify design contract in disabled_skill_excluded_from_prompt |
-| ❌ | `76e1a3515` | feat(skills): add enabled field to Skill, SkillMeta, SkillMarkdownMeta |
-| ❌ | `ee7a78775` | feat(skills): wire enabled field through loaders and frontmatter parser |
-| ❌ | `ba50948f9` | feat(skills): filter disabled skills from prompt and tool registry |
-| ❌ | `ceb83c2bb` | feat(skills): show [disabled] badge in skills list |
+| ✅ | `52a93c369` | test(skills): add failing tests for enabled field (TDD) |
+| ✅ | `a3b493ad1` | test(skills): clarify design contract in disabled_skill_excluded_from_prompt |
+| ✅ | `76e1a3515` | feat(skills): add enabled field to Skill, SkillMeta, SkillMarkdownMeta |
+| 🟡 | `ee7a78775` | feat(skills): wire enabled field through loaders and frontmatter parser — **skipped** the `doctor/mod.rs max_tokens/temperature` artifact that belongs to Area H |
+| ✅ | `ba50948f9` | feat(skills): filter disabled skills from prompt and tool registry |
+| ✅ | `ceb83c2bb` | feat(skills): show [disabled] badge in skills list |
 
-**First step**: check whether upstream 0.8.0 already added a skill
-enabled/disabled mechanism (likely with the new skills/bundle/scaffold
-refactor). If yes, this is no-op. If no, port.
+> **0.8.0 changes**: serde `default_true` helper added next to existing
+> `default_version`. 5 new unit tests (parse `enabled: true|false`,
+> default to `None`, alias values `yes/on/1/no/off/0`, disabled skill
+> excluded from system prompt). 4 test-only `Skill { ... }` literal
+> sites filled in with `enabled: true,`. All 146 skills tests pass.
 
 ---
 
@@ -415,7 +423,7 @@ Based on dependency and risk:
 2. ~~**F. Windows/PowerShell hardening**~~ — ✅ done (`7eaed77e4`)
 3. ~~**C. YumcSearch route**~~ — ✅ done (`d608b8f1b`)
 4. ~~**B. dawn_s3**~~ — ✅ done (`688cd30a7`)
-5. **G. Skills `enabled` field** — check upstream first; port if absent
+5. ~~**G. Skills `enabled` field**~~ — ✅ done (`f6199e8bb`)
 6. **H. Per-route max_tokens/temperature** — needs adaptation to new ModelProvider API
 7. **I. Channels/orchestrator misc** — case-by-case
 8. **J. Multimodal/Lark fixes** — diff against upstream first; many may be redundant
