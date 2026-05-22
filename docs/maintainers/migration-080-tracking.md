@@ -21,7 +21,7 @@ This report tracks which local-fork functionality has been ported to the
 |------|---------|--------|---------------------|
 | **A. WuKongIM channel** | ~70 | ✅ Migrated (minus progress_streaming) | `7759e1d52` |
 | **B. dawn_s3 / DawnS3Tool** | 9 | ✅ Migrated (new `dawn-tools` crate) | `688cd30a7` |
-| **C. Web search routing (YumcSearch)** | 2 | ❌ Pending | — |
+| **C. Web search routing (YumcSearch)** | 2 | ✅ Migrated | `d608b8f1b` |
 | **D. Local logging refactor** | 9 | ⏸️ Deferred (superseded by `zeroclaw-log`) | — |
 | **E. progress-observer crate** | 13 | ⏸️ Deferred (superseded by `zeroclaw-log`/Observer bridge) | — |
 | **F. Windows/PowerShell hardening** | 5 | ❌ Pending | — |
@@ -192,16 +192,22 @@ Owner of completion: **`688cd30a7` feat(dawn-tools): add dawn-tools crate with D
 
 ---
 
-## C. Web search routing — YumcSearch (❌ Pending)
+## C. Web search routing — YumcSearch (✅ Migrated — 1 commit on 0.8.0)
+
+Ported via **`d608b8f1b` feat(web_search): add YumcSearch provider route**.
 
 | Status | Commit | Title |
 |--------|--------|-------|
-| ❌ | `3480e0857` | feat: implement extensible web search tool with lazy configuration |
-| ❌ | (overlaps `f58ae18c6` above) | YumcSearch alias resolution in `web_search_provider_routing.rs` |
+| ✅ | `3480e0857` | feat: implement extensible web search tool with lazy configuration |
+| ✅ | (shared with `f58ae18c6` schema portion) | YumcSearch alias resolution in `web_search_provider_routing.rs` |
 
-**Migration plan**: add `YumcSearch` variant to upstream's
-`WebSearchProviderRoute` enum + alias case in
-`resolve_web_search_provider`. Small patch.
+> **0.8.0 changes**: new `WebSearchProviderRoute::YumcSearch` variant,
+> 2 new `WebSearchConfig` fields (`yumc_search_api_key` secret +
+> `yumc_search_base_url`), 2 new args on `WebSearchTool::new_with_config`,
+> 4 new methods (`resolve_yumc_search_api_key`,
+> `reload_yumc_search_api_key`, `search_yumc_search`,
+> `parse_yumc_search_results`). All log emission via `zeroclaw-log`.
+> Lazy key reload + decrypt matches the Brave/Tavily pattern.
 
 ---
 
@@ -400,7 +406,7 @@ Based on dependency and risk:
 
 1. **K. UTF-8 fixes** — small, mechanical, no risk
 2. **F. Windows/PowerShell hardening** — small, mostly mechanical (drop the one already-upstream commit)
-3. **C. YumcSearch route** — single-file patch
+3. ~~**C. YumcSearch route**~~ — ✅ done (`d608b8f1b`)
 4. ~~**B. dawn_s3**~~ — ✅ done (`688cd30a7`)
 5. **G. Skills `enabled` field** — check upstream first; port if absent
 6. **H. Per-route max_tokens/temperature** — needs adaptation to new ModelProvider API
