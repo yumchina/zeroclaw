@@ -24,7 +24,7 @@ This report tracks which local-fork functionality has been ported to the
 | **C. Web search routing (YumcSearch)** | 2 | ✅ Migrated | `d608b8f1b` |
 | **D. Local logging refactor** | 9 | ⏸️ Deferred (superseded by `zeroclaw-log`) | — |
 | **E. progress-observer crate** | 13 | ⏸️ Deferred (superseded by `zeroclaw-log`/Observer bridge) | — |
-| **F. Windows/PowerShell hardening** | 5 | ❌ Pending | — |
+| **F. Windows/PowerShell hardening** | 5 | ✅ Migrated (squashed) | `7eaed77e4` |
 | **G. Skills `enabled` field** | 6 | ❌ Pending (upstream may have equivalent) | — |
 | **H. Provider routing extensions** | 1 | ❌ Pending | — |
 | **I. Channel/orchestrator misc** | 8 | ❌ Pending | — |
@@ -265,22 +265,27 @@ reviving this crate.
 
 ---
 
-## F. Windows / PowerShell hardening (❌ Pending)
+## F. Windows / PowerShell hardening (✅ Migrated — 1 commit on 0.8.0)
+
+All 5 master commits squashed into **`7eaed77e4` feat(shell,security): Windows/PowerShell hardening**.
 
 | Status | Commit | Title |
 |--------|--------|-------|
-| ❌ | `619ea3eb1` | feat(shell): use PowerShell instead of cmd.exe on Windows |
-| ❌ | `d168b641a` | feat(shell): prefer pwsh.exe, fall back to powershell.exe then cmd.exe |
-| ❌ | `7ac36e373` | fix(security): peel powershell/cmd wrappers before allowlist check |
-| ❌ | `f1b1a174b` | fix(security): case-insensitive allowed_commands matching on Windows |
-| ❌ | `fb9df1151` | fix(security): clarify allowed_roots in prompt and tool description |
+| ✅ | `619ea3eb1` | feat(shell): use PowerShell instead of cmd.exe on Windows |
+| ✅ | `d168b641a` | feat(shell): prefer pwsh.exe, fall back to powershell.exe then cmd.exe |
+| ✅ | `7ac36e373` | fix(security): peel powershell/cmd wrappers before allowlist check |
+| ✅ | `f1b1a174b` | fix(security): case-insensitive allowed_commands matching on Windows |
+| ✅ | `fb9df1151` | fix(security): clarify allowed_roots in prompt and tool description |
 
 > Already in upstream: `c746998f6 fix(policy): allow multiline heredocs in SecurityPolicy command splitting (#6816)`
 
-**Migration plan**: cherry-pick or re-apply against
-`crates/zeroclaw-runtime/src/tools/shell.rs` and
-`crates/zeroclaw-runtime/src/security/`. Watch for upstream `Shell` tool
-refactors that may have moved code.
+> **0.8.0 changes**: pwsh/powershell/cmd detection cached on
+> `NativeRuntime` via `WindowsShell` enum; `shell-words` dep added to
+> `zeroclaw-config` for the wrapper peeler; 4 new policy unit tests
+> covering case-insensitive matching, wrapper unwrapping, and
+> EncodedCommand rejection; 2 new NativeRuntime tests for shell
+> selection. Skipped the `[logging]` Default-impl additions from
+> `f1b1a174b` (those belong to deferred Area D).
 
 ---
 
@@ -407,7 +412,7 @@ Examples:
 Based on dependency and risk:
 
 1. ~~**K. UTF-8 fixes**~~ — ✅ done (`225d3a670`)
-2. **F. Windows/PowerShell hardening** — small, mostly mechanical (drop the one already-upstream commit)
+2. ~~**F. Windows/PowerShell hardening**~~ — ✅ done (`7eaed77e4`)
 3. ~~**C. YumcSearch route**~~ — ✅ done (`d608b8f1b`)
 4. ~~**B. dawn_s3**~~ — ✅ done (`688cd30a7`)
 5. **G. Skills `enabled` field** — check upstream first; port if absent
