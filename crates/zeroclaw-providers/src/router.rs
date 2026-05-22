@@ -49,6 +49,13 @@ pub struct RouterModelProvider {
     model_providers: Vec<(String, Box<dyn ModelProvider>)>,
     default_index: usize,
     default_model: String,
+    /// Per-route temperature overrides, keyed by hint. When the caller passes
+    /// a `"hint:<name>"` model string and `<name>` is present here, this value
+    /// wins over the caller-supplied temperature (which typically came from
+    /// the agent's resolved `[model_providers.<alias>].temperature`). Built
+    /// from `[[providers.model_routes]] temperature` entries at construction
+    /// time; empty when no route declares an override.
+    temperature_overrides: HashMap<String, f64>,
 }
 
 impl RouterModelProvider {
@@ -61,6 +68,29 @@ impl RouterModelProvider {
         model_providers: Vec<(String, Box<dyn ModelProvider>)>,
         routes: Vec<(String, Route)>,
         default_model: String,
+    ) -> Self {
+        Self::new_with_overrides(
+            alias,
+            model_providers,
+            routes,
+            default_model,
+            HashMap::new(),
+        )
+    }
+
+    /// Like [`Self::new`] but also accepts per-hint temperature overrides
+    /// built from `[[providers.model_routes]]` entries that carry a
+    /// `temperature` field. Each `(hint, temperature)` pair makes the router
+    /// override the caller-supplied temperature when a request resolves to
+    /// that hint — typically used so a single agent can have one route at
+    /// `temperature = 0.1` (deterministic code) and another at `0.9`
+    /// (creative) without spawning a second agent identity.
+    pub fn new_with_overrides(
+        alias: &str,
+        model_providers: Vec<(String, Box<dyn ModelProvider>)>,
+        routes: Vec<(String, Route)>,
+        default_model: String,
+        temperature_overrides: HashMap<String, f64>,
     ) -> Self {
         // Build model_provider name → index lookup
         let name_to_index: HashMap<&str, usize> = model_providers
@@ -90,7 +120,21 @@ impl RouterModelProvider {
             model_providers,
             default_index: 0,
             default_model,
+            temperature_overrides,
         }
+    }
+
+    /// Return the effective temperature for a request: use the per-route
+    /// override when the model string is a matching `"hint:<name>"`, otherwise
+    /// fall back to the caller-supplied value (the agent's default, in normal
+    /// callers). Bare model names always pass through the caller value.
+    fn effective_temperature(&self, model: &str, temperature: Option<f64>) -> Option<f64> {
+        if let Some(hint) = model.strip_prefix("hint:")
+            && let Some(&t) = self.temperature_overrides.get(hint)
+        {
+            return Some(t);
+        }
+        temperature
     }
     /// Resolve a model parameter to the cheapest qualifying route based on pricing.
     ///
@@ -237,6 +281,7 @@ impl ModelProvider for RouterModelProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         let (provider_idx, resolved_model) = self.resolve(model);
+        let temperature = self.effective_temperature(model, temperature);
 
         let (provider_name, model_provider) = &self.model_providers[provider_idx];
         // `provider_name` is the configured `<type>.<alias>` key the
@@ -256,6 +301,7 @@ impl ModelProvider for RouterModelProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
         let (provider_idx, resolved_model) = self.resolve(model);
+        let temperature = self.effective_temperature(model, temperature);
         let (_, model_provider) = &self.model_providers[provider_idx];
         model_provider
             .chat_with_history(messages, &resolved_model, temperature)
@@ -269,6 +315,7 @@ impl ModelProvider for RouterModelProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         let (provider_idx, resolved_model) = self.resolve(model);
+        let temperature = self.effective_temperature(model, temperature);
         let (_, model_provider) = &self.model_providers[provider_idx];
         model_provider
             .chat(request, &resolved_model, temperature)
@@ -283,6 +330,7 @@ impl ModelProvider for RouterModelProvider {
         temperature: Option<f64>,
     ) -> anyhow::Result<ChatResponse> {
         let (provider_idx, resolved_model) = self.resolve(model);
+        let temperature = self.effective_temperature(model, temperature);
         let (_, model_provider) = &self.model_providers[provider_idx];
         model_provider
             .chat_with_tools(messages, tools, &resolved_model, temperature)
@@ -316,6 +364,7 @@ impl ModelProvider for RouterModelProvider {
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamChunk>> {
         let (provider_idx, resolved_model) = self.resolve(model);
+        let temperature = self.effective_temperature(model, temperature);
         let (_, model_provider) = &self.model_providers[provider_idx];
         model_provider.stream_chat_with_history(messages, &resolved_model, temperature, options)
     }
@@ -328,6 +377,7 @@ impl ModelProvider for RouterModelProvider {
         options: StreamOptions,
     ) -> BoxStream<'static, StreamResult<StreamEvent>> {
         let (provider_idx, resolved_model) = self.resolve(model);
+        let temperature = self.effective_temperature(model, temperature);
         let (_, model_provider) = &self.model_providers[provider_idx];
         model_provider.stream_chat(request, &resolved_model, temperature, options)
     }
@@ -1313,5 +1363,78 @@ mod tests {
         );
 
         assert!(router.supports_vision());
+    }
+
+    fn make_router_with_temperature_overrides(
+        overrides: HashMap<String, f64>,
+    ) -> RouterModelProvider {
+        let provider = Arc::new(MockModelProvider::new("ok"));
+        let providers: Vec<(String, Box<dyn ModelProvider>)> = vec![(
+            "default".into(),
+            Box::new(MockModelProvider::new("ok")) as Box<dyn ModelProvider>,
+        )];
+        let _ = provider; // unused; constructed just to satisfy type inference path
+        RouterModelProvider::new_with_overrides(
+            "test",
+            providers,
+            vec![(
+                "fast".into(),
+                Route {
+                    provider_name: "default".into(),
+                    model: "fast-model".into(),
+                },
+            )],
+            "default-model".into(),
+            overrides,
+        )
+    }
+
+    #[test]
+    fn effective_temperature_uses_route_override_when_hint_matches() {
+        // Route declares its own temperature → that value wins over the
+        // caller-supplied value (which typically came from
+        // `[model_providers.<alias>].temperature`).
+        let mut overrides = HashMap::new();
+        overrides.insert("fast".to_string(), 0.1);
+        let router = make_router_with_temperature_overrides(overrides);
+
+        let effective = router.effective_temperature("hint:fast", Some(0.7));
+        assert_eq!(effective, Some(0.1));
+    }
+
+    #[test]
+    fn effective_temperature_falls_back_to_caller_when_no_override() {
+        // The hint has no entry in temperature_overrides → caller's value
+        // passes through untouched.
+        let mut overrides = HashMap::new();
+        overrides.insert("fast".to_string(), 0.1);
+        let router = make_router_with_temperature_overrides(overrides);
+
+        let effective = router.effective_temperature("hint:other", Some(0.7));
+        assert_eq!(effective, Some(0.7));
+    }
+
+    #[test]
+    fn effective_temperature_ignores_bare_model_names() {
+        // Bare model names never trigger override resolution — only
+        // `"hint:<name>"` is consulted.
+        let mut overrides = HashMap::new();
+        overrides.insert("fast".to_string(), 0.1);
+        let router = make_router_with_temperature_overrides(overrides);
+
+        let effective = router.effective_temperature("anthropic/claude-sonnet-4-5", Some(0.7));
+        assert_eq!(effective, Some(0.7));
+    }
+
+    #[test]
+    fn effective_temperature_with_none_caller_returns_override() {
+        // Even when the caller doesn't supply a temperature, a matching
+        // route override still applies.
+        let mut overrides = HashMap::new();
+        overrides.insert("fast".to_string(), 0.1);
+        let router = make_router_with_temperature_overrides(overrides);
+
+        let effective = router.effective_temperature("hint:fast", None);
+        assert_eq!(effective, Some(0.1));
     }
 }

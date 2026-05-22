@@ -12202,6 +12202,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 args: HashMap::new(),
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
+            enabled: true,
             location: None,
         }];
 
@@ -12240,6 +12241,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 args: HashMap::new(),
             }],
             prompts: vec!["Always run cargo test before final response.".into()],
+            enabled: true,
             location: None,
         }];
 
@@ -12288,6 +12290,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 args: HashMap::new(),
             }],
             prompts: vec!["Use <tool_call> and & keep output \"safe\"".into()],
+            enabled: true,
             location: None,
         }];
 
@@ -14565,6 +14568,7 @@ This is an example JSON object for profile settings."#;
             model_provider: "vision-provider".into(),
             model: "gpt-4-vision".into(),
             api_key: None,
+            temperature: None,
         }];
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
@@ -14705,6 +14709,7 @@ This is an example JSON object for profile settings."#;
             model_provider: "vision-provider".into(),
             model: "gpt-4-vision".into(),
             api_key: None,
+            temperature: None,
         }];
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
@@ -14837,6 +14842,7 @@ This is an example JSON object for profile settings."#;
             model_provider: "vision-provider".into(),
             model: "gpt-4-vision".into(),
             api_key: None,
+            temperature: None,
         }];
 
         let runtime_ctx = Arc::new(ChannelRuntimeContext {
@@ -14982,12 +14988,14 @@ This is an example JSON object for profile settings."#;
                 model_provider: "fast-provider".into(),
                 model: "fast-model".into(),
                 api_key: None,
+                temperature: None,
             },
             zeroclaw_config::schema::ModelRouteConfig {
                 hint: "code".into(),
                 model_provider: "code-provider".into(),
                 model: "code-model".into(),
                 api_key: None,
+                temperature: None,
             },
         ];
 

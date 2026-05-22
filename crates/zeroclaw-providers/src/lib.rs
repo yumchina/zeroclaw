@@ -1415,11 +1415,21 @@ pub fn create_routed_model_provider_with_options(
         })
         .collect();
 
-    Ok(Box::new(router::RouterModelProvider::new(
+    // Per-route temperature overrides. The router applies these at dispatch
+    // time so a route's temperature wins over the agent's resolved default
+    // (`[model_providers.<alias>].temperature`) whenever the request resolves
+    // to that hint.
+    let temperature_overrides: std::collections::HashMap<String, f64> = model_routes
+        .iter()
+        .filter_map(|r| r.temperature.map(|t| (r.hint.clone(), t)))
+        .collect();
+
+    Ok(Box::new(router::RouterModelProvider::new_with_overrides(
         primary_name,
         model_providers,
         routes,
         default_model.to_string(),
+        temperature_overrides,
     )))
 }
 

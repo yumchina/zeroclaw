@@ -9269,6 +9269,17 @@ pub struct ModelRouteConfig {
     /// Optional API key override for this route's model provider
     #[serde(default)]
     pub api_key: Option<String>,
+    /// Override the sampling temperature for this route. When set, takes
+    /// precedence over the caller-supplied temperature (e.g. the agent's
+    /// default temperature resolved from `[model_providers.<alias>].temperature`)
+    /// any time the route's hint matches. When unset, the caller value wins.
+    ///
+    /// Per-route `max_tokens` is intentionally NOT a field here — upstream's
+    /// per-alias `[model_providers.<family>.<alias>].max_tokens` already gives
+    /// per-route token budgets via alias multiplication (route → distinct alias
+    /// → distinct `ModelProviderRuntimeOptions.provider_max_tokens`).
+    #[serde(default)]
+    pub temperature: Option<f64>,
 }
 
 // ── Embedding routing ───────────────────────────────────────────
