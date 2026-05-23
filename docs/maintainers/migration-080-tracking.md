@@ -30,7 +30,7 @@ This report tracks which local-fork functionality has been ported to the
 | **I. Channel/orchestrator misc** | 8 | ❌ Pending | — |
 | **J. Multimodal / Lark image fixes** | 11 | ❌ Pending (may be redundant with upstream) | — |
 | **K. UTF-8 / truncation fixes** | 2 | ✅ Migrated (1 ported, 1 moot — upstream removed code path) | `225d3a670` |
-| **L. System-prompt additions (S3, Node.js)** | 3 | ❌ Pending | — |
+| **L. System-prompt additions (S3, Node.js)** | 3 | ✅ Migrated (3 commits squashed; LLM-logging half of `aff780a82` skipped) | `b46b802de` |
 | **M. Docs / housekeeping** | 5 | ❌ Pending (low priority) | — |
 | **N. Merge / chore glue** | ~75 | 🟪 N/A | — |
 
@@ -396,13 +396,24 @@ Ported via **`225d3a670` fix(tools/linkedin): prevent UTF-8 boundary panic when 
 
 ---
 
-## L. System-prompt additions (❌ Pending)
+## L. System-prompt additions (✅ Migrated — 1 commit on 0.8.0)
+
+3 master commits squashed into **`b46b802de` feat(prompt,skills,shell): port misc system-prompt + working_dir additions**.
 
 | Status | Commit | Title |
 |--------|--------|-------|
-| ❌ | `aff780a82` | feat(runtime): add S3 file sharing prompt (paired with DawnS3Tool — port together with B) |
-| ❌ | `7c796a124` | feat: add Node.js Runtime Preference to system prompt |
-| ❌ | `f10b6b0a8` | (also in I) skill_directory in system prompt |
+| 🟡 | `aff780a82` | feat(runtime): add S3 file sharing prompt and enhanced LLM logging — **prompt half ported**; LLM-logging half deliberately skipped (tracing-disallowed, carries the UTF-8 bug Area K fixed elsewhere, duplicates `zeroclaw_log` Action::Invoke/Receive at the provider boundary) |
+| ✅ | `7c796a124` | feat: add Node.js Runtime Preference to system prompt (bun > node/npm) |
+| ✅ | `f10b6b0a8` | feat: Add working_dir parameter to shell tool and skill_directory to system prompt — full port including security validation (working_dir must be inside workspace or `workspace/skills/`) |
+
+> **0.8.0 changes**: `tool_descs` entry for `dawn_s3` (added in `688cd30a7`)
+> plus the broader "File Sharing" prose section (added here) together give
+> the LLM both the concise tool spec and the workflow guidance. The
+> `<skill_directory>` element + `<usage>` block in skill prompts pair with
+> the new `working_dir` shell parameter so third-party skills shipping
+> `bash scripts/make.sh run`-style entries work without source edits.
+> 3 new shell unit tests cover schema shape, rejection of out-of-workspace
+> paths, and acceptance of `workspace/skills/...` paths.
 
 ---
 
@@ -449,7 +460,7 @@ Based on dependency and risk:
 6. ~~**H. Per-route temperature**~~ — ✅ done (`7e3c5da73`); per-route max_tokens left to upstream alias mechanism
 7. **I. Channels/orchestrator misc** — case-by-case
 8. **J. Multimodal/Lark fixes** — diff against upstream first; many may be redundant
-9. **L. Node.js prompt addition + skill_directory** — small, port after I lands
+9. ~~**L. Node.js prompt addition + File Sharing + working_dir**~~ — ✅ done (`b46b802de`)
 
 ⏸️ **Deferred (no action):** D (local logging), E (progress-observer crate), parts of A (progress_streaming).
 
