@@ -1263,6 +1263,24 @@ pub fn skills_to_prompt_with_mode(
         let _ = writeln!(prompt, "  <skill>");
         write_xml_text_element(&mut prompt, 4, "name", &skill.name);
         write_xml_text_element(&mut prompt, 4, "description", &skill.description);
+
+        // Emit `<skill_directory>` so the LLM knows where the skill lives on
+        // disk. Pairs with the shell tool's `working_dir` parameter for
+        // pure-instruction skills that ship relative-path scripts (e.g.
+        // `bash scripts/make.sh run`). When the skill's SKILL.md / SKILL.toml
+        // location isn't known (synthetic skills, in-memory test fixtures)
+        // the element is omitted.
+        if let Some(ref location) = skill.location
+            && let Some(skill_dir) = location.parent()
+        {
+            write_xml_text_element(
+                &mut prompt,
+                4,
+                "skill_directory",
+                &skill_dir.display().to_string(),
+            );
+        }
+
         let location = render_skill_location(
             skill,
             workspace_dir,
@@ -1286,6 +1304,30 @@ pub fn skills_to_prompt_with_mode(
                 write_xml_text_element(&mut prompt, 6, "instruction", instruction);
             }
             let _ = writeln!(prompt, "    </instructions>");
+
+            // Pure-instruction skills (no callable tools) get a focused
+            // usage hint that tells the LLM to pass `working_dir =
+            // <skill_directory>` when running the skill's relative-path
+            // commands. This is what enables third-party skills with
+            // `bash scripts/make.sh run`-style entries to work without
+            // editing the skill source.
+            if skill.tools.is_empty()
+                && let Some(ref location) = skill.location
+                && let Some(skill_dir) = location.parent()
+            {
+                let _ = writeln!(prompt, "    <usage>");
+                let _ = writeln!(
+                    prompt,
+                    "      When executing shell commands for this skill, \
+                     always use the working_dir parameter with the skill_directory value."
+                );
+                let _ = writeln!(
+                    prompt,
+                    "      Example: {{\"command\":\"bash scripts/make.sh run\",\"working_dir\":\"{}\"}}",
+                    skill_dir.display()
+                );
+                let _ = writeln!(prompt, "    </usage>");
+            }
         }
 
         if !skill.tools.is_empty() {

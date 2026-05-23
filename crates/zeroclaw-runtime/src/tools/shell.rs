@@ -4,6 +4,7 @@ use crate::security::traits::Sandbox;
 use async_trait::async_trait;
 use serde_json::json;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use zeroclaw_api::tool::{Tool, ToolResult};
@@ -132,6 +133,11 @@ impl Tool for ShellTool {
                     "type": "string",
                     "description": "The shell command to execute"
                 },
+                "working_dir": {
+                    "type": "string",
+                    "description": "Optional working directory for command execution. Use the skill's <skill_directory> value when running a skill's relative-path commands. Must be inside the workspace or under workspace/skills. Defaults to workspace root when omitted.",
+                    "default": null
+                },
                 "approved": {
                     "type": "boolean",
                     "description": "Set true to explicitly approve medium/high-risk commands in supervised mode",
@@ -162,6 +168,42 @@ impl Tool for ShellTool {
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        // Optional `working_dir` parameter. When set, must be inside the
+        // workspace or under `workspace/skills/` (the skill source area —
+        // third-party skills with relative-path commands need to execute
+        // from their own directory). When omitted, the workspace root is
+        // used, preserving the prior behaviour exactly.
+        let exec_dir = match args.get("working_dir").and_then(|v| v.as_str()) {
+            Some(raw) => {
+                let dir = PathBuf::from(raw);
+                let workspace = &self.security.workspace_dir;
+                let skills_dir = workspace.join("skills");
+                if !dir.starts_with(workspace) && !dir.starts_with(&skills_dir) {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "working_dir": dir.display().to_string(),
+                                "workspace_dir": workspace.display().to_string(),
+                            })),
+                        "shell tool: working_dir outside workspace rejected"
+                    );
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "working_dir must be within the workspace directory ({}) or its skills/ subdirectory. Provided: {}",
+                            workspace.display(),
+                            dir.display()
+                        )),
+                    });
+                }
+                dir
+            }
+            None => self.security.workspace_dir.clone(),
+        };
+
         match self.security.validate_command_execution(command, approved) {
             Ok(_) => {}
             Err(reason) => {
@@ -176,10 +218,7 @@ impl Tool for ShellTool {
         // Execute with timeout to prevent hanging commands.
         // Clear the environment to prevent leaking API keys and other secrets
         // (CWE-200), then re-add only safe, functional variables.
-        let mut cmd = match self
-            .runtime
-            .build_shell_command(command, &self.security.workspace_dir)
-        {
+        let mut cmd = match self.runtime.build_shell_command(command, &exec_dir) {
             Ok(cmd) => cmd,
             Err(e) => {
                 return Ok(ToolResult {
@@ -826,5 +865,80 @@ mod tests {
             .expect("command with sandbox should succeed");
         assert!(result.success);
         assert!(result.output.contains("sandbox_test"));
+    }
+
+    #[test]
+    fn shell_tool_schema_has_working_dir() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let schema = tool.parameters_schema();
+        assert!(
+            schema["properties"]["working_dir"].is_object(),
+            "schema must expose `working_dir` so the LLM can target skill_directory paths"
+        );
+        // working_dir is optional — must NOT be in `required`.
+        let required = schema["required"]
+            .as_array()
+            .expect("schema required field should be an array");
+        assert!(!required.contains(&json!("working_dir")));
+    }
+
+    #[tokio::test]
+    async fn shell_working_dir_outside_workspace_is_rejected() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: workspace.clone(),
+            workspace_only: true,
+            ..SecurityPolicy::default()
+        });
+        let tool = ShellTool::new(security, test_runtime());
+        let result = tool
+            .execute(json!({
+                "command": "echo trap",
+                "working_dir": outside.to_str().unwrap(),
+            }))
+            .await
+            .expect("execute must return Ok with a structured error");
+
+        assert!(!result.success);
+        let err = result.error.unwrap();
+        assert!(
+            err.contains("workspace"),
+            "rejection message must mention workspace; got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_working_dir_inside_skills_dir_is_accepted() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let skill_dir = workspace.join("skills").join("demo");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: workspace,
+            ..SecurityPolicy::default()
+        });
+        let tool = ShellTool::new(security, test_runtime());
+        let result = tool
+            .execute(json!({
+                "command": "echo skill_cwd",
+                "working_dir": skill_dir.to_str().unwrap(),
+            }))
+            .await
+            .expect("skill directory paths must be accepted");
+        // Security path passed; if the actual exec fails on Windows etc.
+        // we only care that we didn't get the "outside workspace" rejection.
+        if !result.success {
+            let err = result.error.unwrap_or_default();
+            assert!(
+                !err.contains("working_dir must be within"),
+                "skill subdir must NOT be flagged as outside workspace; got: {err}"
+            );
+        }
     }
 }
