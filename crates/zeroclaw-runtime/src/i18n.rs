@@ -75,12 +75,29 @@ fn missing_cli_string(key: &str) -> String {
 
 fn load_descriptions(locale: &str) -> HashMap<String, String> {
     let mut map = format_ftl_messages(include_str!("../locales/en/tools.ftl"), "en");
-    if locale != "en"
-        && let Some(locale_ftl) = load_ftl_from_disk(locale, "tools.ftl")
-    {
-        map.extend(format_ftl_messages(&locale_ftl, locale));
+    if locale != "en" {
+        // Built-in (compile-time) translations override English first, so
+        // the binary ships a usable non-English description set without
+        // requiring the user to copy a file into their workspace. Mirrors
+        // the `builtin_cli_ftl_source` pattern used for CLI strings.
+        if let Some(locale_ftl) = builtin_tools_ftl_source(locale) {
+            map.extend(format_ftl_messages(locale_ftl, locale));
+        }
+        // Disk-loaded translations (from the user's workspace locale dir)
+        // win over the built-ins so operators can patch wording without
+        // rebuilding.
+        if let Some(locale_ftl) = load_ftl_from_disk(locale, "tools.ftl") {
+            map.extend(format_ftl_messages(&locale_ftl, locale));
+        }
     }
     map
+}
+
+fn builtin_tools_ftl_source(locale: &str) -> Option<&'static str> {
+    match locale {
+        "zh-CN" => Some(include_str!("../locales/zh-CN/tools.ftl")),
+        _ => None,
+    }
 }
 
 fn load_cli_strings(locale: &str) -> HashMap<String, String> {
@@ -271,6 +288,42 @@ mod tests {
     fn unknown_locale_falls_back_to_english() {
         let map = load_descriptions("xx-FAKE");
         assert!(map.contains_key("tool-shell"));
+    }
+
+    #[test]
+    fn zh_cn_tools_ftl_parses_and_translates_known_keys() {
+        // The compile-time embedded zh-CN tool descriptions must parse cleanly
+        // AND deliver Chinese strings for every key that has a builtin entry
+        // (missing keys fall back to English, so a parse failure / typo is
+        // the only way Chinese-locale users see English text for keys we
+        // intended to translate).
+        let map = load_descriptions("zh-CN");
+
+        // Spot-check a handful that exercise tricky Fluent escaping
+        // (literal `{` braces in `tool-cron-add`, multiline ASCII in
+        // `tool-shell` after the Area F PowerShell update).
+        let shell = map
+            .get("tool-shell")
+            .expect("tool-shell must be present after zh-CN builtin load");
+        assert!(
+            shell.contains("PowerShell") && shell.contains("工作区"),
+            "tool-shell should be the localised PowerShell-aware string, got: {shell}"
+        );
+
+        let cron_add = map
+            .get("tool-cron-add")
+            .expect("tool-cron-add must be present");
+        assert!(
+            cron_add.contains("delivery=") && cron_add.contains("Discord"),
+            "tool-cron-add should preserve the JSON example with delivery=, got: {cron_add}"
+        );
+
+        // Schema discipline: dropped `tool-swarm` upstream so it must NOT
+        // sneak back in via a stale zh-CN entry.
+        assert!(
+            !map.contains_key("tool-swarm"),
+            "tool-swarm was removed upstream and must not be reintroduced via zh-CN translations"
+        );
     }
 
     #[test]
