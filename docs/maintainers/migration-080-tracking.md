@@ -23,7 +23,7 @@ This report tracks which local-fork functionality has been ported to the
 | **B. dawn_s3 / DawnS3Tool** | 9 | ✅ Migrated (new `dawn-tools` crate) | `688cd30a7` |
 | **C. Web search routing (YumcSearch)** | 2 | ✅ Migrated | `d608b8f1b` |
 | **D. Local logging refactor** | 9 | ⏸️ Deferred (superseded by `zeroclaw-log`) | — |
-| **E. progress-observer crate** | 13 | ✅ Migrated as `orchestrator/progress.rs` (no new crate; reuses 0.8.0's `StreamDelta::Status` → `update_draft_progress` path) | _pending_ |
+| **E. progress-observer crate** | 13 | ✅ Migrated as `orchestrator/progress.rs` (no new crate; reuses 0.8.0's `StreamDelta::Status` → `update_draft_progress` path) | `7ccb80150` |
 | **F. Windows/PowerShell hardening** | 5 | ✅ Migrated (squashed) | `7eaed77e4` |
 | **G. Skills `enabled` field** | 6 | ✅ Migrated (squashed; upstream had no equivalent) | `f6199e8bb` |
 | **H. Provider routing extensions** | 1 | 🟡 Partial (temperature ported; max_tokens superseded by upstream alias mechanism) | `7e3c5da73` |
