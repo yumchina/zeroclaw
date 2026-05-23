@@ -27,7 +27,7 @@ This report tracks which local-fork functionality has been ported to the
 | **F. Windows/PowerShell hardening** | 5 | ✅ Migrated (squashed) | `7eaed77e4` |
 | **G. Skills `enabled` field** | 6 | ✅ Migrated (squashed; upstream had no equivalent) | `f6199e8bb` |
 | **H. Provider routing extensions** | 1 | 🟡 Partial (temperature ported; max_tokens superseded by upstream alias mechanism) | `7e3c5da73` |
-| **I. Channel/orchestrator misc** | 8 | ❌ Pending | — |
+| **I. Channel/orchestrator misc** | 8 | 🟡 Partial — `f10b6b0a8` covered by Area L; 4 code commits processed (5e7d31196 / fbea7dc70 / 80db3718d partial; f96238e45 deferred); 3 docs commits skipped | `6821b1077` |
 | **J. Multimodal / Lark image fixes** | 11 | ❌ Pending (may be redundant with upstream) | — |
 | **K. UTF-8 / truncation fixes** | 2 | ✅ Migrated (1 ported, 1 moot — upstream removed code path) | `225d3a670` |
 | **L. System-prompt additions (S3, Node.js)** | 3 | ✅ Migrated (3 commits squashed; LLM-logging half of `aff780a82` skipped) | `b46b802de` |
@@ -350,18 +350,36 @@ Owner of completion: **`7e3c5da73` feat(providers): per-route temperature overri
 
 ---
 
-## I. Channels / orchestrator misc (❌ Pending)
+## I. Channels / orchestrator misc (🟡 Partial — 1 commit on 0.8.0)
+
+After a research pass against 0.8.0 the working set shrank
+dramatically: 3 docs/chore commits skipped wholesale, 1 already
+covered by Area L, 1 already covered by upstream, 1 (sub-)deferred
+because the underlying code path was rewritten. The four pieces that
+remained relevant are ported together in
+**`6821b1077` fix(channels,runtime): port misc orchestrator + cron + tool_calls JSON fixes**.
 
 | Status | Commit | Title |
 |--------|--------|-------|
-| ❌ | `f10b6b0a8` | feat: Add working_dir parameter to shell tool and skill_directory to system prompt |
-| ❌ | `37284dcc7` | feat(channels): structured error codes + context-window user message |
-| ❌ | `fbea7dc70` | feat(channels): cron scheduling part (wukongim part already in A) |
-| ❌ | `f96238e45` | fix(channels): teach reply-intent classifier to honor image attachments |
-| ❌ | `80db3718d` | fix(channels,runtime): preserve tool_calls JSON across consecutive assistants |
-| ❌ | `2a9e3c488` | docs(contributing): add zh-CN developer guide |
-| ❌ | `f01000375` | chore: sync version references to v0.7.0 |
-| ❌ | `bbbb54931` | docs: improve AGENTS.md with approval architecture and expanded skills |
+| ✅ | `f10b6b0a8` | feat: working_dir + skill_directory — **already ported via Area L** (`b46b802de`) |
+| ✅ | `37284dcc7` | feat(channels): structured error codes + context-window user message — orchestrator emits `ERR:context_window_exceeded`; WuKongIM intercepts (Area A); structured logging at the same site was already in 0.8.0 |
+| 🟡 | `fbea7dc70` | feat(channels): wukongim + cron scheduling — sub-features ported piecemeal: `maybe_inject` allowlist + cron_add enum + cron_add description + system_prompt UTC note + `deliver_announcement` arm; `cron/mod.rs` validator + WuKongIM approval card both **moot** (Area A already handled) |
+| ⏸️ | `f96238e45` | fix(channels): reply-intent classifier honor image attachments — **deferred**: 0.8.0 rewrote `classify_channel_reply_intent` with a 4-way typology + explicit "default REPLY" rule; master's regression doesn't reproduce on the new prompt |
+| 🟡 | `80db3718d` | fix(channels,runtime): preserve tool_calls JSON across consecutive assistants — orchestrator half ported (`normalize_cached_channel_turns` + `looks_like_tool_calls_json` + 2 tests); `history_pruner.rs` half **already covered** by upstream (which independently shipped the same `PrunedOrphans` / `extract_assistant_tool_call_ids` structural fix) |
+| ⏸️ | `2a9e3c488` | docs(contributing): add zh-CN developer guide — skipped (written against pre-V3 crate layout; would mislead new contributors on the current structure) |
+| ⏸️ | `f01000375` | chore: sync version references to v0.7.0 — moot, we're already on `0.8.0-beta-1` |
+| ⏸️ | `bbbb54931` | docs: improve AGENTS.md — skipped (upstream V3 rewrote AGENTS.md; manual merge would replay work upstream has already done differently) |
+
+> **0.8.0 changes**: error_text → `ERR:context_window_exceeded` code
+> (`process_channel_message`); wukongim added to `maybe_inject` channel
+> allowlist; system_prompt "MUST convert this local time to UTC" note;
+> cron_add delivery enum + description (DO NOT USE THIS if same-channel
+> reply); `deliver_announcement` `"wukongim" =>` arm minting a per-alias
+> SqliteMemory (matches the orchestrator full-setup db naming);
+> `normalize_cached_channel_turns` preserves consecutive assistants when
+> either side carries structured `tool_calls` JSON, plus 2 new tests
+> covering both directions of the regression. Full-workspace clippy
+> clean.
 
 ---
 
