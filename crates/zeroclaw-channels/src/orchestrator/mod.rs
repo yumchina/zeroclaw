@@ -787,9 +787,34 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
                 normalized.push(turn);
                 expecting_user = true;
             }
+            (true, "assistant") => {
+                // Multi-iteration agent loops persist consecutive assistants
+                // (e.g. a text reply followed by a `tool_calls` JSON message).
+                // Merging the structured tool_calls JSON with surrounding text
+                // produces invalid JSON, which `convert_messages_for_native`
+                // silently downgrades to plain text — dropping `tool_calls`
+                // and orphaning the next role=tool message (OpenAI 400).
+                // Preserve such turns as separate assistants whenever either
+                // side carries structured tool_calls.
+                let last_is_structured = normalized
+                    .last()
+                    .is_some_and(|t| looks_like_tool_calls_json(&t.content));
+                let new_is_structured = looks_like_tool_calls_json(&turn.content);
+
+                if last_is_structured || new_is_structured {
+                    normalized.push(turn);
+                } else if let Some(last_turn) = normalized.last_mut()
+                    && !turn.content.is_empty()
+                {
+                    if !last_turn.content.is_empty() {
+                        last_turn.content.push_str("\n\n");
+                    }
+                    last_turn.content.push_str(&turn.content);
+                }
+            }
             // Interrupted channel turns can produce consecutive user messages
             // (no assistant persisted yet). Merge instead of dropping.
-            (false, "user") | (true, "assistant") => {
+            (false, "user") => {
                 if let Some(last_turn) = normalized.last_mut()
                     && !turn.content.is_empty()
                 {
@@ -804,6 +829,18 @@ fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     }
 
     normalized
+}
+
+/// Cheap structural-check for an assistant message whose `content` is the
+/// stringified tool_calls JSON envelope produced by the agent loop's native
+/// tool-call path (e.g. `{"content":null,"tool_calls":[{...}]}`). The check
+/// is intentionally conservative — JSON parsing is too expensive to run on
+/// every normalize-pass turn, so we look for the two cheap signals (leading
+/// `{` after whitespace, and the literal `"tool_calls"` substring) that
+/// together rule out plain-text replies.
+fn looks_like_tool_calls_json(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    trimmed.starts_with('{') && trimmed.contains("\"tool_calls\"")
 }
 
 /// Remove `<tool_result …>…</tool_result>` blocks (and a leading `[Tool results]`
@@ -4296,11 +4333,15 @@ async fn process_channel_message_body(
                 }
             } else if is_context_window_overflow_error(&e) {
                 let compacted = compact_sender_history(ctx.as_ref(), &history_key);
-                let error_text = if compacted {
-                    "⚠️ Context window exceeded for this conversation. I compacted recent history and kept the latest context. Please resend your last message."
-                } else {
-                    "⚠️ Context window exceeded for this conversation. Please resend your last message."
-                };
+                // Send the structured error code rather than English prose so
+                // channel implementations can intercept it in `send()` and show
+                // a localised message. Channels that don't intercept will
+                // surface the raw code — by design, so the operator notices
+                // and adds an intercept for their channel. WuKongIM (see
+                // `wukongim/channel.rs` `send()`) is the first interceptor;
+                // other channels render the ERR code verbatim until they grow
+                // their own.
+                let error_text = "ERR:context_window_exceeded";
                 eprintln!(
                     "  ⚠️ Context window exceeded after {}ms; sender history compacted={}",
                     started_at.elapsed().as_millis(),
@@ -7643,6 +7684,37 @@ pub async fn deliver_announcement(
         "wechat" => {
             anyhow::bail!("WeChat channel requires the `channel-wechat` feature");
         }
+        #[cfg(feature = "channel-wukongim")]
+        "wukongim" => {
+            let wk = config
+                .channels
+                .wukongim
+                .get(alias)
+                .ok_or_else(not_configured)?;
+            let peers = config.channel_external_peers("wukongim", alias);
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+                Arc::new(move || peers.clone());
+            let _ = peer_resolver; // WuKongIM uses its own allowed_users gate, not peer_resolver.
+            // Cron deliveries are a fire-and-forget singleton path: we
+            // don't have the live channel handle from the runtime registry
+            // (the early `registry_snapshot` branch above handles that),
+            // so we mint a fresh SqliteMemory for this delivery instance.
+            // This is consistent with how the orchestrator's full setup
+            // builds WuKongIM (see `wukongim_{alias}` db name there).
+            let memory: Arc<dyn zeroclaw_api::memory_traits::Memory> =
+                Arc::new(zeroclaw_memory::SqliteMemory::new_named(
+                    "sqlite",
+                    &config.data_dir,
+                    &format!("wukongim_{alias}"),
+                )?);
+            let ch =
+                crate::wukongim::WuKongIMChannel::from_config(wk, alias, &config.data_dir, memory);
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+        }
+        #[cfg(not(feature = "channel-wukongim"))]
+        "wukongim" => {
+            anyhow::bail!("WuKongIM channel requires the `channel-wukongim` feature");
+        }
         "webhook" => {
             let wh = config
                 .channels
@@ -8438,6 +8510,52 @@ mod tests {
         assert_eq!(normalized[2].role, "user");
         assert!(normalized[1].content.contains("assistant part 1"));
         assert!(normalized[1].content.contains("assistant part 2"));
+    }
+
+    /// Multi-iteration agent loops persist a text reply followed by a
+    /// `tool_calls` JSON message. Merging those two assistants would corrupt
+    /// the JSON, the native-message conversion would fall back to plain text
+    /// (dropping `tool_calls`), and the next role=tool turn would be orphaned
+    /// — provoking an OpenAI 400 on the following request.
+    #[test]
+    fn normalize_cached_channel_turns_preserves_tool_calls_json_after_text() {
+        let tool_calls_json = r#"{"content":null,"tool_calls":[{"id":"call_FUzv","type":"function","function":{"name":"file_write","arguments":"{}"}}]}"#;
+        let turns = vec![
+            ChatMessage::user("write a file"),
+            ChatMessage::assistant("已记下，下次再试"),
+            ChatMessage::assistant(tool_calls_json),
+            ChatMessage::tool(r#"{"tool_call_id":"call_FUzv","content":"Denied by user"}"#),
+        ];
+
+        let normalized = normalize_cached_channel_turns(turns);
+        assert_eq!(
+            normalized.len(),
+            4,
+            "tool_calls assistant must not be merged into the preceding text assistant"
+        );
+        assert_eq!(normalized[1].role, "assistant");
+        assert_eq!(normalized[1].content, "已记下，下次再试");
+        assert_eq!(normalized[2].role, "assistant");
+        assert_eq!(normalized[2].content, tool_calls_json);
+        assert_eq!(normalized[3].role, "tool");
+    }
+
+    /// Mirror of the above — tool_calls JSON first, then a text continuation.
+    /// Same fix applies in the other direction: merging the text into the
+    /// tool_calls JSON would still destroy the JSON structure.
+    #[test]
+    fn normalize_cached_channel_turns_preserves_text_after_tool_calls_json() {
+        let tool_calls_json = r#"{"content":null,"tool_calls":[{"id":"call_x","type":"function","function":{"name":"f","arguments":"{}"}}]}"#;
+        let turns = vec![
+            ChatMessage::user("u"),
+            ChatMessage::assistant(tool_calls_json),
+            ChatMessage::assistant("post-tool reflection"),
+        ];
+
+        let normalized = normalize_cached_channel_turns(turns);
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[1].content, tool_calls_json);
+        assert_eq!(normalized[2].content, "post-tool reflection");
     }
 
     /// Verify that an orphan user turn followed by a failure-marker assistant
