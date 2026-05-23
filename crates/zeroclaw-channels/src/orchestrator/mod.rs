@@ -5158,7 +5158,10 @@ fn build_channel_by_id(
                     let alias = alias.clone();
                     Arc::new(move || cfg_arc.read().channel_external_peers("lark", &alias))
                 };
-                Ok(Arc::new(LarkChannel::from_config(lk, alias, peer_resolver)))
+                Ok(Arc::new(
+                    LarkChannel::from_config(lk, alias.clone(), peer_resolver)
+                        .with_workspace_dir(config.channel_workspace_dir(&format!("lark.{alias}"))),
+                ))
             }
             #[cfg(not(feature = "channel-lark"))]
             {
@@ -6169,7 +6172,8 @@ fn collect_configured_channels(
             alias: Some(alias.clone()),
             channel: Arc::new(
                 LarkChannel::from_config(lk, alias.clone(), peer_resolver)
-                    .with_transcription(config.transcription.clone()),
+                    .with_transcription(config.transcription.clone())
+                    .with_workspace_dir(config.channel_workspace_dir(&format!("lark.{alias}"))),
             ),
         });
     }

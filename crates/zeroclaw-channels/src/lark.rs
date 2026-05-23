@@ -3,12 +3,15 @@ use base64::Engine as _;
 use futures_util::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 use uuid::Uuid;
-use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+use zeroclaw_api::channel::{
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+};
 
 const FEISHU_BASE_URL: &str = "https://open.feishu.cn/open-apis";
 const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
@@ -270,6 +273,94 @@ fn build_interactive_card_body(recipient: &str, markdown: &str) -> serde_json::V
     })
 }
 
+/// Build the message body for an interactive card with three approval buttons
+/// (Approve / Deny / Always-approve). Click payload is wired through the V2
+/// `behaviors[].value` callback protocol — see Feishu Card V2 documentation.
+///
+/// Each button's payload is `{ "approval_id": ..., "action": ... }`. Inbound
+/// `card.action.trigger` events expose this same shape at `/action/value`
+/// (see `parse_card_action_trigger`).
+fn build_approval_card_body(
+    recipient: &str,
+    tool_name: &str,
+    args_summary: &str,
+    approval_id: &str,
+) -> serde_json::Value {
+    // Card schema 2.0 dropped the `action` container tag (Feishu error 200861).
+    // Buttons must be top-level elements; for a horizontal row we wrap them
+    // in a `column_set` and put the click payload under `behaviors[].value`.
+    let make_button = |label: &str, ty: &str, action: &str| {
+        serde_json::json!({
+            "tag": "button",
+            "type": ty,
+            "text": { "tag": "plain_text", "content": label },
+            "behaviors": [{
+                "type": "callback",
+                "value": { "approval_id": approval_id, "action": action }
+            }]
+        })
+    };
+    let card = serde_json::json!({
+        "schema": "2.0",
+        "body": {
+            "elements": [
+                {
+                    "tag": "markdown",
+                    "content": format!(
+                        "🔧 **工具审批请求**\n\n工具：`{tool_name}`\n{args_summary}"
+                    )
+                },
+                {
+                    "tag": "column_set",
+                    "flex_mode": "trisect",
+                    "horizontal_spacing": "small",
+                    "columns": [
+                        {
+                            "tag": "column", "width": "weighted", "weight": 1,
+                            "elements": [make_button("✅ 批准", "primary", "approve")]
+                        },
+                        {
+                            "tag": "column", "width": "weighted", "weight": 1,
+                            "elements": [make_button("❌ 拒绝", "danger", "deny")]
+                        },
+                        {
+                            "tag": "column", "width": "weighted", "weight": 1,
+                            "elements": [make_button("✅✅ 始终批准", "default", "always")]
+                        }
+                    ]
+                }
+            ]
+        }
+    });
+    serde_json::json!({
+        "receive_id": recipient,
+        "msg_type": "interactive",
+        "content": card.to_string(),
+    })
+}
+
+/// Parse a `card.action.trigger` event payload into
+/// `(approval_id, response, operator_open_id)`. Returns `None` when the
+/// payload lacks the approval fields entirely. `operator_open_id` is
+/// `None` when the event omits operator info — callers MUST treat such
+/// events as unauthorized.
+fn parse_card_action_trigger(
+    event: &serde_json::Value,
+) -> Option<(String, ChannelApprovalResponse, Option<String>)> {
+    let value = event.pointer("/action/value")?;
+    let approval_id = value.get("approval_id")?.as_str()?.to_string();
+    let response = match value.get("action")?.as_str()? {
+        "approve" => ChannelApprovalResponse::Approve,
+        "always" => ChannelApprovalResponse::AlwaysApprove,
+        _ => ChannelApprovalResponse::Deny,
+    };
+    let operator_open_id = event
+        .pointer("/operator/open_id")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    Some((approval_id, response, operator_open_id))
+}
+
 /// Split markdown content into chunks that fit within the card size limit.
 /// Splits on line boundaries to avoid breaking markdown syntax.
 fn split_markdown_chunks(text: &str, max_bytes: usize) -> Vec<&str> {
@@ -408,6 +499,21 @@ pub struct LarkChannel {
     proxy_url: Option<String>,
     transcription: Option<zeroclaw_config::schema::TranscriptionConfig>,
     transcription_manager: Option<Arc<super::transcription::TranscriptionManager>>,
+    /// Workspace directory for persisting downloaded images to disk.
+    /// When `Some`, `download_image_as_marker` saves bytes to
+    /// `{workspace_dir}/sessions/files/<image_key>.<ext>` and emits a
+    /// path-based `[IMAGE:/abs/path]` marker so subsequent tools can
+    /// re-open the file. When `None`, falls back to inline base64 markers.
+    workspace_dir: Option<PathBuf>,
+    /// Pending tool-call approvals: `approval_id` → oneshot sender.
+    /// `dispatch_card_action_trigger` (driven by `listen_ws`) resolves
+    /// these when a matching `card.action.trigger` event arrives from
+    /// an allowed_users operator.
+    pending_approvals:
+        Arc<Mutex<HashMap<String, tokio::sync::oneshot::Sender<ChannelApprovalResponse>>>>,
+    /// Seconds to wait for a user to tap an approval button before
+    /// auto-denying. Default 120.
+    approval_timeout_secs: u64,
     #[cfg(test)]
     api_base_override: Option<String>,
 }
@@ -466,9 +572,22 @@ impl LarkChannel {
             proxy_url: None,
             transcription: None,
             transcription_manager: None,
+            workspace_dir: None,
+            pending_approvals: Arc::new(Mutex::new(HashMap::new())),
+            approval_timeout_secs: 120,
             #[cfg(test)]
             api_base_override: None,
         }
+    }
+
+    /// Builder: enable on-disk persistence for downloaded images.
+    /// Persists to `{workspace}/sessions/files/` (flattened — no chat_id
+    /// sub-dir) and returns a `[IMAGE:/abs/path]` marker that downstream
+    /// tools can open. Without this builder, image downloads emit inline
+    /// base64 markers instead.
+    pub fn with_workspace_dir(mut self, workspace_dir: PathBuf) -> Self {
+        self.workspace_dir = Some(workspace_dir);
+        self
     }
 
     /// Build from `LarkConfig` using legacy compatibility:
@@ -903,7 +1022,14 @@ impl LarkChannel {
                         Ok(e) => e,
                         Err(e) => { ::zeroclaw_log::record!(ERROR, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail).with_outcome(::zeroclaw_log::EventOutcome::Failure).with_attrs(::serde_json::json!({"error": format!("{}", e)})), "event JSON"); continue; }
                     };
-                    if event.header.event_type != "im.message.receive_v1" { continue; }
+                    match event.header.event_type.as_str() {
+                        "card.action.trigger" => {
+                            self.dispatch_card_action_trigger(&event.event).await;
+                            continue;
+                        }
+                        "im.message.receive_v1" => {}
+                        _ => continue,
+                    }
 
                     let event_payload = event.event;
 
@@ -964,7 +1090,11 @@ impl LarkChannel {
                                 Some(marker) => (marker, Vec::new()),
                                 None => {
                                     ::zeroclaw_log::record!(WARN, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_outcome(::zeroclaw_log::EventOutcome::Unknown).with_attrs(::serde_json::json!({"image_key": image_key})), "WS: failed to download image");
-                                    (format!("[IMAGE:{image_key} | download failed]"), Vec::new())
+                                    // Plain text — must NOT be `[IMAGE:...]` or the
+                                    // multimodal pipeline will treat it as an image
+                                    // source and abort the LLM call with
+                                    // "multimodal image source not found".
+                                    (format!("(image {image_key}: download failed)"), Vec::new())
                                 }
                             }
                         }
@@ -1175,14 +1305,24 @@ impl LarkChannel {
         };
 
         if !resp.status().is_success() {
+            // Drain the body so the operator can see Feishu's `{code, msg}`
+            // explanation (e.g. missing `im:resource` scope, expired token,
+            // app not in chat, key-message mismatch). Truncate at 512 chars
+            // to bound log size.
+            let status = resp.status();
+            let body_snippet = resp.text().await.unwrap_or_default();
+            let body_snippet: String = body_snippet.chars().take(512).collect();
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                &format!(
-                    "image download failed for {image_key}: status={}",
-                    resp.status()
-                )
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "image_key": image_key,
+                        "url": url,
+                        "status": status.as_u16(),
+                        "body": body_snippet,
+                    })),
+                "Lark: image download failed"
             );
             return None;
         }
@@ -1245,6 +1385,34 @@ impl LarkChannel {
                 "unsupported image MIME for"
             );
             return None;
+        }
+
+        // When workspace_dir is configured, persist to disk and emit a
+        // path-based marker so subsequent tools can re-open the file.
+        // Otherwise fall back to inline base64.
+        if let Some(workspace) = self.workspace_dir.as_deref() {
+            let ext = lark_mime_to_extension(&mime);
+            let filename = format!("{image_key}.{ext}");
+            match persist_session_file(workspace, &filename, &bytes).await {
+                Ok(path) => {
+                    let display = path.to_string_lossy();
+                    let path_str = strip_windows_verbatim_prefix(&display);
+                    return Some(format!("[IMAGE:{path_str}]"));
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "image_key": image_key,
+                                "error": format!("{}", e),
+                            })),
+                        "Lark: failed to persist image, falling back to inline base64"
+                    );
+                    // fall through to inline base64
+                }
+            }
         }
 
         let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
@@ -1845,7 +2013,10 @@ impl LarkChannel {
                                     .with_attrs(::serde_json::json!({"key": key})),
                                     "failed to download image"
                                 );
-                                format!("[IMAGE:{key} | download failed]")
+                                // Plain text — must NOT be `[IMAGE:...]` or the
+                                // multimodal pipeline will treat it as an image
+                                // source and abort the LLM call.
+                                format!("(image {key}: download failed)")
                             }
                         };
                         (marker, Vec::new())
@@ -2037,9 +2208,113 @@ impl Channel for LarkChannel {
     async fn health_check(&self) -> bool {
         self.get_tenant_access_token().await.is_ok()
     }
+
+    /// Render an approval card and wait for the operator's tap.
+    ///
+    /// **Limitation:** only `LarkReceiveMode::Websocket` resolves card
+    /// actions today; the HTTP webhook receive mode (`listen_http`) does
+    /// not yet route `card.action.trigger` events back to pending
+    /// approvals, so every approval times out and auto-denies in webhook
+    /// mode. Tracked as a follow-up.
+    ///
+    /// **Authorization:** only `open_id`s present in `allowed_users` (the
+    /// channel's peer-resolver list) may resolve an approval. Taps from
+    /// other group members are dropped with a `warn` log so audit trails
+    /// stay clear.
+    async fn request_approval(
+        &self,
+        recipient: &str,
+        request: &ChannelApprovalRequest,
+    ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
+        let approval_id = Uuid::new_v4().to_string();
+        let body = build_approval_card_body(
+            recipient,
+            &request.tool_name,
+            &request.arguments_summary,
+            &approval_id,
+        );
+
+        // Register the sender BEFORE sending so a fast tap can't beat us.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.pending_approvals
+            .lock()
+            .await
+            .insert(approval_id.clone(), tx);
+
+        let token = match self.get_tenant_access_token().await {
+            Ok(t) => t,
+            Err(e) => {
+                self.pending_approvals.lock().await.remove(&approval_id);
+                return Err(e);
+            }
+        };
+
+        match self
+            .send_text_once(&self.send_message_url(), &token, &body)
+            .await
+        {
+            Ok((status, _)) if status.is_success() => {}
+            Ok((status, body_text)) => {
+                self.pending_approvals.lock().await.remove(&approval_id);
+                anyhow::bail!("Lark approval card send failed ({status}): {body_text}");
+            }
+            Err(e) => {
+                self.pending_approvals.lock().await.remove(&approval_id);
+                return Err(e);
+            }
+        }
+
+        Ok(
+            match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), rx).await {
+                Ok(Ok(response)) => Some(response),
+                _ => {
+                    self.pending_approvals.lock().await.remove(&approval_id);
+                    Some(ChannelApprovalResponse::Deny)
+                }
+            },
+        )
+    }
 }
 
 impl LarkChannel {
+    /// Resolve a `card.action.trigger` event against the pending approvals
+    /// map. Drops events whose operator is not in `allowed_users` and logs
+    /// them at WARN level. Sensitive payload (tool args, message content)
+    /// is NOT logged — only `approval_id` + `operator_open_id` + decision.
+    async fn dispatch_card_action_trigger(&self, event: &serde_json::Value) {
+        let Some((id, response, operator)) = parse_card_action_trigger(event) else {
+            return;
+        };
+        let operator_str = operator.as_deref().unwrap_or("");
+        if !self.is_user_allowed(operator_str) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "approval_id": id,
+                        "operator": operator_str,
+                    })),
+                "Lark: dropped approval action from unauthorized operator"
+            );
+            return;
+        }
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Approve)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({
+                    "approval_id": id,
+                    "operator": operator_str,
+                    "decision": format!("{:?}", response),
+                })),
+            "Lark: approval decision received"
+        );
+        if let Some(tx) = self.pending_approvals.lock().await.remove(&id) {
+            let _ = tx.send(response);
+        }
+    }
+
     /// HTTP callback server (legacy — requires a public endpoint).
     /// Use `listen()` (WS long-connection) for new deployments.
     pub async fn listen_http(
@@ -2359,6 +2634,82 @@ fn detect_lark_ack_locale(
     }
 
     detect_locale_from_text(fallback_text).unwrap_or(LarkAckLocale::En)
+}
+
+/// Map a Lark-supported image MIME type to a conventional file extension.
+/// Caller guarantees `mime` is one of `LARK_SUPPORTED_IMAGE_MIMES`; other
+/// inputs fall through to `bin`.
+fn lark_mime_to_extension(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        _ => "bin",
+    }
+}
+
+/// Sanitise a filename segment so a hostile `image_key` cannot escape the
+/// session-files directory. Strips path separators and parent-dir tokens,
+/// truncates to a sane length.
+fn sanitize_filename_segment(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | '\0' => '_',
+            _ => c,
+        })
+        .collect();
+    let cleaned = cleaned.trim_matches('.').trim();
+    let safe: String = cleaned
+        .split('/')
+        .filter(|seg| !seg.is_empty() && *seg != "." && *seg != "..")
+        .collect::<Vec<_>>()
+        .join("_");
+    // Bound length so a pathological key can't blow up the filesystem.
+    safe.chars().take(200).collect()
+}
+
+/// Write `bytes` to `{workspace}/sessions/files/<sanitised filename>`,
+/// returning the absolute path on success. Creates the parent dirs as
+/// needed. The output path is canonicalised so downstream consumers see a
+/// stable, absolute path; on Windows the `\\?\` extended-length prefix is
+/// stripped at the call site (see `strip_windows_verbatim_prefix`).
+///
+/// Path-traversal defense: the sanitised filename cannot contain separators
+/// or `..` segments, and the resulting `target` is verified to start with
+/// the intended `files` directory after canonicalisation.
+async fn persist_session_file(
+    workspace_dir: &std::path::Path,
+    filename: &str,
+    bytes: &[u8],
+) -> anyhow::Result<PathBuf> {
+    let safe_name = sanitize_filename_segment(filename);
+    if safe_name.is_empty() {
+        anyhow::bail!("persist_session_file: filename collapsed to empty after sanitisation");
+    }
+    let files_dir = workspace_dir.join("sessions").join("files");
+    tokio::fs::create_dir_all(&files_dir).await?;
+    let target = files_dir.join(&safe_name);
+    tokio::fs::write(&target, bytes).await?;
+    let canonical_files_dir = tokio::fs::canonicalize(&files_dir).await?;
+    let canonical_target = tokio::fs::canonicalize(&target).await?;
+    if !canonical_target.starts_with(&canonical_files_dir) {
+        anyhow::bail!(
+            "persist_session_file: resolved path {} escapes the session files directory {}",
+            canonical_target.display(),
+            canonical_files_dir.display()
+        );
+    }
+    Ok(canonical_target)
+}
+
+/// Local re-export of the multimodal helper so call sites in this file
+/// can strip the Windows `\\?\` extended-length prefix without pulling
+/// `zeroclaw_providers::multimodal` into the function-level imports.
+fn strip_windows_verbatim_prefix(input: &str) -> std::borrow::Cow<'_, str> {
+    zeroclaw_providers::multimodal::strip_windows_verbatim_prefix(input)
 }
 
 /// Detect image MIME type from magic bytes, falling back to Content-Type header.
@@ -4042,5 +4393,272 @@ mod tests {
         let (bytes, filename) = result.unwrap();
         assert_eq!(bytes.len(), 64);
         assert_eq!(filename, "voice.m4a");
+    }
+
+    // -----------------------------------------------------------------
+    // Area J — approval flow + image disk persistence
+    // -----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn lark_pending_approvals_map_is_initially_empty() {
+        let ch = make_channel();
+        assert!(ch.pending_approvals.lock().await.is_empty());
+    }
+
+    #[test]
+    fn lark_approval_timeout_defaults_to_120() {
+        let ch = make_channel();
+        assert_eq!(ch.approval_timeout_secs, 120);
+    }
+
+    #[test]
+    fn lark_card_action_approve_parses_correctly() {
+        let event = serde_json::json!({
+            "action": { "value": { "approval_id": "abc-123", "action": "approve" } },
+            "operator": { "open_id": "ou_testuser123" }
+        });
+        let (id, resp, op) = parse_card_action_trigger(&event).expect("parse ok");
+        assert_eq!(id, "abc-123");
+        assert!(matches!(resp, ChannelApprovalResponse::Approve));
+        assert_eq!(op.as_deref(), Some("ou_testuser123"));
+    }
+
+    #[test]
+    fn lark_card_action_deny_parses_correctly() {
+        let event = serde_json::json!({
+            "action": { "value": { "approval_id": "abc-123", "action": "deny" } },
+            "operator": { "open_id": "ou_testuser123" }
+        });
+        let (_, resp, _) = parse_card_action_trigger(&event).expect("parse ok");
+        assert!(matches!(resp, ChannelApprovalResponse::Deny));
+    }
+
+    #[test]
+    fn lark_card_action_always_parses_correctly() {
+        let event = serde_json::json!({
+            "action": { "value": { "approval_id": "abc-123", "action": "always" } },
+            "operator": { "open_id": "ou_testuser123" }
+        });
+        let (_, resp, _) = parse_card_action_trigger(&event).expect("parse ok");
+        assert!(matches!(resp, ChannelApprovalResponse::AlwaysApprove));
+    }
+
+    #[test]
+    fn lark_card_action_unknown_action_resolves_as_deny() {
+        // Defensive: any unrecognised action must NOT auto-approve.
+        let event = serde_json::json!({
+            "action": { "value": { "approval_id": "abc-123", "action": "wat" } },
+            "operator": { "open_id": "ou_testuser123" }
+        });
+        let (_, resp, _) = parse_card_action_trigger(&event).expect("parse ok");
+        assert!(matches!(resp, ChannelApprovalResponse::Deny));
+    }
+
+    #[test]
+    fn lark_card_action_missing_approval_id_returns_none() {
+        let event = serde_json::json!({
+            "action": { "value": { "action": "approve" } },
+            "operator": { "open_id": "ou_testuser123" }
+        });
+        assert!(parse_card_action_trigger(&event).is_none());
+    }
+
+    #[test]
+    fn lark_card_action_missing_value_returns_none() {
+        let event = serde_json::json!({
+            "action": {},
+            "operator": { "open_id": "ou_testuser123" }
+        });
+        assert!(parse_card_action_trigger(&event).is_none());
+    }
+
+    #[test]
+    fn lark_card_action_missing_operator_returns_none_open_id() {
+        let event = serde_json::json!({
+            "action": { "value": { "approval_id": "x", "action": "approve" } }
+        });
+        let (_, _, op) = parse_card_action_trigger(&event).expect("parse ok");
+        assert!(op.is_none(), "missing operator must yield None open_id");
+    }
+
+    #[tokio::test]
+    async fn lark_dispatch_routes_authorized_operator() {
+        let ch = make_channel();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        ch.pending_approvals
+            .lock()
+            .await
+            .insert("abc-123".into(), tx);
+
+        let event = serde_json::json!({
+            "action": { "value": { "approval_id": "abc-123", "action": "approve" } },
+            "operator": { "open_id": "ou_testuser123" }
+        });
+        ch.dispatch_card_action_trigger(&event).await;
+
+        let resp = rx.await.expect("oneshot delivered");
+        assert!(matches!(resp, ChannelApprovalResponse::Approve));
+        assert!(ch.pending_approvals.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn lark_dispatch_drops_unauthorized_operator() {
+        let ch = make_channel();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        ch.pending_approvals
+            .lock()
+            .await
+            .insert("abc-123".into(), tx);
+
+        let event = serde_json::json!({
+            "action": { "value": { "approval_id": "abc-123", "action": "approve" } },
+            "operator": { "open_id": "ou_attacker" }
+        });
+        ch.dispatch_card_action_trigger(&event).await;
+
+        // sender must still be alive — approval untouched
+        assert!(!ch.pending_approvals.lock().await.is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn lark_dispatch_drops_event_with_missing_operator() {
+        let ch = make_channel();
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        ch.pending_approvals
+            .lock()
+            .await
+            .insert("abc-123".into(), tx);
+
+        let event = serde_json::json!({
+            "action": { "value": { "approval_id": "abc-123", "action": "approve" } }
+        });
+        ch.dispatch_card_action_trigger(&event).await;
+
+        assert!(!ch.pending_approvals.lock().await.is_empty());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn lark_dispatch_unknown_approval_id_is_silently_ignored() {
+        let ch = make_channel();
+        let event = serde_json::json!({
+            "action": { "value": { "approval_id": "nope", "action": "approve" } },
+            "operator": { "open_id": "ou_testuser123" }
+        });
+        // Must not panic and must leave the map untouched.
+        ch.dispatch_card_action_trigger(&event).await;
+        assert!(ch.pending_approvals.lock().await.is_empty());
+    }
+
+    #[test]
+    fn lark_build_approval_card_body_uses_v2_schema_with_three_buttons() {
+        let body = build_approval_card_body(
+            "oc_chat_xyz",
+            "delete_file",
+            "path=/etc/passwd",
+            "approval-abc",
+        );
+        assert_eq!(body["receive_id"], "oc_chat_xyz");
+        assert_eq!(body["msg_type"], "interactive");
+
+        let card_str = body["content"].as_str().expect("content is string");
+        let card: serde_json::Value = serde_json::from_str(card_str).expect("card parses");
+        assert_eq!(card["schema"], "2.0");
+
+        let elements = card["body"]["elements"].as_array().expect("elements array");
+        // markdown header + column_set
+        assert_eq!(elements.len(), 2);
+        assert_eq!(elements[1]["tag"], "column_set");
+
+        let columns = elements[1]["columns"].as_array().expect("columns array");
+        assert_eq!(columns.len(), 3, "three buttons: approve/deny/always");
+
+        // Each column contains exactly one button with a callback behavior
+        // carrying the approval_id + action.
+        let actions: Vec<&str> = columns
+            .iter()
+            .map(|col| {
+                let btn = &col["elements"][0];
+                assert_eq!(btn["tag"], "button");
+                let beh = &btn["behaviors"][0];
+                assert_eq!(beh["type"], "callback");
+                assert_eq!(beh["value"]["approval_id"], "approval-abc");
+                beh["value"]["action"].as_str().unwrap()
+            })
+            .collect();
+        assert_eq!(actions, vec!["approve", "deny", "always"]);
+    }
+
+    #[test]
+    fn lark_sanitize_filename_segment_strips_separators_and_dotdot() {
+        // `/`, `\` and NUL are flattened to `_` — and once they are gone the
+        // `..` segments can no longer be interpreted as parent-dir tokens by
+        // any downstream path resolver. Leading dots are trimmed.
+        let out = sanitize_filename_segment("../../etc/passwd");
+        assert!(!out.contains('/') && !out.contains('\\'));
+        assert!(!out.starts_with('.'), "leading dots must be trimmed: {out}");
+        assert!(out.ends_with("etc_passwd"), "got {out}");
+
+        assert_eq!(sanitize_filename_segment(r"a\b/c"), "a_b_c");
+        assert_eq!(sanitize_filename_segment("normal.png"), "normal.png");
+        assert_eq!(sanitize_filename_segment("a\0b"), "a_b");
+    }
+
+    #[test]
+    fn lark_sanitize_filename_segment_truncates_pathological_length() {
+        let huge: String = "a".repeat(1024);
+        let out = sanitize_filename_segment(&huge);
+        assert!(out.chars().count() <= 200);
+    }
+
+    #[test]
+    fn lark_mime_to_extension_maps_known_mimes() {
+        assert_eq!(lark_mime_to_extension("image/png"), "png");
+        assert_eq!(lark_mime_to_extension("image/jpeg"), "jpg");
+        assert_eq!(lark_mime_to_extension("image/gif"), "gif");
+        assert_eq!(lark_mime_to_extension("image/webp"), "webp");
+        assert_eq!(lark_mime_to_extension("image/bmp"), "bmp");
+        assert_eq!(lark_mime_to_extension("application/octet-stream"), "bin");
+    }
+
+    #[tokio::test]
+    async fn lark_persist_session_file_writes_under_sessions_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = persist_session_file(dir.path(), "img.png", b"hello-bytes")
+            .await
+            .expect("persist ok");
+        let written = tokio::fs::read(&path).await.expect("read back");
+        assert_eq!(written, b"hello-bytes");
+
+        let parent = path.parent().expect("has parent");
+        assert!(parent.ends_with(std::path::Path::new("sessions").join("files")));
+    }
+
+    #[tokio::test]
+    async fn lark_persist_session_file_neutralises_traversal_attempt() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A hostile filename containing `..` and separators must be flattened.
+        let path = persist_session_file(dir.path(), "../../etc/passwd", b"x")
+            .await
+            .expect("persist ok");
+        let files_dir = dir
+            .path()
+            .join("sessions")
+            .join("files")
+            .canonicalize()
+            .expect("canonicalize files dir");
+        assert!(
+            path.starts_with(&files_dir),
+            "{} must live under {}",
+            path.display(),
+            files_dir.display()
+        );
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        assert!(!name.contains('/'), "filename must not contain separators");
+        assert!(
+            !name.contains('\\'),
+            "filename must not contain backslashes"
+        );
     }
 }

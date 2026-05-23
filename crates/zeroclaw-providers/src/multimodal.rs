@@ -170,6 +170,27 @@ pub fn contains_image_markers(messages: &[ChatMessage]) -> bool {
 /// Auxiliary calls do not need to *see* the media content; they only route
 /// or summarize, so the placeholder is sufficient. The main agent loop
 /// continues to call `prepare_messages_for_provider` for full normalization.
+/// Strip the Windows verbatim/extended-length prefix `\\?\` (or `\\?\UNC\`)
+/// from a path string. Returns the original input on non-Windows or when
+/// there is no prefix to strip. Borrows when possible to avoid allocations.
+///
+/// Lark image persistence (in `lark.rs::persist_session_file`) used to
+/// canonicalize the saved path, which on Windows returns extended-length
+/// paths starting with `\\?\`. Those paths confuse downstream consumers
+/// (LLM providers URL-encoding the value, `Path::exists()` on round-trip
+/// through string serialization). Channels strip the prefix at write time,
+/// and this helper also strips it at read time for historical markers
+/// still in session memory.
+pub fn strip_windows_verbatim_prefix(input: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = input.strip_prefix(r"\\?\UNC\") {
+        std::borrow::Cow::Owned(format!(r"\\{rest}"))
+    } else if let Some(rest) = input.strip_prefix(r"\\?\") {
+        std::borrow::Cow::Borrowed(rest)
+    } else {
+        std::borrow::Cow::Borrowed(input)
+    }
+}
+
 pub fn strip_media_markers(text: &str) -> String {
     static RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
         regex::Regex::new(r"(?i)\[(?:IMAGE|PHOTO|DOCUMENT|FILE|VIDEO|VOICE|AUDIO):[^\]]*\]")
@@ -754,7 +775,14 @@ async fn normalize_remote_image(
 }
 
 async fn normalize_local_image(source: &str, max_bytes: usize) -> anyhow::Result<String> {
-    let path = Path::new(source);
+    // Old session memory may carry markers like `[IMAGE:\\?\E:\...]` written
+    // before channels learned to strip the Windows extended-length prefix
+    // (Lark image persistence path historically returned canonicalized paths
+    // with the `\\?\` prefix). Strip it here so historical markers continue
+    // to resolve to a valid base64 data URI rather than failing the path
+    // existence check below.
+    let cleaned_source = strip_windows_verbatim_prefix(source);
+    let path = Path::new(cleaned_source.as_ref());
     if !path.exists() || !path.is_file() {
         return Err(MultimodalError::ImageSourceNotFound {
             input: source.to_string(),
@@ -1788,5 +1816,25 @@ mod tests {
             "expected empty string, got: {cleaned:?}"
         );
         assert_eq!(refs.len(), 1);
+    }
+
+    #[test]
+    fn strip_windows_verbatim_prefix_removes_local_drive_prefix() {
+        let out = strip_windows_verbatim_prefix(r"\\?\C:\Users\me\photo.png");
+        assert_eq!(out, r"C:\Users\me\photo.png");
+    }
+
+    #[test]
+    fn strip_windows_verbatim_prefix_rewrites_unc_prefix() {
+        let out = strip_windows_verbatim_prefix(r"\\?\UNC\server\share\file.jpg");
+        assert_eq!(out, r"\\server\share\file.jpg");
+    }
+
+    #[test]
+    fn strip_windows_verbatim_prefix_passthrough_for_plain_paths() {
+        let out = strip_windows_verbatim_prefix(r"C:\Users\me\photo.png");
+        assert_eq!(out, r"C:\Users\me\photo.png");
+        let out = strip_windows_verbatim_prefix("/home/me/photo.png");
+        assert_eq!(out, "/home/me/photo.png");
     }
 }

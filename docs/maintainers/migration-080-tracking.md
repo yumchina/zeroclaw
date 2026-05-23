@@ -28,7 +28,7 @@ This report tracks which local-fork functionality has been ported to the
 | **G. Skills `enabled` field** | 6 | ✅ Migrated (squashed; upstream had no equivalent) | `f6199e8bb` |
 | **H. Provider routing extensions** | 1 | 🟡 Partial (temperature ported; max_tokens superseded by upstream alias mechanism) | `7e3c5da73` |
 | **I. Channel/orchestrator misc** | 8 | 🟡 Partial — `f10b6b0a8` covered by Area L; 4 code commits processed (5e7d31196 / fbea7dc70 / 80db3718d partial; f96238e45 deferred); 3 docs commits skipped | `6821b1077` |
-| **J. Multimodal / Lark image fixes** | 11 | ❌ Pending (may be redundant with upstream) | — |
+| **J. Multimodal / Lark image fixes** | 11 | ✅ Migrated (8 ported as one squash; 380efec7e superseded by upstream skip-on-error; c2f79ee7d half-covered by `strip_media_markers`; f96238e45 classifier deferred) | _pending_ |
 | **K. UTF-8 / truncation fixes** | 2 | ✅ Migrated (1 ported, 1 moot — upstream removed code path) | `225d3a670` |
 | **L. System-prompt additions (S3, Node.js)** | 3 | ✅ Migrated (3 commits squashed; LLM-logging half of `aff780a82` skipped) | `b46b802de` |
 | **M. Docs / housekeeping** | 7 | 🟡 Partial — only the zh-CN tool descriptions extracted from `5e7d31196` were worth porting; everything else moot/superseded | `3141fcda8` |
@@ -383,23 +383,72 @@ remained relevant are ported together in
 
 ---
 
-## J. Multimodal / Lark image fixes (❌ Pending — may overlap upstream)
+## J. Multimodal / Lark image fixes (✅ Migrated — 1 commit on 0.8.0)
 
 | Status | Commit | Title |
 |--------|--------|-------|
-| ❌ | `915472ebe` | fix(channels/lark): authorize approval responder + webhook limitation doc |
-| ❌ | `d51e2eea1` | fix(channels/lark): migrate approval card to V2 schema (column_set + behaviors) |
-| ❌ | `056dc187b` | fix(channels/lark): use message-resource endpoint + persist to session workspace |
-| ❌ | `107c234aa` | chore(channels/lark): include URL and response body in image-download error log |
-| ❌ | `74df326e7` | fix(channels/lark): flatten image save path + strip Windows verbatim prefix |
-| ❌ | `17773efcb` | fix(multimodal,channels/lark): tolerate verbatim paths + stop [IMAGE:] for failed |
-| ❌ | `380efec7e` | fix(multimodal): drop unresolvable image markers instead of aborting LLM call |
-| ❌ | `622d674b9` | fix(providers/compatible): drop image refs that aren't data: or http(s) URLs |
-| ❌ | `c2f79ee7d` | fix(channels,runtime): strip [IMAGE:] markers in text-only LLM helpers |
-| ❌ | `f96238e45` | (also in I) reply-intent classifier honors image attachments |
+| ✅ | `915472ebe` | fix(channels/lark): authorize approval responder + webhook limitation doc |
+| ✅ | `d51e2eea1` | fix(channels/lark): migrate approval card to V2 schema (column_set + behaviors) |
+| ✅ | `056dc187b` | fix(channels/lark): use message-resource endpoint + persist to session workspace |
+| ✅ | `107c234aa` | chore(channels/lark): include URL and response body in image-download error log |
+| ✅ | `74df326e7` | fix(channels/lark): flatten image save path + strip Windows verbatim prefix |
+| ✅ | `17773efcb` | fix(multimodal,channels/lark): tolerate verbatim paths + stop [IMAGE:] for failed |
+| ⏸️ | `380efec7e` | fix(multimodal): drop unresolvable image markers instead of aborting LLM call — **already covered by upstream's skip-on-error pattern in `multimodal.rs`** |
+| ✅ | `622d674b9` | fix(providers/compatible): drop image refs that aren't data: or http(s) URLs |
+| 🟡 | `c2f79ee7d` | fix(channels,runtime): strip [IMAGE:] markers in text-only LLM helpers — runtime side ported via `context_compressor`; channel-side text helpers already use upstream's `strip_media_markers` |
+| ⏸️ | `f96238e45` | (also in I) reply-intent classifier honors image attachments — partly covered by upstream `strip_media_markers`; the remaining classifier-level work has no clear hook in 0.8.0 |
 
-**Recommendation**: diff each against upstream `lark.rs` / `multimodal.rs`
-before porting — upstream may have done similar work independently.
+### J.1 Implementation notes
+
+Ported as a single squash commit on 0.8.0. The Lark approval flow had to be
+written essentially fresh — upstream 0.8.0 had no `request_approval` impl on
+the Lark channel at all. Key bits:
+
+- `LarkChannel::pending_approvals: Arc<Mutex<HashMap<String, oneshot::Sender>>>` +
+  `approval_timeout_secs: u64` (default 120).
+- `build_approval_card_body` emits Card schema 2.0 (`column_set` + per-button
+  `behaviors[].value`) — Feishu rejects the old `action` tag with error 200861.
+- `parse_card_action_trigger` + `dispatch_card_action_trigger`: only `open_id`s
+  in `allowed_users` resolve approvals; unknown / unauthorized operators get a
+  WARN log and are dropped. Unknown action strings resolve as `Deny` (never
+  silent-approve).
+- `LarkChannel::with_workspace_dir(PathBuf)`: when set, downloaded images are
+  persisted to `<workspace>/sessions/files/` with a sanitised filename, and the
+  resulting `[IMAGE:<absolute-path>]` marker is canonicalised (Windows `\\?\`
+  verbatim prefix stripped via `multimodal::strip_windows_verbatim_prefix`).
+  Path-traversal defense: `sanitize_filename_segment` flattens `/`, `\`, `\0`
+  to `_` before `persist_session_file` re-canonicalises and verifies the
+  resulting path stays under the `files` dir.
+- Provider defense (`compatible.rs`): `is_provider_acceptable_image_url` guard
+  drops anything that isn't `data:`, `http://`, or `https://` (anchored at
+  start, case-insensitive) before pushing as `ImageUrl`, with a WARN log.
+- Context compressor (`context_compressor.rs::build_transcript`) now strips
+  `[IMAGE:...]` markers and substitutes an `[N image(s) attached]` summary
+  token so compressed history doesn't carry through stale base64.
+
+Orchestrator wiring: both the singleton path (~line 5161) and the
+multi-instance path (~line 6174) now thread `config.channel_workspace_dir(&format!("lark.{alias}"))`
+through `with_workspace_dir`, matching how Telegram/Discord/Slack do it.
+
+Tests added (15 new):
+- `multimodal::strip_windows_verbatim_prefix` — local drive, UNC, passthrough.
+- `compatible::is_provider_acceptable_image_url` — data/http/https accept;
+  local paths, empty, `ftp://`, leftover marker text reject.
+- `lark::*` — `pending_approvals` initial state, default timeout,
+  `parse_card_action_trigger` for approve/deny/always/unknown/missing fields,
+  `dispatch_card_action_trigger` for authorized/unauthorized/missing operator /
+  unknown approval id, `build_approval_card_body` (V2 schema asserts three
+  columns + callback values), `sanitize_filename_segment` (separator flatten,
+  length cap), `lark_mime_to_extension`, `persist_session_file` (write path
+  + traversal neutralisation).
+
+Skipped commits (already covered by upstream):
+- `380efec7e` — upstream `multimodal.rs` already short-circuits on unresolvable
+  refs without aborting; no port needed.
+- Channel-side text helpers in `c2f79ee7d` — upstream's `strip_media_markers`
+  already handles `[IMAGE:...]` replacement for text-only paths.
+- `f96238e45` reply-intent classifier — half covered by `strip_media_markers`;
+  the remaining behaviour requires a hook 0.8.0 doesn't expose, defer.
 
 ---
 

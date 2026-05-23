@@ -1545,6 +1545,29 @@ fn parse_chat_response_body(name: &str, body: &str) -> anyhow::Result<ApiChatRes
     })
 }
 
+/// Defense-in-depth gate for values that flow into `image_url.url`.
+/// OpenAI-compatible providers accept only `data:` URIs and absolute http(s)
+/// URLs at that position; anything else (raw filesystem paths, leftover
+/// `[IMAGE:<key> | download failed]` text, `ftp://` etc.) gets the request
+/// rejected with HTTP 400 ("Invalid/Unsupported image URL ..."). The
+/// multimodal pipeline normally base64-encodes local paths upstream, but if
+/// one slips through (multimodal disabled, agent loop bypassed,
+/// serialization race), this guard drops it to text instead.
+fn is_provider_acceptable_image_url(value: &str) -> bool {
+    let trimmed = value.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower_prefix: String = trimmed
+        .chars()
+        .take(8)
+        .flat_map(char::to_lowercase)
+        .collect();
+    lower_prefix.starts_with("data:")
+        || lower_prefix.starts_with("http://")
+        || lower_prefix.starts_with("https://")
+}
+
 impl OpenAiCompatibleModelProvider {
     fn apply_auth_header(
         &self,
@@ -1663,9 +1686,25 @@ impl OpenAiCompatibleModelProvider {
         }
 
         for image_ref in image_refs {
-            parts.push(MessagePart::ImageUrl {
-                image_url: ImageUrlPart { url: image_ref },
-            });
+            // Only `data:` URIs and absolute http(s) URLs are accepted by
+            // OpenAI-compatible providers in `image_url.url`. Local
+            // filesystem paths must already have been base64-encoded by
+            // `multimodal::prepare_messages_for_provider` upstream. If one
+            // slips through, drop it to text rather than sending an invalid
+            // URL the provider will reject with HTTP 400.
+            if is_provider_acceptable_image_url(&image_ref) {
+                parts.push(MessagePart::ImageUrl {
+                    image_url: ImageUrlPart { url: image_ref },
+                });
+            } else {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"image_ref": image_ref})),
+                    "OpenAI-compatible provider: dropping unencoded image marker (not a data: URI or http(s) URL)"
+                );
+            }
         }
 
         MessageContent::Parts(parts)
@@ -5102,5 +5141,34 @@ mod tests {
             vec!["user", "assistant"]
         );
         assert_eq!(stripped[1].content, "Here are the results");
+    }
+
+    #[test]
+    fn provider_acceptable_image_url_accepts_data_uri() {
+        assert!(is_provider_acceptable_image_url(
+            "data:image/png;base64,AAAA"
+        ));
+        assert!(is_provider_acceptable_image_url(
+            "DATA:image/png;base64,AAAA"
+        ));
+    }
+
+    #[test]
+    fn provider_acceptable_image_url_accepts_http_and_https() {
+        assert!(is_provider_acceptable_image_url("https://x.test/y.png"));
+        assert!(is_provider_acceptable_image_url("http://x.test/y.png"));
+        assert!(is_provider_acceptable_image_url("HTTPS://x.test/Y.PNG"));
+    }
+
+    #[test]
+    fn provider_acceptable_image_url_rejects_local_paths_and_garbage() {
+        assert!(!is_provider_acceptable_image_url(r"C:\Users\me\photo.png"));
+        assert!(!is_provider_acceptable_image_url("/home/me/photo.png"));
+        assert!(!is_provider_acceptable_image_url(
+            "[IMAGE:img_v3 | download failed]"
+        ));
+        assert!(!is_provider_acceptable_image_url("ftp://x.test/y.png"));
+        assert!(!is_provider_acceptable_image_url(""));
+        assert!(!is_provider_acceptable_image_url("   "));
     }
 }
