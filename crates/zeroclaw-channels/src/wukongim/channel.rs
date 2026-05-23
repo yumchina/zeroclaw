@@ -20,9 +20,10 @@ use zeroclaw_config::schema::WuKongIMConfig;
 
 use super::approval::{PendingApprovals, WkApprovalAction, build_approval_card};
 use super::connection::{
-    ClearUnreadRequest, ConnectParams, HEARTBEAT_TIMEOUT, JsonRpcNotification, JsonRpcRequest,
-    JsonRpcResponse, PING_INTERVAL, RecvAckParams, RecvNotificationParams, SendParams, SyncRequest,
-    SyncResponse, WUKONGIM_RPC_VERSION, WkChannelType, WkMessageType, WsSink,
+    ClearUnreadRequest, ConnectParams, HEARTBEAT_TIMEOUT, Header, JsonRpcNotification,
+    JsonRpcRequest, JsonRpcResponse, PING_INTERVAL, RecvAckParams, RecvNotificationParams,
+    SendParams, SyncRequest, SyncResponse, WUKONGIM_RPC_VERSION, WkChannelType, WkMessageType,
+    WsSink,
 };
 use super::filter::{is_mentioned, is_user_allowed, parse_recipient};
 use super::messaging::{
@@ -929,6 +930,53 @@ impl Channel for WuKongIMChannel {
             channel_type,
             payload: serde_json::Value::String(payload_b64),
             header: None,
+            setting: None,
+            msg_key: None,
+            expire: None,
+            stream_no: None,
+            topic: None,
+        };
+        let _: serde_json::Value = self.send_rpc("send", params).await?;
+        Ok(())
+    }
+
+    /// Ephemeral progress text rendered as a short chat message.
+    ///
+    /// WuKongIM lacks a Slack-style assistant-status banner and JSON-RPC
+    /// `send` is the only push primitive we have. To keep these updates
+    /// out of message history (so they don't bloat replay / sync), we set
+    /// `noPersist = true` and `redDot = false` so:
+    ///   * the message is broadcast to currently-connected clients but
+    ///     never persisted server-side, and
+    ///   * it doesn't bump the chat's unread counter.
+    ///
+    /// `message_id` is ignored — we always send a fresh ephemeral message
+    /// (no edit semantics on the JSON-RPC channel). The 💭 prefix exists
+    /// so the user can visually distinguish progress from real responses.
+    async fn update_draft_progress(
+        &self,
+        recipient: &str,
+        _message_id: &str,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Ok(());
+        }
+        let content = format!("💭 {trimmed}");
+        let payload_b64 = encode_text_payload(&content)?;
+        let (channel_id, channel_type) = parse_recipient(recipient);
+        let params = SendParams {
+            from_uid: Some(self.uid.clone()),
+            client_msg_no: Uuid::new_v4().to_string(),
+            channel_id,
+            channel_type,
+            payload: serde_json::Value::String(payload_b64),
+            header: Some(Header {
+                no_persist: Some(true),
+                red_dot: Some(false),
+                ..Default::default()
+            }),
             setting: None,
             msg_key: None,
             expire: None,

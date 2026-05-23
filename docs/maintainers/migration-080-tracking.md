@@ -305,24 +305,33 @@ is implicit, no routing needed), dropped `set_scoped_broadcast_hook` route
    behaviour change on upgrade. Helper `any_enabled()` short-circuits the
    wrapper construction at the wiring site.
 
-### E.4 Limitations
+### E.4 Channel coverage
 
-- Status updates are only emitted on channels with
-  `supports_draft_updates() == true` (today: Slack via
-  `set_assistant_status`). Other channels see no effect — opt-in
-  follow-up: add `update_draft_progress` fallback paths in
-  Telegram/Discord/Lark.
-- `LlmRequest` event is the only signal mapped to "thinking" today;
+`ProgressObserver` calls `Channel::update_draft_progress` directly
+(decoupled from `supports_draft_updates`), so any channel can opt in by
+overriding the trait method:
+
+- **Slack** — `update_draft_progress` calls `set_assistant_status`,
+  rendering the latest status in the assistant banner above the input.
+  No extra chat noise.
+- **WuKongIM** — sends the text as a `noPersist: true` + `redDot: false`
+  chat message with a 💭 prefix. Broadcast to currently-connected clients,
+  not persisted to history, doesn't bump unread counters. (Master's
+  `progress_streaming` Area A item is satisfied by this — no separate
+  wiring needed.)
+- **Others** (Telegram, Discord, Lark, …) — default no-op. Adding
+  support is a per-channel ~10-line override of `update_draft_progress`.
+
+### E.5 Limitations
+
+- `LlmRequest` is the only signal mapped to "thinking" today;
   `LlmResponse` is not surfaced (matches master's design).
-- No rate-limiting layer on top of the existing draft-updater's debounce
-  (Slack rate-limits `chat.update` to ~1 req/sec which is already
-  appropriate for status text).
-
-### E.5 Follow-up
-
-- WuKongIM `progress_streaming` (the Area A deferred piece) can now be
-  wired by implementing `update_draft_progress` on `WuKongImChannel` and
-  enabling the appropriate toggles — no further infrastructure work.
+- No rate-limiting layer in the observer itself. Slack's
+  `set_assistant_status` is rate-limited server-side; WuKongIM's
+  `send_rpc("send")` is not, so under a fast tool storm each
+  `ToolCallStart` would spawn one RPC. If this becomes hot, add a
+  per-recipient debounce in `ProgressObserver::record_event` (~10
+  LOC).
 
 ---
 

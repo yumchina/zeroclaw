@@ -3761,20 +3761,23 @@ async fn process_channel_message_body(
 
     // Optionally wrap with ProgressObserver so the agent loop's per-message
     // events (AgentStart / LlmRequest / ToolCallStart / ToolCall / AgentEnd /
-    // Error) get translated to status text and pushed through the
-    // already-established draft-streaming `StreamDelta::Status` path. No-op
-    // when the channel doesn't support draft updates or when no toggle is
-    // enabled in config — leaves the existing observer chain untouched.
-    let progress_observer: Arc<dyn Observer> =
-        if ctx.progress_observer.any_enabled() && delta_tx.is_some() {
+    // Error) get translated to status text and fire `update_draft_progress`
+    // on the target channel. Decoupled from draft streaming so channels
+    // that only want ephemeral status (e.g. WuKongIM) can opt in by
+    // overriding `update_draft_progress` alone. No-op when no target
+    // channel is available or no toggle is enabled in config.
+    let progress_observer: Arc<dyn Observer> = match target_channel.as_ref() {
+        Some(channel) if ctx.progress_observer.any_enabled() => {
             Arc::new(progress::ProgressObserver::new(
                 Arc::clone(&notify_observer) as Arc<dyn Observer>,
-                delta_tx.clone(),
+                Arc::clone(channel),
+                msg.reply_target.clone(),
+                draft_message_id.clone(),
                 ctx.progress_observer.clone(),
             ))
-        } else {
-            Arc::clone(&notify_observer) as Arc<dyn Observer>
-        };
+        }
+        _ => Arc::clone(&notify_observer) as Arc<dyn Observer>,
+    };
     let notify_channel = target_channel.clone();
     let notify_reply_target = msg.reply_target.clone();
     let notify_thread_root = followup_thread_id(&msg);

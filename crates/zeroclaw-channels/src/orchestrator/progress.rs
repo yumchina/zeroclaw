@@ -1,25 +1,28 @@
-//! Per-message progress reporting via the existing draft-streaming path.
+//! Per-message progress reporting via `Channel::update_draft_progress`.
 //!
 //! Wires `ObserverEvent`s emitted by the agent loop into human-readable
-//! Chinese status text that gets pushed through the orchestrator's existing
-//! `StreamDelta::Status` channel — which the draft-updater task already
-//! forwards to `Channel::update_draft_progress`. So we get
-//! channel-specific status UX (Slack `assistant_status`, etc.) for free.
+//! Chinese status text and calls `Channel::update_draft_progress` directly
+//! (fire-and-forget). Each channel decides how to render the status —
+//! Slack shows it in the assistant status banner via `set_assistant_status`;
+//! WuKongIM sends it as a `noPersist` ephemeral chat message; others can
+//! plug in their own implementation by overriding the trait method.
 //!
 //! Translation logic mirrors the master-fork `progress-observer` crate but
 //! is intentionally stripped to text (no `StatusUpdate` / `StatusPhase`
 //! structures) since the downstream path is text-only.
 //!
-//! Per-message context (which `recipient`, which `draft_message_id`) is
-//! NOT in the `ObserverEvent` — the wrapper is constructed fresh for each
-//! channel message and the mpsc sender it holds is already bound to the
-//! correct delta channel, so no routing is needed.
+//! Per-message context (`recipient`, `draft_message_id`) is bound into the
+//! wrapper at construction time. The wrapper is built fresh per channel
+//! message, so events arrive already routed to the correct conversation.
+//! This decouples progress reporting from full draft streaming
+//! (`supports_draft_updates()`); a channel can implement
+//! `update_draft_progress` even without participating in main-response
+//! draft edits.
 
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
+use zeroclaw_api::channel::Channel;
 use zeroclaw_config::schema::ProgressObserverConfig;
-use zeroclaw_runtime::agent::loop_::DraftEvent;
 use zeroclaw_runtime::observability::{Observer, ObserverEvent, traits::ObserverMetric};
 
 const ARG_SNIPPET_MAX_CHARS: usize = 120;
@@ -107,39 +110,67 @@ pub(crate) fn event_to_status(
 
 /// Per-message wrapper observer.
 ///
-/// Lifecycle is bound to a single `process_channel_message` call. The mpsc
-/// sender it holds is the orchestrator's per-message `delta_tx`; the
-/// existing draft-updater task on the other side routes
-/// `StreamDelta::Status(text)` to `Channel::update_draft_progress`. So this
-/// wrapper does no I/O of its own — it just translates and forwards.
+/// Lifecycle is bound to a single `process_channel_message` call. Holds the
+/// target channel + recipient + (optional) draft id; on each translatable
+/// event it spawns a fire-and-forget task that calls
+/// `Channel::update_draft_progress`. The inner observer is always invoked,
+/// so this wrapper never breaks an existing chain.
 ///
-/// When `sender` is `None` (channel doesn't support draft streaming) the
-/// observer becomes a transparent pass-through.
+/// `draft_message_id` is forwarded verbatim to the channel; channels that
+/// don't need it (today: WuKongIM, Slack via `set_assistant_status`)
+/// simply ignore the argument.
 pub(crate) struct ProgressObserver {
     inner: Arc<dyn Observer>,
-    sender: Option<mpsc::Sender<DraftEvent>>,
+    channel: Arc<dyn Channel>,
+    recipient: String,
+    draft_message_id: Option<String>,
     cfg: ProgressObserverConfig,
 }
 
 impl ProgressObserver {
     pub(crate) fn new(
         inner: Arc<dyn Observer>,
-        sender: Option<mpsc::Sender<DraftEvent>>,
+        channel: Arc<dyn Channel>,
+        recipient: String,
+        draft_message_id: Option<String>,
         cfg: ProgressObserverConfig,
     ) -> Self {
-        Self { inner, sender, cfg }
+        Self {
+            inner,
+            channel,
+            recipient,
+            draft_message_id,
+            cfg,
+        }
     }
 }
 
 impl Observer for ProgressObserver {
     fn record_event(&self, event: &ObserverEvent) {
-        if let (Some(sender), Some(text)) =
-            (self.sender.as_ref(), event_to_status(event, &self.cfg))
-        {
-            // Non-blocking: drop the status update if the delta channel is
-            // full / closed. The progress text is purely advisory — losing
-            // one update is preferable to slowing down the agent loop.
-            let _ = sender.try_send(DraftEvent::Status(text));
+        if let Some(text) = event_to_status(event, &self.cfg) {
+            let channel = Arc::clone(&self.channel);
+            let recipient = self.recipient.clone();
+            let draft_id = self.draft_message_id.clone().unwrap_or_default();
+            // Fire-and-forget. Network errors are advisory; losing a single
+            // progress update is preferable to back-pressuring the agent
+            // loop or panicking.
+            tokio::spawn(async move {
+                if let Err(e) = channel
+                    .update_draft_progress(&recipient, &draft_id, &text)
+                    .await
+                {
+                    ::zeroclaw_log::record!(
+                        DEBUG,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({
+                                "channel": channel.name(),
+                                "error": format!("{e}"),
+                            })),
+                        "ProgressObserver: update_draft_progress failed"
+                    );
+                }
+            });
         }
         self.inner.record_event(event);
     }
@@ -461,11 +492,78 @@ mod tests {
         }
     }
 
+    /// Records `update_draft_progress` calls for assertion.
+    #[derive(Default)]
+    struct RecordingProgressChannel {
+        calls: tokio::sync::Mutex<Vec<(String, String, String)>>,
+    }
+
+    impl zeroclaw_api::attribution::Attributable for RecordingProgressChannel {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Channel(
+                zeroclaw_api::attribution::ChannelKind::Webhook,
+            )
+        }
+        fn alias(&self) -> &str {
+            "test"
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for RecordingProgressChannel {
+        fn name(&self) -> &str {
+            "recording"
+        }
+
+        async fn send(&self, _message: &zeroclaw_api::channel::SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<zeroclaw_api::channel::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn update_draft_progress(
+            &self,
+            recipient: &str,
+            message_id: &str,
+            text: &str,
+        ) -> anyhow::Result<()> {
+            self.calls
+                .lock()
+                .await
+                .push((recipient.into(), message_id.into(), text.into()));
+            Ok(())
+        }
+    }
+
+    /// Wait until `recorded.calls` reaches `expected_len` or `attempts` ms
+    /// expire; the wrapper spawns a tokio task so we have to yield to let
+    /// it run before asserting.
+    async fn wait_for_calls(ch: &Arc<RecordingProgressChannel>, expected: usize, attempts: u32) {
+        for _ in 0..attempts {
+            if ch.calls.lock().await.len() >= expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    }
+
     #[tokio::test]
-    async fn progress_observer_forwards_to_inner_and_emits_status() {
+    async fn progress_observer_calls_update_draft_progress_with_translated_text() {
         let inner = Arc::new(CountingObserver::default());
-        let (tx, mut rx) = mpsc::channel::<DraftEvent>(4);
-        let obs = ProgressObserver::new(inner.clone(), Some(tx), all_on());
+        let ch = Arc::new(RecordingProgressChannel::default());
+        let obs = ProgressObserver::new(
+            inner.clone(),
+            ch.clone() as Arc<dyn Channel>,
+            "u_alice".into(),
+            Some("draft-xyz".into()),
+            all_on(),
+        );
 
         obs.record_event(&ObserverEvent::ToolCallStart {
             tool: "shell".into(),
@@ -474,52 +572,88 @@ mod tests {
 
         assert_eq!(inner.events.load(Ordering::SeqCst), 1, "inner must run");
 
-        match rx.try_recv() {
-            Ok(DraftEvent::Status(text)) => assert_eq!(text, "执行命令：ls"),
-            other => panic!("expected Status, got {other:?}"),
-        }
+        wait_for_calls(&ch, 1, 200).await;
+        let calls = ch.calls.lock().await;
+        assert_eq!(calls.len(), 1, "exactly one update_draft_progress call");
+        let (recipient, draft_id, text) = &calls[0];
+        assert_eq!(recipient, "u_alice");
+        assert_eq!(draft_id, "draft-xyz");
+        assert_eq!(text, "执行命令：ls");
     }
 
     #[tokio::test]
-    async fn progress_observer_skips_emit_when_no_sender() {
+    async fn progress_observer_passes_empty_draft_id_when_none() {
         let inner = Arc::new(CountingObserver::default());
-        let obs = ProgressObserver::new(inner.clone(), None, all_on());
-        obs.record_event(&ObserverEvent::ToolCallStart {
-            tool: "shell".into(),
-            arguments: Some(r#"{"command": "ls"}"#.into()),
+        let ch = Arc::new(RecordingProgressChannel::default());
+        let obs = ProgressObserver::new(
+            inner.clone(),
+            ch.clone() as Arc<dyn Channel>,
+            "u_alice".into(),
+            None,
+            all_on(),
+        );
+
+        obs.record_event(&ObserverEvent::AgentEnd {
+            model_provider: "openai".into(),
+            model: "gpt-5".into(),
+            duration: Duration::from_millis(10),
+            tokens_used: None,
+            cost_usd: None,
         });
+
+        wait_for_calls(&ch, 1, 200).await;
+        let calls = ch.calls.lock().await;
+        assert_eq!(calls.len(), 1);
         assert_eq!(
-            inner.events.load(Ordering::SeqCst),
-            1,
-            "inner still runs without sender"
+            calls[0].1, "",
+            "missing draft id is forwarded as empty string"
         );
     }
 
     #[tokio::test]
     async fn progress_observer_skips_emit_for_irrelevant_events() {
         let inner = Arc::new(CountingObserver::default());
-        let (tx, mut rx) = mpsc::channel::<DraftEvent>(4);
-        let obs = ProgressObserver::new(inner.clone(), Some(tx), all_on());
+        let ch = Arc::new(RecordingProgressChannel::default());
+        let obs = ProgressObserver::new(
+            inner.clone(),
+            ch.clone() as Arc<dyn Channel>,
+            "u_alice".into(),
+            None,
+            all_on(),
+        );
+
         obs.record_event(&ObserverEvent::HeartbeatTick);
-        assert!(rx.try_recv().is_err(), "HeartbeatTick must not emit status");
+        // Give any erroneously-spawned task a chance to run.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            ch.calls.lock().await.is_empty(),
+            "HeartbeatTick must not produce a status"
+        );
         assert_eq!(inner.events.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn progress_observer_drops_status_when_channel_full() {
+    async fn progress_observer_skips_emit_when_toggles_all_off() {
         let inner = Arc::new(CountingObserver::default());
-        let (tx, rx) = mpsc::channel::<DraftEvent>(1);
-        // Saturate the channel
-        tx.try_send(DraftEvent::Status("filler".into()))
-            .expect("filler send");
+        let ch = Arc::new(RecordingProgressChannel::default());
+        let cfg = ProgressObserverConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let obs = ProgressObserver::new(
+            inner.clone(),
+            ch.clone() as Arc<dyn Channel>,
+            "u_alice".into(),
+            None,
+            cfg,
+        );
 
-        let obs = ProgressObserver::new(inner.clone(), Some(tx), all_on());
-        // Must not panic, must not block.
         obs.record_event(&ObserverEvent::ToolCallStart {
             tool: "shell".into(),
-            arguments: Some(r#"{"command": "ls"}"#.into()),
+            arguments: None,
         });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(ch.calls.lock().await.is_empty());
         assert_eq!(inner.events.load(Ordering::SeqCst), 1);
-        drop(rx);
     }
 }
