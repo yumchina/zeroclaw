@@ -31,7 +31,7 @@ This report tracks which local-fork functionality has been ported to the
 | **J. Multimodal / Lark image fixes** | 11 | ❌ Pending (may be redundant with upstream) | — |
 | **K. UTF-8 / truncation fixes** | 2 | ✅ Migrated (1 ported, 1 moot — upstream removed code path) | `225d3a670` |
 | **L. System-prompt additions (S3, Node.js)** | 3 | ✅ Migrated (3 commits squashed; LLM-logging half of `aff780a82` skipped) | `b46b802de` |
-| **M. Docs / housekeeping** | 5 | ❌ Pending (low priority) | — |
+| **M. Docs / housekeeping** | 7 | 🟡 Partial — only the zh-CN tool descriptions extracted from `5e7d31196` were worth porting; everything else moot/superseded | `3141fcda8` |
 | **N. Merge / chore glue** | ~75 | 🟪 N/A | — |
 
 ---
@@ -417,17 +417,26 @@ Ported via **`225d3a670` fix(tools/linkedin): prevent UTF-8 boundary panic when 
 
 ---
 
-## M. Docs / housekeeping (❌ Pending — low priority)
+## M. Docs / housekeeping (🟡 Partial — 1 commit on 0.8.0)
+
+`5e7d31196` ("add", no commit message) turned out to be a mixed bag
+once unpacked: 1 useful file (zh-CN tools translation) plus 5 unrelated
+items (local settings, two Area A/G plan documents, an Area G design
+spec, and a `web/bun.lock`). The useful half is ported via
+**`3141fcda8` feat(i18n): bundle zh-CN tool descriptions** along with
+the necessary `builtin_tools_ftl_source` loader hook in `i18n.rs`.
+Everything else in Area M is either historical paperwork for completed
+or deferred work, or targets files that no longer exist on this branch.
 
 | Status | Commit | Title |
 |--------|--------|-------|
-| ❌ | `e95a51288` | docs: WuKongIM file download implementation plan (historical — can drop) |
-| ❌ | `404888fa4` | docs: clarify blacklisted file handling in data flow |
-| ❌ | `3cdc23601` | docs: WuKongIM file download feature design spec (historical — can drop) |
-| ❌ | `d957d2ee5` | docs(plan): progress streaming implementation plan (paired with E — deferred) |
-| ❌ | `76bf5b723` | docs(spec): progress streaming via sidelined observer (paired with E — deferred) |
-| ❌ | `5e7d31196` | add (no message — investigate) |
-| ❌ | `8bfe2d61c` | fmt modify (no functional payload — likely chore) |
+| ⏸️ | `e95a51288` | docs: WuKongIM file download implementation plan — historical, feature done in Area A |
+| ⏸️ | `3cdc23601` | docs: WuKongIM file download feature design spec — historical, feature done in Area A |
+| ⏸️ | `404888fa4` | docs: clarify blacklisted file handling in data flow — 1-line tweak to the above spec |
+| ⏸️ | `d957d2ee5` | docs(plan): progress streaming implementation plan — paired with **deferred** Area E |
+| ⏸️ | `76bf5b723` | docs(spec): progress streaming via sidelined observer — paired with **deferred** Area E |
+| 🟡 | `5e7d31196` | "add" — zh-CN/tools.ftl extracted and ported; settings.local.json / plan / spec / bun.lock skipped |
+| ⏸️ | `8bfe2d61c` | "fmt modify" — moot: target file `crates/zeroclaw-channels/src/file.rs` only existed in master; equivalent code now lives in the dedicated `dawn-tools` crate (Area B port) |
 
 ---
 
