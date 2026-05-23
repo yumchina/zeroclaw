@@ -10019,6 +10019,69 @@ pub struct ChannelsConfig {
     /// as a single concatenated message. `0` disables debouncing. Default: `0`.
     #[serde(default)]
     pub debounce_ms: u64,
+    /// Real-time progress reporting for channels that support draft streaming
+    /// (Slack today). When `enabled` is true, agent loop events selected by the
+    /// sub-toggles are translated into status text and pushed through the
+    /// existing draft-streaming `StreamDelta::Status` path so users see
+    /// "正在调用工具 X" / "Agent 启动" etc. while the agent is working. All
+    /// off by default — opt-in to avoid changing existing channel UX.
+    #[nested]
+    #[serde(default)]
+    pub progress_observer: ProgressObserverConfig,
+}
+
+/// Toggles for the per-message `ProgressObserver` (see `ChannelsConfig::progress_observer`).
+///
+/// `enabled` is the master switch. Each sub-toggle enables translation of one
+/// `ObserverEvent` class into a user-visible status update. Sub-toggles are
+/// only consulted when `enabled` is true.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "channels_config.progress_observer"]
+pub struct ProgressObserverConfig {
+    /// Master switch. When false, no `ProgressObserver` is constructed and no
+    /// per-message status updates are emitted regardless of the sub-toggles.
+    /// Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Translate `ObserverEvent::AgentStart` → "Agent 启动（provider/model）".
+    /// Default: `false`.
+    #[serde(default)]
+    pub agent_start: bool,
+    /// Translate `ObserverEvent::AgentEnd` → "处理完成". Default: `false`.
+    #[serde(default)]
+    pub agent_end: bool,
+    /// Translate `ObserverEvent::ToolCallStart` → "调用工具：X" (with a 120-char
+    /// argument snippet extracted from `command` / `query` / `path` / `url`
+    /// when present). Default: `false`.
+    #[serde(default)]
+    pub tool_call_start: bool,
+    /// Translate `ObserverEvent::ToolCall` → "X 执行完成（123ms）" or
+    /// "X 执行失败". Default: `false`.
+    #[serde(default)]
+    pub tool_call: bool,
+    /// Translate `ObserverEvent::LlmRequest` → "正在调用大模型推理（N 条消息）".
+    /// Default: `false`.
+    #[serde(default)]
+    pub llm_thinking: bool,
+    /// Translate `ObserverEvent::Error` → "<component> 出现错误：<message>"
+    /// (message truncated to 200 chars). Default: `false`.
+    #[serde(default)]
+    pub error: bool,
+}
+
+impl ProgressObserverConfig {
+    /// `true` iff `enabled` is set and at least one sub-toggle is on. Used at
+    /// the wiring site to skip constructing a wrapper that would be a no-op.
+    pub fn any_enabled(&self) -> bool {
+        self.enabled
+            && (self.agent_start
+                || self.agent_end
+                || self.tool_call_start
+                || self.tool_call
+                || self.llm_thinking
+                || self.error)
+    }
 }
 
 impl ChannelsConfig {
@@ -10198,6 +10261,7 @@ impl Default for ChannelsConfig {
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
             debounce_ms: 0,
+            progress_observer: ProgressObserverConfig::default(),
         }
     }
 }
@@ -16130,6 +16194,7 @@ auto_save = true
                 session_backend: default_session_backend(),
                 session_ttl_hours: 0,
                 debounce_ms: 0,
+                progress_observer: ProgressObserverConfig::default(),
             },
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
@@ -17363,6 +17428,7 @@ allowed_users = ["@u:matrix.org"]
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
             debounce_ms: 0,
+            progress_observer: ProgressObserverConfig::default(),
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();
@@ -17749,6 +17815,7 @@ allowed_numbers = ["+1", "+2"]
             session_backend: default_session_backend(),
             session_ttl_hours: 0,
             debounce_ms: 0,
+            progress_observer: ProgressObserverConfig::default(),
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
         let parsed: ChannelsConfig = toml::from_str(&toml_str).unwrap();

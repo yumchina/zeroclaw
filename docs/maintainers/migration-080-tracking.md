@@ -23,12 +23,12 @@ This report tracks which local-fork functionality has been ported to the
 | **B. dawn_s3 / DawnS3Tool** | 9 | ✅ Migrated (new `dawn-tools` crate) | `688cd30a7` |
 | **C. Web search routing (YumcSearch)** | 2 | ✅ Migrated | `d608b8f1b` |
 | **D. Local logging refactor** | 9 | ⏸️ Deferred (superseded by `zeroclaw-log`) | — |
-| **E. progress-observer crate** | 13 | ⏸️ Deferred (superseded by `zeroclaw-log`/Observer bridge) | — |
+| **E. progress-observer crate** | 13 | ✅ Migrated as `orchestrator/progress.rs` (no new crate; reuses 0.8.0's `StreamDelta::Status` → `update_draft_progress` path) | _pending_ |
 | **F. Windows/PowerShell hardening** | 5 | ✅ Migrated (squashed) | `7eaed77e4` |
 | **G. Skills `enabled` field** | 6 | ✅ Migrated (squashed; upstream had no equivalent) | `f6199e8bb` |
 | **H. Provider routing extensions** | 1 | 🟡 Partial (temperature ported; max_tokens superseded by upstream alias mechanism) | `7e3c5da73` |
 | **I. Channel/orchestrator misc** | 8 | 🟡 Partial — `f10b6b0a8` covered by Area L; 4 code commits processed (5e7d31196 / fbea7dc70 / 80db3718d partial; f96238e45 deferred); 3 docs commits skipped | `6821b1077` |
-| **J. Multimodal / Lark image fixes** | 11 | ✅ Migrated (8 ported as one squash; 380efec7e superseded by upstream skip-on-error; c2f79ee7d half-covered by `strip_media_markers`; f96238e45 classifier deferred) | _pending_ |
+| **J. Multimodal / Lark image fixes** | 11 | ✅ Migrated (8 ported as one squash; 380efec7e superseded by upstream skip-on-error; c2f79ee7d half-covered by `strip_media_markers`; f96238e45 classifier deferred) | `2eb35edfb` |
 | **K. UTF-8 / truncation fixes** | 2 | ✅ Migrated (1 ported, 1 moot — upstream removed code path) | `225d3a670` |
 | **L. System-prompt additions (S3, Node.js)** | 3 | ✅ Migrated (3 commits squashed; LLM-logging half of `aff780a82` skipped) | `b46b802de` |
 | **M. Docs / housekeeping** | 7 | 🟡 Partial — only the zh-CN tool descriptions extracted from `5e7d31196` were worth porting; everything else moot/superseded | `3141fcda8` |
@@ -234,34 +234,95 @@ split), file a focused PR upstream instead of re-porting.
 
 ---
 
-## E. progress-observer crate (⏸️ Deferred)
+## E. progress-observer crate (✅ Migrated — orchestrator submodule)
 
-**Decision**: superseded by upstream's `zeroclaw-log` event broadcast +
-Observer bridge in 0.8.0. The whole `crates/zeroclaw-progress-observer/`
-will not be ported.
+**Outcome**: master's standalone `zeroclaw-progress-observer` crate is
+**not** ported as a crate. Instead an equivalent feature lives in
+`crates/zeroclaw-channels/src/orchestrator/progress.rs` (~170 LOC + tests)
+that reuses 0.8.0's existing draft-streaming infrastructure.
 
-| Status | Commit | Title |
-|--------|--------|-------|
-| ⏸️ | `c4de33b77` | feat(progress-observer): scaffold new crate |
-| ⏸️ | `3db39131f` | feat(progress-observer): add toggles, summarize_tool_args, event_to_status |
-| ⏸️ | `94bdb3db4` | test(progress-observer): add MockChannel test helper |
-| ⏸️ | `d335ec535` | feat(progress-observer): implement ProgressReportingObserver |
-| ⏸️ | `1c91e91a` (`1c1e90c91`) | feat(channels): wire progress-reporting observer into orchestrator |
-| ⏸️ | `d088b2202` | feat(channels): wire ProgressReportingObserver into orchestrator |
-| ⏸️ | `019f180ff` | feat(orchestrator): fire AgentStart/AgentEnd events for channel turns |
-| ⏸️ | `cdbf37e53` | fix(progress-observer): fix tool names in desc mapping |
-| ⏸️ | `8445bba23` | fix(progress-observer): friendly tool label in tool_call done/fail desc |
-| ⏸️ | `73c20ebad` | feat(progress-observer): event_name helper for readable log output |
-| ⏸️ | `ac823f870` | feat(api): add StatusUpdate and Channel::send_status_update default |
-| ⏸️ | `6e759624d` | feat(config): add [progress_observer] config section |
-| ⏸️ | `d0b2055a4` | fix(config): correct derive order and fix async test for ProgressObserverConfig |
-| ⏸️ | `e5245a891` | chore: update Cargo.lock for zeroclaw-progress-observer crate |
-| ⏸️ | `d957d2ee5` | docs(plan): add progress streaming implementation plan |
-| ⏸️ | `76bf5b723` | docs(spec): add progress streaming via sidelined observer design |
+### E.1 Why a submodule, not a crate
 
-**Follow-up**: when WuKongIM `progress_streaming` is ready to be re-enabled,
-do it via Observer bridge subscription inside the WK module — not by
-reviving this crate.
+0.8.0 already provides the moving parts master built from scratch:
+
+- `Observer` trait + complete `ObserverEvent` enum (covers all 6 event
+  classes from master's `[progress_observer]` toggles)
+- `TeeObserver` + `set_scoped_broadcast_hook` for process-wide observers
+  (gateway SSE uses this)
+- `Channel::update_draft_progress` / `start_typing` / `add_reaction` for
+  per-recipient progress UX
+- `StreamDelta::Status(text)` mpsc protocol with an existing draft-updater
+  task in the orchestrator that already forwards Status to
+  `update_draft_progress` (Slack's `set_assistant_status` for free)
+
+So the only missing piece was the **`ObserverEvent` → Chinese status text**
+translation table — exactly `event_to_status` + `summarize_tool_args` from
+master. Lifted those two pure functions, dropped master's `StatusUpdate` /
+`StatusPhase` value types (the downstream path is text-only),
+dropped `execution_id` (per-message wrapper observer means context binding
+is implicit, no routing needed), dropped `set_scoped_broadcast_hook` route
+(broadcasts to all observers; we want per-message scoping, not global).
+
+### E.2 What got ported (essence vs container)
+
+| Status | Commit | Title | Disposition |
+|--------|--------|-------|-------------|
+| ⏸️ | `c4de33b77` | scaffold new crate | dropped (no crate) |
+| ✅ | `3db39131f` | toggles, summarize_tool_args, event_to_status | **ported** (translation table + toggles) |
+| ⏸️ | `94bdb3db4` | MockChannel test helper | dropped (uses tokio mpsc directly) |
+| ✅ | `d335ec535` | implement ProgressReportingObserver | **ported** as `ProgressObserver` wrapper |
+| ✅ | `1c1e90c91` / `d088b2202` | wire into orchestrator | **ported** at `process_channel_message_body` |
+| ⏸️ | `019f180ff` | fire AgentStart/AgentEnd events for channel turns | not needed — 0.8.0 agent loop already fires both via the `record!` macro → observer_bridge route |
+| ✅ | `cdbf37e53` | fix tool names in desc mapping | folded into `event_to_status` |
+| ✅ | `8445bba23` | friendly tool label in tool_call done/fail desc | folded |
+| ⏸️ | `73c20ebad` | event_name helper for readable log output | not needed (no separate log path) |
+| ⏸️ | `ac823f870` | StatusUpdate type + Channel::send_status_update default | dropped — uses existing `StreamDelta::Status` path; no new Channel trait method |
+| ✅ | `6e759624d` / `d0b2055a4` | [progress_observer] config section | **ported** as `ProgressObserverConfig` under `[channels_config.progress_observer]` |
+| 🟪 | `e5245a891` | update Cargo.lock | N/A |
+| ⏸️ | `d957d2ee5` / `76bf5b723` | docs | not needed |
+
+### E.3 Design deltas from master
+
+1. **No new crate.** `crates/zeroclaw-channels/src/orchestrator/progress.rs`
+   is a private submodule visible only to the orchestrator.
+2. **No `StatusUpdate` / `StatusPhase` value types.** Translation returns
+   `Option<String>` instead. Phase information would be redundant since the
+   downstream `update_draft_progress` is text-only.
+3. **No `execution_id`.** The wrapper is constructed per-message in
+   `process_channel_message_body`; the mpsc sender it holds is the
+   per-message `delta_tx`. Context binding is implicit through the
+   wrapper's lifetime — no `execution_id` field on events needed, no
+   per-event routing table.
+4. **No `Channel::send_status_update`.** Reuses `StreamDelta::Status` →
+   existing draft-updater task → `Channel::update_draft_progress`. Keeps
+   the Channel trait surface unchanged.
+5. **Config namespace**: `[channels_config.progress_observer]` rather than
+   master's top-level `[progress_observer]`, to match 0.8.0's
+   `ChannelsConfig` grouping convention.
+6. **Toggle semantics**: master's `enabled` master switch + 6 sub-toggles
+   are preserved bit-for-bit (`agent_start`, `agent_end`, `tool_call_start`,
+   `tool_call`, `llm_thinking`, `error`). All default `false` → no
+   behaviour change on upgrade. Helper `any_enabled()` short-circuits the
+   wrapper construction at the wiring site.
+
+### E.4 Limitations
+
+- Status updates are only emitted on channels with
+  `supports_draft_updates() == true` (today: Slack via
+  `set_assistant_status`). Other channels see no effect — opt-in
+  follow-up: add `update_draft_progress` fallback paths in
+  Telegram/Discord/Lark.
+- `LlmRequest` event is the only signal mapped to "thinking" today;
+  `LlmResponse` is not surfaced (matches master's design).
+- No rate-limiting layer on top of the existing draft-updater's debounce
+  (Slack rate-limits `chat.update` to ~1 req/sec which is already
+  appropriate for status text).
+
+### E.5 Follow-up
+
+- WuKongIM `progress_streaming` (the Area A deferred piece) can now be
+  wired by implementing `update_draft_progress` on `WuKongImChannel` and
+  enabling the appropriate toggles — no further infrastructure work.
 
 ---
 
