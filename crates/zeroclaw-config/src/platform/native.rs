@@ -212,11 +212,20 @@ mod tests {
         let debug = format!("{cmd:?}");
         match rt.shell {
             WindowsShell::Pwsh | WindowsShell::PowerShell => {
-                assert!(debug.contains("-Command"), "PowerShell must use -Command, got: {debug}");
-                assert!(debug.contains("-NoProfile"), "must isolate from user profile, got: {debug}");
+                assert!(
+                    debug.contains("-Command"),
+                    "PowerShell must use -Command, got: {debug}"
+                );
+                assert!(
+                    debug.contains("-NoProfile"),
+                    "must isolate from user profile, got: {debug}"
+                );
             }
             WindowsShell::Cmd => {
-                assert!(debug.contains("/C"), "cmd fallback must use /C, got: {debug}");
+                assert!(
+                    debug.contains("/C"),
+                    "cmd fallback must use /C, got: {debug}"
+                );
             }
         }
     }

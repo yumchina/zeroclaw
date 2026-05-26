@@ -1251,7 +1251,10 @@ impl SecurityPolicy {
         }
 
         // tee check
-        if command.split_whitespace().any(|w| w == "tee" || w.ends_with("/tee")) {
+        if command
+            .split_whitespace()
+            .any(|w| w == "tee" || w.ends_with("/tee"))
+        {
             return Some(("tee".to_string(), DeniedCategory::Redirect));
         }
 
@@ -1291,7 +1294,9 @@ impl SecurityPolicy {
             // Argument safety check
             let args_cased: Vec<String> = words.map(|w| w.to_string()).collect();
             let args: Vec<String> = args_cased.iter().map(|w| w.to_ascii_lowercase()).collect();
-            if let Some((blocked, category)) = self.diagnose_args_danger(base_cmd, &args, &args_cased) {
+            if let Some((blocked, category)) =
+                self.diagnose_args_danger(base_cmd, &args, &args_cased)
+            {
                 return Some((blocked, category));
             }
         }
@@ -1532,10 +1537,16 @@ impl SecurityPolicy {
                 if args_cased.iter().any(|arg| arg == "-c") {
                     return Some(("git -c".to_string(), DeniedCategory::HighRisk));
                 }
-                if args.iter().any(|arg| arg == "config" || arg.starts_with("config.")) {
+                if args
+                    .iter()
+                    .any(|arg| arg == "config" || arg.starts_with("config."))
+                {
                     return Some(("git config".to_string(), DeniedCategory::HighRisk));
                 }
-                if args.iter().any(|arg| arg == "alias" || arg.starts_with("alias.")) {
+                if args
+                    .iter()
+                    .any(|arg| arg == "alias" || arg.starts_with("alias."))
+                {
                     return Some(("git alias".to_string(), DeniedCategory::HighRisk));
                 }
             }
@@ -2304,14 +2315,10 @@ mod tests {
         assert!(p.is_command_allowed(
             r#"pwsh -NoProfile -NonInteractive -Command "Get-ChildItem 'C:\Users\foo'""#
         ));
-        assert!(p.is_command_allowed(
-            r#"powershell -Command "Get-ChildItem""#
-        ));
+        assert!(p.is_command_allowed(r#"powershell -Command "Get-ChildItem""#));
 
         // Wrapper around a disallowed cmdlet must still be rejected.
-        assert!(!p.is_command_allowed(
-            r#"powershell -Command "Remove-Item 'C:\Users\foo'""#
-        ));
+        assert!(!p.is_command_allowed(r#"powershell -Command "Remove-Item 'C:\Users\foo'""#));
     }
 
     #[test]
@@ -4365,7 +4372,10 @@ mod tests {
             ..Default::default()
         };
         let result = p.find_denied_command("docker run");
-        assert_eq!(result, Some(("docker".to_string(), DeniedCategory::NotAllowed)));
+        assert_eq!(
+            result,
+            Some(("docker".to_string(), DeniedCategory::NotAllowed))
+        );
     }
 
     #[test]
@@ -4375,14 +4385,20 @@ mod tests {
             ..Default::default()
         };
         let result = p.find_denied_command("python -c 'print(1)'");
-        assert_eq!(result, Some(("python -c".to_string(), DeniedCategory::InlineEval)));
+        assert_eq!(
+            result,
+            Some(("python -c".to_string(), DeniedCategory::InlineEval))
+        );
     }
 
     #[test]
     fn find_denied_command_subshell() {
         let p = SecurityPolicy::default();
         let result = p.find_denied_command("echo $(rm -rf /)");
-        assert_eq!(result, Some(("$(...)".to_string(), DeniedCategory::Subshell)));
+        assert_eq!(
+            result,
+            Some(("$(...)".to_string(), DeniedCategory::Subshell))
+        );
     }
 
     #[test]
