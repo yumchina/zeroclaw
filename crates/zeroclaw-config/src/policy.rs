@@ -1196,6 +1196,97 @@ impl SecurityPolicy {
     // per-segment allowlist check. Each gate targets a specific bypass
     // technique. If any gate rejects, the whole command is blocked.
 
+    /// Find the specific command/argument that causes denial.
+    /// Returns (blocked_part, category), where blocked_part is the minimal identifiable element.
+    /// Example: ("python -c", InlineEval) means python -c is blocked due to inline execution.
+    pub fn find_denied_command(&self, command: &str) -> Option<(String, DeniedCategory)> {
+        if self.autonomy == AutonomyLevel::ReadOnly {
+            return Some(("".to_string(), DeniedCategory::NotAllowed));
+        }
+
+        let has_wildcard = self.allowed_commands.iter().any(|c| c.trim() == "*");
+        if has_wildcard && !self.block_high_risk_commands {
+            return None;
+        }
+
+        // Unwrap shell wrapper
+        let mut working = command.to_owned();
+        for _ in 0..4 {
+            match unwrap_shell_wrapper(&working) {
+                Some(inner) => working = inner,
+                None => break,
+            }
+        }
+        let command = working.as_str();
+
+        // Subshell operators check
+        if command.contains('`') {
+            return Some(("`...`".to_string(), DeniedCategory::Subshell));
+        }
+        if contains_unquoted_shell_variable_expansion(command) {
+            return Some(("$(...)".to_string(), DeniedCategory::Subshell));
+        }
+        if command.contains("<(") || command.contains(">(") {
+            return Some(("<(...)".to_string(), DeniedCategory::Subshell));
+        }
+
+        // Redirect check
+        if contains_unsafe_output_redirect(command) {
+            return Some((">".to_string(), DeniedCategory::Redirect));
+        }
+        if contains_unquoted_input_redirect(command) {
+            return Some(("<".to_string(), DeniedCategory::Redirect));
+        }
+
+        // tee check
+        if command.split_whitespace().any(|w| w == "tee" || w.ends_with("/tee")) {
+            return Some(("tee".to_string(), DeniedCategory::Redirect));
+        }
+
+        // Background chaining check
+        let ampersand_check = strip_fd_merge_redirects(command);
+        if contains_unquoted_single_ampersand(&ampersand_check) {
+            return Some(("&".to_string(), DeniedCategory::Background));
+        }
+
+        // Parse command segments
+        let segments = split_unquoted_segments(command);
+        for segment in &segments {
+            let cmd_part = skip_env_assignments(segment);
+            let mut words = cmd_part.split_whitespace();
+            let raw_executable = strip_wrapping_quotes(words.next().unwrap_or("")).trim();
+            let executable = if let Some(idx) = raw_executable.find(['<', '>']) {
+                &raw_executable[..idx]
+            } else {
+                raw_executable
+            };
+            let base_cmd_owned = command_basename(executable).to_ascii_lowercase();
+            let base_cmd = strip_windows_exe_suffix(&base_cmd_owned);
+
+            if base_cmd.is_empty() {
+                continue;
+            }
+
+            // Allowlist check
+            if !self
+                .allowed_commands
+                .iter()
+                .any(|allowed| is_allowlist_entry_match(allowed, executable, base_cmd))
+            {
+                return Some((base_cmd.to_string(), DeniedCategory::NotAllowed));
+            }
+
+            // Argument safety check
+            let args_cased: Vec<String> = words.map(|w| w.to_string()).collect();
+            let args: Vec<String> = args_cased.iter().map(|w| w.to_ascii_lowercase()).collect();
+            if let Some((blocked, category)) = self.diagnose_args_danger(base_cmd, &args, &args_cased) {
+                return Some((blocked, category));
+            }
+        }
+
+        None
+    }
+
     /// Check if a shell command is allowed.
     ///
     /// Validates the **entire** command string, not just the first word:
@@ -4191,6 +4282,45 @@ mod tests {
         let args = vec!["script.py".to_string()];
         let args_cased = args.clone();
         let result = p.diagnose_args_danger("python", &args, &args_cased);
+        assert_eq!(result, None);
+    }
+
+    // ── find_denied_command ───────────────────────────────────────
+
+    #[test]
+    fn find_denied_command_not_allowed() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["ls".to_string()],
+            ..Default::default()
+        };
+        let result = p.find_denied_command("docker run");
+        assert_eq!(result, Some(("docker".to_string(), DeniedCategory::NotAllowed)));
+    }
+
+    #[test]
+    fn find_denied_command_inline_eval() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["python".to_string()],
+            ..Default::default()
+        };
+        let result = p.find_denied_command("python -c 'print(1)'");
+        assert_eq!(result, Some(("python -c".to_string(), DeniedCategory::InlineEval)));
+    }
+
+    #[test]
+    fn find_denied_command_subshell() {
+        let p = SecurityPolicy::default();
+        let result = p.find_denied_command("echo $(rm -rf /)");
+        assert_eq!(result, Some(("$(...)".to_string(), DeniedCategory::Subshell)));
+    }
+
+    #[test]
+    fn find_denied_command_allowed() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["ls".to_string()],
+            ..Default::default()
+        };
+        let result = p.find_denied_command("ls -la");
         assert_eq!(result, None);
     }
 }
