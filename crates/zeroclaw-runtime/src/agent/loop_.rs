@@ -990,11 +990,16 @@ async fn consume_provider_streaming_response(
     temperature: Option<f64>,
     cancellation_token: Option<&CancellationToken>,
     on_delta: Option<&tokio::sync::mpsc::Sender<DraftEvent>>,
+    strict_tool_parsing: bool,
 ) -> Result<StreamedChatOutcome> {
     let mut provider_stream = model_provider.stream_chat(
         ChatRequest {
             messages,
             tools: request_tools,
+            thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                .try_with(Clone::clone)
+                .ok()
+                .flatten(),
         },
         model,
         temperature,
@@ -1070,6 +1075,16 @@ async fn consume_provider_streaming_response(
                     continue;
                 }
 
+                if strict_tool_parsing {
+                    if let Some(tx) = delta_sender {
+                        outcome.forwarded_live_deltas = true;
+                        if tx.send(StreamDelta::Text(chunk.delta)).await.is_err() {
+                            delta_sender = None;
+                        }
+                    }
+                    continue;
+                }
+
                 let Some(forward_text) = text_guard.push(&chunk.delta) else {
                     continue;
                 };
@@ -1117,6 +1132,7 @@ pub async fn agent_turn(
     dedup_exempt_tools: &[String],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
+    strict_tool_parsing: bool,
     channel: Option<&dyn Channel>,
 ) -> Result<String> {
     run_tool_call_loop(
@@ -1141,6 +1157,7 @@ pub async fn agent_turn(
         activated_tools,
         model_switch_callback,
         &zeroclaw_config::schema::PacingConfig::default(),
+        strict_tool_parsing,
         0,    // max_tool_result_chars: 0 = disabled (legacy callers)
         0,    // context_token_budget: 0 = disabled (legacy callers)
         None, // shared_budget: no shared budget for legacy callers
@@ -1283,6 +1300,7 @@ pub async fn run_tool_call_loop(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     model_switch_callback: Option<ModelSwitchCallback>,
     pacing: &zeroclaw_config::schema::PacingConfig,
+    strict_tool_parsing: bool,
     max_tool_result_chars: usize,
     context_token_budget: usize,
     shared_budget: Option<Arc<std::sync::atomic::AtomicUsize>>,
@@ -1583,6 +1601,7 @@ pub async fn run_tool_call_loop(
                 temperature,
                 cancellation_token.as_ref(),
                 on_delta.as_ref(),
+                strict_tool_parsing,
             )
             .await
             {
@@ -1625,6 +1644,10 @@ pub async fn run_tool_call_loop(
                                 ChatRequest {
                                     messages: &prepared_messages.messages,
                                     tools: request_tools,
+                                    thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                                        .try_with(Clone::clone)
+                                        .ok()
+                                        .flatten(),
                                 },
                                 active_model,
                                 temperature,
@@ -1654,6 +1677,10 @@ pub async fn run_tool_call_loop(
                     ChatRequest {
                         messages: &prepared_messages.messages,
                         tools: request_tools,
+                        thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+                            .try_with(Clone::clone)
+                            .ok()
+                            .flatten(),
                     },
                     active_model,
                     temperature,
@@ -1731,7 +1758,7 @@ pub async fn run_tool_call_loop(
                     .as_ref()
                     .and_then(|usage| record_tool_loop_cost_usage(provider_name, model, usage));
 
-                let response_text = if tool_specs.is_empty() {
+                let mut response_text = if tool_specs.is_empty() {
                     strip_think_tags(resp.text_or_empty())
                 } else {
                     resp.text_or_empty().to_string()
@@ -1757,8 +1784,13 @@ pub async fn run_tool_call_loop(
                 };
                 let mut parsed_text = String::new();
 
+                if strict_tool_parsing && calls.is_empty() {
+                    response_text = strip_think_tags(&response_text);
+                }
+
                 if calls.is_empty()
                     && !tool_specs.is_empty()
+                    && !strict_tool_parsing
                     && !looks_like_tool_protocol_example(&response_text)
                 {
                     let (fallback_text, fallback_calls) = parse_tool_calls(&response_text);
@@ -1772,7 +1804,9 @@ pub async fn run_tool_call_loop(
                     calls = filtered_calls;
                 }
 
-                let parse_issue = if tool_specs.is_empty() {
+                let parse_issue = if strict_tool_parsing {
+                    None
+                } else if tool_specs.is_empty() {
                     detect_internal_protocol_without_tools(&response_text).or_else(|| {
                         streamed_protocol_suppressed.then(|| {
                             "streaming text guard suppressed an internal tool protocol envelope"
@@ -2677,6 +2711,10 @@ pub async fn run_tool_call_loop(
     let summary_request = zeroclaw_providers::ChatRequest {
         messages: history,
         tools: None, // No tools — force a text response
+        thinking: zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .try_with(Clone::clone)
+            .ok()
+            .flatten(),
     };
     match model_provider
         .chat(summary_request, model, temperature)
@@ -2766,6 +2804,20 @@ fn retain_registered_tool_descriptions(
     tool_descs.retain(|(name, _)| registered_tool_names.contains(name));
 }
 
+pub fn apply_text_tool_prompt_policy(
+    native_tools: bool,
+    strict_tool_parsing: bool,
+    tool_descs: &mut Vec<(&str, &str)>,
+    deferred_section: &mut String,
+) -> bool {
+    let expose_text_tool_protocol = !native_tools && !strict_tool_parsing;
+    if !native_tools && strict_tool_parsing {
+        tool_descs.clear();
+        deferred_section.clear();
+    }
+    expose_text_tool_protocol
+}
+
 // ── CLI Entrypoint ───────────────────────────────────────────────────────
 // Wires up all subsystems (observer, runtime, security, memory, tools,
 // model_provider, hardware RAG, peripherals) and enters either single-shot or
@@ -2814,6 +2866,7 @@ pub async fn run(
         .agent(agent_alias)
         .with_context(|| format!("agents.{agent_alias} is not configured"))?
         .clone();
+    crate::agent::thinking::validate_thinking_config(&agent.thinking);
     let risk_profile = config
         .risk_profile_for_agent(agent_alias)
         .with_context(|| {
@@ -3315,6 +3368,12 @@ pub async fn run(
             None
         };
         let native_tools = model_provider.supports_native_tools();
+        let expose_text_tool_protocol = apply_text_tool_prompt_policy(
+            native_tools,
+            agent.strict_tool_parsing,
+            &mut tool_descs,
+            &mut deferred_section,
+        );
         let agent_workspace = config.agent_workspace_dir(agent_alias);
         let mut system_prompt =
             crate::agent::system_prompt::build_system_prompt_with_mode_and_autonomy(
@@ -3332,7 +3391,7 @@ pub async fn run(
             );
 
         // Append structured tool-use instructions with schemas (only for non-native model_providers)
-        if !native_tools {
+        if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions(&tools_registry));
         }
 
@@ -3410,7 +3469,10 @@ pub async fn run(
                 None,
                 &agent.thinking,
             );
-            let thinking_params = crate::agent::thinking::apply_thinking_level(thinking_level);
+            let thinking_params = crate::agent::thinking::apply_thinking_level_with_config(
+                thinking_level,
+                &agent.thinking,
+            );
             let effective_temperature: Option<f64> = temperature.map(|t| {
                 crate::agent::thinking::clamp_temperature(
                     t + thinking_params.temperature_adjustment,
@@ -3498,37 +3560,41 @@ pub async fn run(
             #[allow(unused_assignments)]
             let mut response = String::new();
             loop {
-                match TOOL_LOOP_COST_TRACKING_CONTEXT
+                match zeroclaw_api::NATIVE_THINKING_OVERRIDE
                     .scope(
-                        cost_tracking_context.clone(),
-                        run_tool_call_loop(
-                            model_provider.as_ref(),
-                            &mut history,
-                            &tools_registry,
-                            observer.as_ref(),
-                            &provider_name,
-                            &model_name,
-                            effective_temperature,
-                            false,
-                            approval_manager.as_ref(),
-                            channel_name,
-                            None,
-                            &config.multimodal,
-                            agent.max_tool_iterations,
-                            None,
-                            None,
-                            None,
-                            &excluded_tools,
-                            &agent.tool_call_dedup_exempt,
-                            activated_handle.as_ref(),
-                            Some(model_switch_callback.clone()),
-                            &config.pacing,
-                            agent.max_tool_result_chars,
-                            agent.max_context_tokens,
-                            None, // shared_budget
-                            None, // channel: CLI mode — uses prompt_cli
-                            None, // receipt_generator
-                            None, // collected_receipts
+                        thinking_params.native_thinking,
+                        TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                            cost_tracking_context.clone(),
+                            run_tool_call_loop(
+                                model_provider.as_ref(),
+                                &mut history,
+                                &tools_registry,
+                                observer.as_ref(),
+                                &provider_name,
+                                &model_name,
+                                effective_temperature,
+                                false,
+                                approval_manager.as_ref(),
+                                channel_name,
+                                None,
+                                &config.multimodal,
+                                agent.max_tool_iterations,
+                                None,
+                                None,
+                                None,
+                                &excluded_tools,
+                                &agent.tool_call_dedup_exempt,
+                                activated_handle.as_ref(),
+                                Some(model_switch_callback.clone()),
+                                &config.pacing,
+                                agent.strict_tool_parsing,
+                                agent.max_tool_result_chars,
+                                agent.max_context_tokens,
+                                None, // shared_budget
+                                None, // channel: CLI mode — uses prompt_cli
+                                None, // receipt_generator
+                                None, // collected_receipts
+                            ),
                         ),
                     )
                     .await
@@ -3746,7 +3812,10 @@ pub async fn run(
                     None,
                     &agent.thinking,
                 );
-                let thinking_params = crate::agent::thinking::apply_thinking_level(thinking_level);
+                let thinking_params = crate::agent::thinking::apply_thinking_level_with_config(
+                    thinking_level,
+                    &agent.thinking,
+                );
                 let turn_temperature: Option<f64> = temperature.map(|t| {
                     crate::agent::thinking::clamp_temperature(
                         t + thinking_params.temperature_adjustment,
@@ -3882,37 +3951,41 @@ pub async fn run(
                 });
 
                 let response = loop {
-                    match TOOL_LOOP_COST_TRACKING_CONTEXT
+                    match zeroclaw_api::NATIVE_THINKING_OVERRIDE
                         .scope(
-                            cost_tracking_context.clone(),
-                            run_tool_call_loop(
-                                model_provider.as_ref(),
-                                &mut history,
-                                &tools_registry,
-                                observer.as_ref(),
-                                &provider_name,
-                                &model_name,
-                                turn_temperature,
-                                true,
-                                approval_manager.as_ref(),
-                                channel_name,
-                                None,
-                                &config.multimodal,
-                                agent.max_tool_iterations,
-                                Some(cancel_token.clone()),
-                                Some(delta_tx.clone()),
-                                None,
-                                &excluded_tools,
-                                &agent.tool_call_dedup_exempt,
-                                activated_handle.as_ref(),
-                                Some(model_switch_callback.clone()),
-                                &config.pacing,
-                                agent.max_tool_result_chars,
-                                agent.max_context_tokens,
-                                None, // shared_budget
-                                None, // channel: interactive CLI — uses prompt_cli
-                                None, // receipt_generator
-                                None, // collected_receipts
+                            thinking_params.native_thinking,
+                            TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                                cost_tracking_context.clone(),
+                                run_tool_call_loop(
+                                    model_provider.as_ref(),
+                                    &mut history,
+                                    &tools_registry,
+                                    observer.as_ref(),
+                                    &provider_name,
+                                    &model_name,
+                                    turn_temperature,
+                                    true,
+                                    approval_manager.as_ref(),
+                                    channel_name,
+                                    None,
+                                    &config.multimodal,
+                                    agent.max_tool_iterations,
+                                    Some(cancel_token.clone()),
+                                    Some(delta_tx.clone()),
+                                    None,
+                                    &excluded_tools,
+                                    &agent.tool_call_dedup_exempt,
+                                    activated_handle.as_ref(),
+                                    Some(model_switch_callback.clone()),
+                                    &config.pacing,
+                                    agent.strict_tool_parsing,
+                                    agent.max_tool_result_chars,
+                                    agent.max_context_tokens,
+                                    None, // shared_budget
+                                    None, // channel: interactive CLI — uses prompt_cli
+                                    None, // receipt_generator
+                                    None, // collected_receipts
+                                ),
                             ),
                         )
                         .await
@@ -4125,6 +4198,7 @@ pub async fn process_message(
         .agent(agent_alias)
         .with_context(|| format!("agents.{agent_alias} is not configured"))?
         .clone();
+    crate::agent::thinking::validate_thinking_config(&agent.thinking);
     let risk_profile = config
         .risk_profile_for_agent(agent_alias)
         .with_context(|| {
@@ -4479,6 +4553,12 @@ pub async fn process_message(
             None
         };
         let native_tools = model_provider.supports_native_tools();
+        let expose_text_tool_protocol = apply_text_tool_prompt_policy(
+            native_tools,
+            agent.strict_tool_parsing,
+            &mut tool_descs,
+            &mut deferred_section,
+        );
         let agent_workspace = config.agent_workspace_dir(agent_alias);
         let mut system_prompt =
             crate::agent::system_prompt::build_system_prompt_with_mode_and_autonomy(
@@ -4494,7 +4574,7 @@ pub async fn process_message(
                 agent.compact_context,
                 agent.max_system_prompt_chars,
             );
-        if !native_tools {
+        if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
                 &tools_registry,
                 &effective_tool_names,
@@ -4524,7 +4604,10 @@ pub async fn process_message(
             None,
             &agent.thinking,
         );
-        let thinking_params = crate::agent::thinking::apply_thinking_level(thinking_level);
+        let thinking_params = crate::agent::thinking::apply_thinking_level_with_config(
+            thinking_level,
+            &agent.thinking,
+        );
         let effective_temperature: Option<f64> = config
             .first_model_provider()
             .and_then(|e| e.temperature)
@@ -4589,27 +4672,32 @@ pub async fn process_message(
             }
         }
 
-        agent_turn(
-            model_provider.as_ref(),
-            &mut history,
-            &tools_registry,
-            observer.as_ref(),
-            provider_name,
-            &model_name,
-            effective_temperature,
-            true,
-            "daemon",
-            None,
-            &config.multimodal,
-            agent.max_tool_iterations,
-            Some(&approval_manager),
-            &excluded_tools,
-            &agent.tool_call_dedup_exempt,
-            activated_handle_pm.as_ref(),
-            None,
-            None, // channel: process_message path has no channel ref
-        )
-        .await
+        zeroclaw_api::NATIVE_THINKING_OVERRIDE
+            .scope(
+                thinking_params.native_thinking,
+                agent_turn(
+                    model_provider.as_ref(),
+                    &mut history,
+                    &tools_registry,
+                    observer.as_ref(),
+                    provider_name,
+                    &model_name,
+                    effective_temperature,
+                    true,
+                    "daemon",
+                    None,
+                    &config.multimodal,
+                    agent.max_tool_iterations,
+                    Some(&approval_manager),
+                    &excluded_tools,
+                    &agent.tool_call_dedup_exempt,
+                    activated_handle_pm.as_ref(),
+                    None,
+                    agent.strict_tool_parsing,
+                    None, // channel: process_message path has no channel ref
+                ),
+            )
+            .await
     };
     __zc_body
         .instrument(__zc_scope_span)
@@ -4620,8 +4708,9 @@ pub async fn process_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        emergency_history_trim, estimate_history_tokens, fast_trim_tool_results,
-        load_interactive_session_history, save_interactive_session_history, truncate_tool_result,
+        apply_text_tool_prompt_policy, emergency_history_trim, estimate_history_tokens,
+        fast_trim_tool_results, load_interactive_session_history, save_interactive_session_history,
+        truncate_tool_result,
     };
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
     use crate::agent::tool_execution::execute_one_tool;
@@ -5094,6 +5183,7 @@ mod tests {
         let result = execute_one_tool(
             "unknown_tool",
             call_arguments,
+            None,
             &[],
             None,
             &observer,
@@ -5125,6 +5215,7 @@ mod tests {
         let outcome = execute_one_tool(
             "extract_text",
             serde_json::json!({ "value": "ok" }),
+            None,
             &[],
             Some(&activated),
             &observer,
@@ -5147,6 +5238,7 @@ mod tests {
         let outcome = execute_one_tool(
             "empty_success",
             serde_json::json!({}),
+            None,
             &tools,
             None,
             &observer,
@@ -5228,6 +5320,7 @@ mod tests {
                 native_tool_calling: false,
                 vision: true,
                 prompt_caching: false,
+                extended_thinking: false,
             }
         }
 
@@ -5541,6 +5634,7 @@ mod tests {
                 native_tool_calling: true,
                 vision: false,
                 prompt_caching: false,
+                extended_thinking: false,
             }
         }
 
@@ -5996,6 +6090,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -6052,6 +6147,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -6112,6 +6208,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -6163,6 +6260,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -6221,6 +6319,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -6280,6 +6379,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -6339,6 +6439,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -6397,6 +6498,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -6454,6 +6556,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -6595,6 +6698,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -6675,6 +6779,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -6747,6 +6852,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -6814,6 +6920,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -6894,6 +7001,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -6964,6 +7072,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -7054,6 +7163,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -7118,6 +7228,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -7186,6 +7297,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -7249,6 +7361,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -7310,6 +7423,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -7374,6 +7488,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -7435,6 +7550,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -7495,6 +7611,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -7547,6 +7664,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -7600,6 +7718,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -7653,6 +7772,7 @@ mod tests {
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -7708,6 +7828,7 @@ This is an example, not an invocation."#;
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -7768,6 +7889,7 @@ This is an example, not an invocation."#;
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -7840,6 +7962,7 @@ This is an example, not an invocation."#;
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -7895,6 +8018,7 @@ Done."#;
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -7953,6 +8077,7 @@ Done."#;
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -8009,6 +8134,7 @@ Done."#;
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -8066,6 +8192,7 @@ This is an example, not an invocation."#;
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -8180,6 +8307,7 @@ This is an example, not an invocation."#;
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -8245,6 +8373,7 @@ This is an example, not an invocation."#;
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -8314,6 +8443,7 @@ This is an example, not an invocation."#;
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -8403,6 +8533,7 @@ This is an example, not an invocation."#;
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -8471,6 +8602,7 @@ This is an example, not an invocation."#;
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -8542,6 +8674,7 @@ This is an example, not an invocation."#;
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -8642,6 +8775,7 @@ This is an example, not an invocation."#;
             Some(0.0),
             None,
             Some(&tx),
+            false,
         )
         .await
         .expect("streaming should finish");
@@ -8726,6 +8860,7 @@ This is an example, not an invocation."#;
             Some(0.0),
             None,
             Some(&tx),
+            false,
         )
         .await
         .expect("streaming should finish");
@@ -8761,6 +8896,7 @@ This is an example, not an invocation."#;
             Some(0.0),
             None,
             Some(&tx),
+            false,
         )
         .await
         .expect("streaming should finish");
@@ -8799,6 +8935,7 @@ This is an example, not an invocation."#;
             Some(0.0),
             None,
             Some(&tx),
+            false,
         )
         .await
         .expect("streaming should finish");
@@ -8837,6 +8974,7 @@ This is an example, not an invocation."#;
             Some(0.0),
             None,
             Some(&tx),
+            false,
         )
         .await
         .expect("streaming should finish");
@@ -8919,6 +9057,7 @@ This is an example, not an invocation."#;
             Some(0.0),
             None,
             Some(&tx),
+            false,
         )
         .await
         .expect("streaming should finish");
@@ -8999,6 +9138,7 @@ This is an example, not an invocation."#;
             Some(0.0),
             None,
             Some(&tx),
+            false,
         )
         .await
         .expect("streaming should finish");
@@ -9082,6 +9222,7 @@ This is an example, not an invocation."#;
             Some(0.0),
             None,
             Some(&tx),
+            false,
         )
         .await
         .expect("streaming should finish");
@@ -9168,6 +9309,7 @@ This is an example, not an invocation."#;
             Some(0.0),
             None,
             Some(&tx),
+            false,
         )
         .await
         .expect("streaming should finish");
@@ -9249,6 +9391,7 @@ This is an example, not an invocation."#;
             Some(0.0),
             None,
             Some(&tx),
+            false,
         )
         .await
         .expect("streaming should finish");
@@ -9333,6 +9476,7 @@ This is an example, not an invocation."#;
             Some(0.0),
             None,
             Some(&tx),
+            false,
         )
         .await
         .expect("streaming should finish");
@@ -9397,6 +9541,7 @@ This is an example, not an invocation."#;
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -9488,6 +9633,7 @@ This is an example, not an invocation."#;
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -9577,6 +9723,7 @@ This is an example, not an invocation."#;
                 &[],
                 Some(&activated),
                 None,
+                false,
                 None, // channel
             )
             .await
@@ -9587,6 +9734,75 @@ This is an example, not an invocation."#;
                 "result should end with 'done', got: {result}"
             );
             assert_eq!(invocations.load(Ordering::SeqCst), 1);
+        });
+    }
+
+    #[test]
+    fn agent_turn_strict_tool_parsing_ignores_activated_tool_text_from_wrapper() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime should initialize");
+
+        runtime.block_on(async {
+            let model_provider = ScriptedModelProvider::from_text_responses(vec![
+                r#"<think>private reasoning</think>
+<tool_call>
+{"name":"pixel__get_api_health","arguments":{"value":"ignored"}}
+</tool_call>"#,
+            ]);
+
+            let invocations = Arc::new(AtomicUsize::new(0));
+            let activated = Arc::new(std::sync::Mutex::new(crate::tools::ActivatedToolSet::new()));
+            let activated_tool: Arc<dyn Tool> = Arc::new(CountingTool::new(
+                "pixel__get_api_health",
+                Arc::clone(&invocations),
+            ));
+            activated
+                .lock()
+                .unwrap()
+                .activate("pixel__get_api_health".into(), activated_tool);
+
+            let tools_registry: Vec<Box<dyn Tool>> = Vec::new();
+            let mut history = vec![
+                ChatMessage::system("test-system"),
+                ChatMessage::user("do not infer activated tool calls from text"),
+            ];
+            let observer = NoopObserver;
+
+            let result = agent_turn(
+                &model_provider,
+                &mut history,
+                &tools_registry,
+                &observer,
+                "mock-provider",
+                "mock-model",
+                Some(0.0),
+                true,
+                "daemon",
+                None,
+                &zeroclaw_config::schema::MultimodalConfig::default(),
+                4,
+                None,
+                &[],
+                &[],
+                Some(&activated),
+                None,
+                true,
+                None, // channel
+            )
+            .await
+            .expect("strict wrapper path should preserve fallback-looking text");
+
+            assert_eq!(invocations.load(Ordering::SeqCst), 0);
+            assert!(
+                result.contains("<tool_call>"),
+                "strict parser should return fallback-looking text, got: {result}"
+            );
+            assert!(
+                !result.contains("private reasoning"),
+                "strict parser should still strip think tags from final text, got: {result}"
+            );
         });
     }
 
@@ -10334,6 +10550,25 @@ Let me check the result."#;
         );
     }
 
+    #[test]
+    fn strict_non_native_prompt_policy_hides_text_tool_protocol_inputs() {
+        let mut tool_descs = vec![("shell", "Run commands")];
+        let mut deferred_section = "## Deferred MCP Tools\n\n- mcp__example".to_string();
+
+        let expose_text_protocol =
+            apply_text_tool_prompt_policy(false, true, &mut tool_descs, &mut deferred_section);
+
+        assert!(!expose_text_protocol);
+        assert!(
+            tool_descs.is_empty(),
+            "strict non-native prompt paths must not advertise text tools"
+        );
+        assert!(
+            deferred_section.is_empty(),
+            "strict non-native prompt paths must not advertise deferred text tools"
+        );
+    }
+
     // ── Cross-Alias & GLM Shortened Body Tests ──────────────────────────
 
     #[test]
@@ -10522,6 +10757,7 @@ Let me check the result."#;
             Some(0.2),
             None,
             None,
+            false,
         )
         .await
         .expect("streaming should succeed");
@@ -10614,6 +10850,7 @@ Let me check the result."#;
             Some(0.2),
             None,
             None,
+            false,
         )
         .await
         .expect("streaming should succeed");
@@ -10815,6 +11052,7 @@ Let me check the result."#;
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -10971,6 +11209,7 @@ Let me check the result."#;
                     None,
                     None,
                     &zeroclaw_config::schema::PacingConfig::default(),
+                    false,
                     0,
                     0,
                     None,
@@ -11027,6 +11266,7 @@ Let me check the result."#;
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
@@ -11121,6 +11361,7 @@ Let me check the result."#;
                     None,
                     None,
                     &zeroclaw_config::schema::PacingConfig::default(),
+                    false,
                     0,
                     0,
                     None,
@@ -11182,6 +11423,7 @@ Let me check the result."#;
             None,
             None,
             &zeroclaw_config::schema::PacingConfig::default(),
+            false,
             0,
             0,
             None,
