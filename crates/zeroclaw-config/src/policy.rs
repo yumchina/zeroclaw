@@ -1406,6 +1406,84 @@ impl SecurityPolicy {
         }
     }
 
+    /// 诊断参数安全检查的拒绝原因。
+    /// 返回 (blocked_part, category)，blocked_part 是最小可识别元素（如 "python -c"）。
+    fn diagnose_args_danger(
+        &self,
+        base: &str,
+        args: &[String],
+        args_cased: &[String],
+    ) -> Option<(String, DeniedCategory)> {
+        let base_lower = base.to_ascii_lowercase();
+
+        match base_lower.as_str() {
+            "find" => {
+                if args.iter().any(|arg| arg == "-exec") {
+                    return Some(("find -exec".to_string(), DeniedCategory::Subshell));
+                }
+                if args.iter().any(|arg| arg == "-ok") {
+                    return Some(("find -ok".to_string(), DeniedCategory::Subshell));
+                }
+            }
+            "git" => {
+                if args_cased.iter().any(|arg| arg == "-c") {
+                    return Some(("git -c".to_string(), DeniedCategory::HighRisk));
+                }
+                if args.iter().any(|arg| arg == "config" || arg.starts_with("config.")) {
+                    return Some(("git config".to_string(), DeniedCategory::HighRisk));
+                }
+                if args.iter().any(|arg| arg == "alias" || arg.starts_with("alias.")) {
+                    return Some(("git alias".to_string(), DeniedCategory::HighRisk));
+                }
+            }
+            "python" | "python3" => {
+                for arg in args.iter() {
+                    if arg.starts_with("-c") {
+                        return Some(("python -c".to_string(), DeniedCategory::InlineEval));
+                    }
+                    if arg.starts_with("-m") {
+                        return Some(("python -m".to_string(), DeniedCategory::InlineEval));
+                    }
+                }
+            }
+            "node" => {
+                for arg in args.iter() {
+                    if arg.starts_with("-e") || arg.starts_with("--eval") {
+                        return Some(("node -e".to_string(), DeniedCategory::InlineEval));
+                    }
+                    if arg.starts_with("-p") || arg.starts_with("--print") {
+                        return Some(("node -p".to_string(), DeniedCategory::InlineEval));
+                    }
+                }
+            }
+            "pip" | "pip3" => {
+                if args.iter().any(|arg| arg == "install") {
+                    return Some(("pip install".to_string(), DeniedCategory::ExternalFetch));
+                }
+                if args.iter().any(|arg| arg == "download") {
+                    return Some(("pip download".to_string(), DeniedCategory::ExternalFetch));
+                }
+            }
+            "npm" => {
+                for arg in args.iter() {
+                    if arg == "exec" {
+                        return Some(("npm exec".to_string(), DeniedCategory::ExternalFetch));
+                    }
+                    if arg == "install" || arg == "i" || arg == "add" || arg == "ci" {
+                        return Some(("npm install".to_string(), DeniedCategory::ExternalFetch));
+                    }
+                }
+            }
+            "cargo" => {
+                if args.iter().any(|arg| arg == "install") {
+                    return Some(("cargo install".to_string(), DeniedCategory::ExternalFetch));
+                }
+            }
+            _ => {}
+        }
+        None
+    }
+
     /// Return the first path-like argument blocked by path policy.
     ///
     /// This is best-effort token parsing for shell commands and is intended
@@ -4079,5 +4157,40 @@ mod tests {
         let t = PerSenderTracker::new();
         // Key "ghost" has never been recorded — should not be exhausted at max=1
         assert!(!t.is_exhausted("ghost", 1));
+    }
+
+    // ── diagnose_args_danger ───────────────────────────────────
+
+    #[test]
+    fn diagnose_args_danger_python_c() {
+        let p = SecurityPolicy::default();
+        let args = vec!["-c".to_string(), "'print(1)'".to_string()];
+        let args_cased = args.clone();
+        let result = p.diagnose_args_danger("python", &args, &args_cased);
+        assert_eq!(
+            result,
+            Some(("python -c".to_string(), DeniedCategory::InlineEval))
+        );
+    }
+
+    #[test]
+    fn diagnose_args_danger_pip_install() {
+        let p = SecurityPolicy::default();
+        let args = vec!["install".to_string(), "requests".to_string()];
+        let args_cased = args.clone();
+        let result = p.diagnose_args_danger("pip", &args, &args_cased);
+        assert_eq!(
+            result,
+            Some(("pip install".to_string(), DeniedCategory::ExternalFetch))
+        );
+    }
+
+    #[test]
+    fn diagnose_args_danger_safe_args() {
+        let p = SecurityPolicy::default();
+        let args = vec!["script.py".to_string()];
+        let args_cased = args.clone();
+        let result = p.diagnose_args_danger("python", &args, &args_cased);
+        assert_eq!(result, None);
     }
 }
