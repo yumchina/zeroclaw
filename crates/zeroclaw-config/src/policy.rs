@@ -1114,7 +1114,19 @@ impl SecurityPolicy {
         approved: bool,
     ) -> Result<CommandRiskLevel, String> {
         if !self.is_command_allowed(command) {
-            return Err(format!("Command not allowed by security policy: {command}"));
+            let denied = self.find_denied_command(command);
+            let msg = match denied {
+                Some((blocked, DeniedCategory::NotAllowed)) => {
+                    format!("'{}' not allowed", blocked)
+                }
+                Some((blocked, _)) => {
+                    format!("'{}' blocked", blocked)
+                }
+                None => {
+                    format!("Command not allowed: {}", command)
+                }
+            };
+            return Err(msg);
         }
 
         let risk = self.command_risk_level(command);
@@ -2997,6 +3009,65 @@ mod tests {
         assert!(!p.is_command_allowed("node -e'process.exit()'"));
         // Flag with other args before it
         assert!(!p.is_command_allowed("python3 -W ignore -c 'import os'"));
+
+        // Validate error message format for LLM self-correction
+        let result = p.validate_command_execution("python3 -c 'import os'", false);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("'python -c'"),
+            "Error message should contain 'python -c': {}",
+            err
+        );
+
+        let result = p.validate_command_execution("node -e 'process.exit()'", false);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("'node -e'"),
+            "Error message should contain 'node -e': {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_denied_message_format() {
+        let p = SecurityPolicy {
+            allowed_commands: vec!["ls".to_string()],
+            ..Default::default()
+        };
+
+        // Test NotAllowed category
+        let result = p.validate_command_execution("docker run", false);
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("'docker'"),
+            "Error should contain 'docker': {}",
+            err
+        );
+        assert!(
+            err.contains("not allowed"),
+            "Error should contain 'not allowed': {}",
+            err
+        );
+
+        // Test InlineEval category (python allowed but -c blocked)
+        let p2 = SecurityPolicy {
+            allowed_commands: vec!["python".to_string()],
+            ..Default::default()
+        };
+        let result = p2.validate_command_execution("python -c 'print(1)'", false);
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("'python -c'"),
+            "Error should contain 'python -c': {}",
+            err
+        );
+        assert!(
+            err.contains("blocked"),
+            "Error should contain 'blocked': {}",
+            err
+        );
     }
 
     #[test]
