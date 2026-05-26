@@ -14,6 +14,26 @@ pub enum CommandRiskLevel {
     High,
 }
 
+/// 简化的拒绝类别，用于生成最小化错误消息。
+/// LLM Agent 可直接解析：`'python -c' blocked`。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeniedCategory {
+    /// 基础命令不在 allowlist
+    NotAllowed,
+    /// python -c, node -e, perl -e 等内联执行
+    InlineEval,
+    /// pip install, npm install, cargo install 等外部包获取
+    ExternalFetch,
+    /// $(), backticks, <(), >() 等子shell操作
+    Subshell,
+    /// rm -rf /, sudo 等高风险操作
+    HighRisk,
+    /// unsafe file redirect
+    Redirect,
+    /// single & (background execution)
+    Background,
+}
+
 /// Classifies whether a tool operation is read-only or side-effecting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolOperation {
