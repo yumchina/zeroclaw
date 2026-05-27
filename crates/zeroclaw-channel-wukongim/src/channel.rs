@@ -833,7 +833,7 @@ impl WuKongIMChannel {
     ///
     /// WuKongIM's Go server expects `SendParams.payload` as `[]uint8`, which
     /// JSON-encodes as a base64 string — same contract as `send_text_message`.
-    async fn send_status_message(
+    pub async fn send_status_message(
         &self,
         channel_id: &str,
         channel_type: u8,

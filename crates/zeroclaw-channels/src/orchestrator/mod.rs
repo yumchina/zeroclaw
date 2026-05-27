@@ -5097,12 +5097,17 @@ struct ConfiguredChannel {
     channel: Arc<dyn Channel>,
 }
 
+#[cfg(feature = "channel-wukongim")]
+type WuKongIMChannelOpt = Option<Arc<crate::WuKongIMChannel>>;
+#[cfg(not(feature = "channel-wukongim"))]
+type WuKongIMChannelOpt = ();
+
 fn collect_configured_channels(
     config: &Config,
     matrix_skip_context: &str,
     tool_specs: &[(String, String)],
     _memory: Arc<dyn Memory>,
-) -> Vec<ConfiguredChannel> {
+) -> (Vec<ConfiguredChannel>, WuKongIMChannelOpt) {
     let _ = matrix_skip_context;
     let _ = tool_specs;
     let mut channels = Vec::new();
@@ -5806,11 +5811,18 @@ fn collect_configured_channels(
     }
 
     #[cfg(feature = "channel-wukongim")]
+    let mut wukongim_channel: WuKongIMChannelOpt = None;
+    #[cfg(not(feature = "channel-wukongim"))]
+    let wukongim_channel: WuKongIMChannelOpt = ();
+
+    #[cfg(feature = "channel-wukongim")]
     if let Some(ref wk) = config.channels.wukongim {
         if wk.enabled {
+            let arc = Arc::new(WuKongIMChannel::from_config(wk, &config.workspace_dir, _memory.clone()));
+            wukongim_channel = Some(arc.clone());
             channels.push(ConfiguredChannel {
                 display_name: "WuKongIM",
-                channel: Arc::new(WuKongIMChannel::from_config(wk, &config.workspace_dir, _memory.clone())),
+                channel: arc,
             });
         } else {
             tracing::info!("WuKongIM channel configured but disabled (enabled = false)");
@@ -5824,14 +5836,14 @@ fn collect_configured_channels(
         );
     }
 
-    channels
+    (channels, wukongim_channel)
 }
 
 /// Run health checks for configured channels.
 pub async fn doctor_channels(config: Config) -> Result<()> {
     #[allow(unused_mut)]
     let memory = Arc::new(zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "doctor")?);
-    let channels = collect_configured_channels(&config, "health check", &[], memory);
+    let (channels, _wk) = collect_configured_channels(&config, "health check", &[], memory);
 
     #[cfg(feature = "channel-nostr")]
     if let Some(ref ns) = config.channels.nostr {
@@ -5893,6 +5905,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 pub async fn start_channels(
     config: Config,
     canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
+    channel_msg_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(String, u8, serde_json::Value)>>,
 ) -> Result<()> {
     // No model resolves yet — the user has channels configured but hasn't
     // finished onboarding their provider. Returning Ok() here lets the
@@ -6255,12 +6268,13 @@ pub async fn start_channels(
     }
 
     // Collect active channels from a shared builder to keep startup and doctor parity.
+    let (configured_channels, wukongim_channel) =
+        collect_configured_channels(&config, "runtime startup", &tool_specs, mem.clone());
     #[allow(unused_mut)]
-    let mut channels: Vec<Arc<dyn Channel>> =
-        collect_configured_channels(&config, "runtime startup", &tool_specs, mem.clone())
-            .into_iter()
-            .map(|configured| configured.channel)
-            .collect();
+    let mut channels: Vec<Arc<dyn Channel>> = configured_channels
+        .into_iter()
+        .map(|configured| configured.channel)
+        .collect();
 
     #[cfg(feature = "channel-nostr")]
     if let Some(ref ns) = config.channels.nostr {
@@ -6352,6 +6366,24 @@ pub async fn start_channels(
         for (name, ch) in channels_by_name.as_ref() {
             map.insert(name.clone(), Arc::clone(ch));
         }
+    }
+
+    // Gateway → WuKongIM bridge: spawn a listener that consumes messages from
+    // the gateway's HTTP /v1/channels/{name}/send endpoint and forwards them
+    // through the WuKongIM channel's send_status_message.
+    #[cfg(feature = "channel-wukongim")]
+    if let (Some(mut rx), Some(wk)) = (channel_msg_rx, wukongim_channel) {
+        tokio::spawn(async move {
+            while let Some((recipient, channel_type, payload)) = rx.recv().await {
+                if let Err(e) = wk
+                    .send_status_message(&recipient, channel_type, payload)
+                    .await
+                {
+                    tracing::error!(?e, recipient, "Failed to forward gateway message to WuKongIM");
+                }
+            }
+            tracing::info!("Gateway → WuKongIM bridge closed");
+        });
     }
 
     let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
@@ -12694,7 +12726,7 @@ This is an example JSON object for profile settings."#;
         });
 
         let memory = Arc::new(zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "test").unwrap());
-        let channels = collect_configured_channels(&config, "test", &[], memory);
+        let (channels, _wk) = collect_configured_channels(&config, "test", &[], memory);
 
         assert!(
             channels
@@ -12718,7 +12750,7 @@ This is an example JSON object for profile settings."#;
         });
 
         let memory = Arc::new(zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "test").unwrap());
-        let channels = collect_configured_channels(&config, "test", &[], memory);
+        let (channels, _wk) = collect_configured_channels(&config, "test", &[], memory);
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Email"),
             "disabled email should not be collected"
@@ -12735,7 +12767,7 @@ This is an example JSON object for profile settings."#;
         });
 
         let memory = Arc::new(zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "test").unwrap());
-        let channels = collect_configured_channels(&config, "test", &[], memory);
+        let (channels, _wk) = collect_configured_channels(&config, "test", &[], memory);
         assert!(
             !channels
                 .iter()
