@@ -13,7 +13,7 @@ use uuid::Uuid;
 use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
-use zeroclaw_api::memory_traits::Memory;
+use zeroclaw_api::memory_traits::{Memory, MemoryCategory};
 
 use crate::approval::{PendingApprovals, WkApprovalAction, build_approval_card};
 use crate::config::WuKongIMConfig;
@@ -35,7 +35,36 @@ struct SyncState {
     channel_seqs: HashMap<String, u32>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize, Clone)]
+struct PendingMessage {
+    content: String,
+    recipient: String,
+    subject: Option<String>,
+    thread_ts: Option<String>,
+}
+
+impl PartialEq<SendMessage> for PendingMessage {
+    fn eq(&self, other: &SendMessage) -> bool {
+        self.content == other.content
+            && self.recipient == other.recipient
+            && self.subject == other.subject
+            && self.thread_ts == other.thread_ts
+    }
+}
+
+impl From<&SendMessage> for PendingMessage {
+    fn from(msg: &SendMessage) -> Self {
+        PendingMessage {
+            content: msg.content.clone(),
+            recipient: msg.recipient.clone(),
+            subject: msg.subject.clone(),
+            thread_ts: msg.thread_ts.clone(),
+        }
+    }
+}
+
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct WuKongIMChannel {
     pub(crate) ws_url: String,
     pub(crate) uid: String,
@@ -59,6 +88,7 @@ pub struct WuKongIMChannel {
     pub(crate) last_message_time: Arc<RwLock<HashMap<String, Instant>>>,
     pub(crate) workspace_dir: PathBuf,
     pub(crate) progress_streaming: bool,
+    pub(crate) pending_outbound: Arc<tokio::sync::Mutex<Vec<SendMessage>>>,
 }
 
 impl WuKongIMChannel {
@@ -90,6 +120,7 @@ impl WuKongIMChannel {
             last_message_time: Arc::new(RwLock::new(HashMap::new())),
             workspace_dir: workspace_dir.to_path_buf(),
             progress_streaming: config.progress_streaming,
+            pending_outbound: Arc::new(tokio::sync::Mutex::new(Vec::new())),
         }
     }
 
@@ -113,7 +144,10 @@ impl WuKongIMChannel {
             match g.as_mut() {
                 Some(s) => {
                     tracing::info!("WuKongIM: RPC {} id={}", method, id);
-                    s.send(WsMsg::Text(msg.into())).await?;
+                    if let Err(e) = s.send(WsMsg::Text(msg.into())).await {
+                        *g = None;
+                        return Err(anyhow::anyhow!("WuKongIM RPC send failed: {}", e));
+                    }
                     Ok(())
                 }
                 None => anyhow::bail!("WuKongIM: WebSocket not connected"),
@@ -156,8 +190,11 @@ impl WuKongIMChannel {
         };
         let msg = serde_json::to_string(&req)?;
         let mut g = self.ws_sink.write().await;
-        if let Some(s) = g.as_mut() {
-            s.send(WsMsg::Text(msg.into())).await?;
+        if let Some(s) = g.as_mut()
+            && let Err(e) = s.send(WsMsg::Text(msg.into())).await
+        {
+            *g = None;
+            return Err(anyhow::anyhow!("WuKongIM ACK send failed: {}", e));
         }
         Ok(())
     }
@@ -185,16 +222,67 @@ impl WuKongIMChannel {
         Ok(())
     }
 
+    fn get_pending_outbound_path(&self) -> PathBuf {
+        self.workspace_dir.join("wukongim_pending_outbound.json")
+    }
+
+    async fn load_pending_outbound(&self) {
+        let path = self.get_pending_outbound_path();
+        if let Ok(content) = tokio::fs::read_to_string(&path).await
+            && let Ok(pending) = serde_json::from_str::<Vec<PendingMessage>>(&content)
+        {
+            let count = pending.len();
+            let pending_send: Vec<SendMessage> = pending
+                .into_iter()
+                .map(|p| {
+                    SendMessage::with_subject(&p.content, &p.recipient, p.subject.unwrap_or_default())
+                        .in_thread(p.thread_ts)
+                })
+                .collect();
+            *self.pending_outbound.lock().await = pending_send;
+            tracing::info!(
+                "WuKongIM: loaded {} pending outbound messages from disk",
+                count
+            );
+        }
+    }
+
+    async fn save_pending_outbound(&self) -> anyhow::Result<()> {
+        let pending = self.pending_outbound.lock().await;
+        let pending_json: Vec<PendingMessage> = pending.iter().map(PendingMessage::from).collect();
+        let path = self.get_pending_outbound_path();
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let content = serde_json::to_string_pretty(&pending_json)?;
+        tokio::fs::write(&path, content).await?;
+        Ok(())
+    }
+
+    async fn remove_from_pending_outbound(&self, msg: &SendMessage) -> anyhow::Result<()> {
+        let mut pending = self.pending_outbound.lock().await;
+        pending.retain(|m| {
+            let pm = PendingMessage::from(m);
+            !(pm == *msg)
+        });
+        let pending_json: Vec<PendingMessage> = pending.iter().map(PendingMessage::from).collect();
+        drop(pending);
+        let path = self.get_pending_outbound_path();
+        let content = serde_json::to_string_pretty(&pending_json)?;
+        tokio::fs::write(&path, content).await?;
+        Ok(())
+    }
+
     async fn update_sync_state(&self, channel_id: &str, channel_type: u8, seq: u32, timestamp_ns: i64) -> anyhow::Result<()> {
         let mut state = self.load_sync_state().await;
         let mut changed = false;
 
         // 1. Update channel sequence
-        let seq_key = format!("{}:{}", channel_id, channel_type);
-        let current_seq = *state.channel_seqs.get(&seq_key).unwrap_or(&0);
+        let seq_key_file = format!("{}:{}", channel_id, channel_type);
+        let current_seq = *state.channel_seqs.get(&seq_key_file).unwrap_or(&0);
         if seq > current_seq {
-            tracing::info!("WuKongIM: updating sequence for {} from {} to {}", seq_key, current_seq, seq);
-            state.channel_seqs.insert(seq_key, seq);
+            tracing::info!("WuKongIM: updating sequence for {} from {} to {}", seq_key_file, current_seq, seq);
+            state.channel_seqs.insert(seq_key_file, seq);
             changed = true;
         }
 
@@ -207,6 +295,15 @@ impl WuKongIMChannel {
 
         if changed {
             self.save_sync_state(&state).await?;
+        }
+
+        // 3. Update memory sequence
+        let seq_key_mem = format!("wukongim:channel_seq:{}:{}", channel_id, channel_type);
+        let mem_current = self.memory.get(&seq_key_mem).await?.and_then(|e| e.content.parse::<u32>().ok()).unwrap_or(0);
+        if seq > mem_current
+            && let Err(e) = self.memory.store(&seq_key_mem, &seq.to_string(), MemoryCategory::Core, None).await
+        {
+            tracing::error!("WuKongIM: failed to update sequence in memory: {}", e);
         }
 
         Ok(())
@@ -255,11 +352,14 @@ impl WuKongIMChannel {
             msg_count: 50,
         };
 
-        let resp = client.post(&url)
-            .header("X-Assistant-Token", &self.dawn_token)
-            .json(&req)
-            .send()
-            .await?;
+        let resp = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.post(&url)
+                .header("X-Assistant-Token", &self.dawn_token)
+                .json(&req)
+                .send()
+        ).await
+        .map_err(|_| anyhow::anyhow!("WuKongIM history sync HTTP request timed out"))??;
 
         if !resp.status().is_success() {
             anyhow::bail!("WuKongIM sync failed: status={}", resp.status());
@@ -341,7 +441,10 @@ impl WuKongIMChannel {
 
         // Idempotency check: skip if already processed
         let seq_key = format!("wukongim:channel_seq:{}:{}", params.channel_id, params.channel_type);
-        let current_seq = self.memory.get(&seq_key).await?.and_then(|e| e.content.parse::<u32>().ok()).unwrap_or(0);
+        let mem_seq = self.memory.get(&seq_key).await?.and_then(|e| e.content.parse::<u32>().ok()).unwrap_or(0);
+        let sync_state = self.load_sync_state().await;
+        let file_seq = *sync_state.channel_seqs.get(&format!("{}:{}", params.channel_id, params.channel_type)).unwrap_or(&0);
+        let current_seq = mem_seq.max(file_seq);
         if params.message_seq <= current_seq {
             return Ok(());
         }
@@ -764,8 +867,55 @@ impl Channel for WuKongIMChannel {
             stream_no: None,
             topic: None,
         };
-        let _: serde_json::Value = self.send_rpc("send", params).await?;
-        Ok(())
+
+        let mut g = self.ws_sink.write().await;
+        match g.as_mut() {
+            Some(s) => {
+                let req = JsonRpcRequest {
+                    jsonrpc: WUKONGIM_RPC_VERSION.to_string(),
+                    method: "send".to_string(),
+                    id: Uuid::new_v4().to_string(),
+                    params,
+                };
+                let msg = serde_json::to_string(&req)?;
+                match s.send(WsMsg::Text(msg.into())).await {
+                    Ok(_) => {
+                        drop(g);
+                        if let Err(e) = self.remove_from_pending_outbound(message).await {
+                            tracing::debug!("WuKongIM: remove_from_pending_outbound: {}", e);
+                        }
+                        Ok(())
+                    }
+                    Err(err) => {
+                        tracing::warn!("WuKongIM: WebSocket send failed: {}. Clearing sink and buffering message.", err);
+                        *g = None;
+                        drop(g);
+                        
+                        let mut pending = self.pending_outbound.lock().await;
+                        pending.push(message.clone());
+                        drop(pending);
+                        if let Err(e) = self.save_pending_outbound().await {
+                            tracing::warn!("WuKongIM: failed to persist pending outbound: {}", e);
+                        }
+                        Ok(())
+                    }
+                }
+            }
+            None => {
+                drop(g);
+                let mut pending = self.pending_outbound.lock().await;
+                pending.push(message.clone());
+                drop(pending);
+                if let Err(e) = self.save_pending_outbound().await {
+                    tracing::warn!("WuKongIM: failed to persist pending outbound: {}", e);
+                }
+                tracing::warn!(
+                    "WuKongIM: not connected, buffered message ({} pending)",
+                    self.pending_outbound.lock().await.len()
+                );
+                Ok(())
+            }
+        }
     }
 
     async fn send_status_update(
@@ -791,6 +941,7 @@ impl Channel for WuKongIMChannel {
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
+        let res = async {
         // 1. Fetch history from HTTP (before WS connect to avoid version race)
         let history = self.sync_history().await.unwrap_or_else(|e| {
             tracing::error!("WuKongIM: history sync failed: {}", e);
@@ -799,7 +950,11 @@ impl Channel for WuKongIMChannel {
 
         // 2. Connect WebSocket
         tracing::info!("WuKongIM: connecting to {}", self.ws_url);
-        let (ws_stream, _) = tokio_tungstenite::connect_async(&self.ws_url).await?;
+        let (ws_stream, _) = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio_tungstenite::connect_async(&self.ws_url)
+        ).await
+        .map_err(|_| anyhow::anyhow!("WuKongIM WebSocket connection timed out"))??;
         let (write, mut read) = ws_stream.split();
         *self.ws_sink.write().await = Some(write);
 
@@ -834,6 +989,19 @@ impl Channel for WuKongIMChannel {
             }
         }
         tracing::info!("WuKongIM: connected as {}", self.uid);
+
+        // 2.5 Retry buffered outbound messages from previous connection.
+        //    Load from disk first (in case of restart), then retry.
+        self.load_pending_outbound().await;
+        let pending = self.pending_outbound.lock().await.clone();
+        if !pending.is_empty() {
+            tracing::info!("WuKongIM: retrying {} buffered messages", pending.len());
+            for msg in pending {
+                if let Err(e) = self.send(&msg).await {
+                    tracing::warn!("WuKongIM: retry failed for buffered message: {}", e);
+                }
+            }
+        }
 
         // 3. Process History (now that WS is connected, Agent can reply).
         //    Spawn each entry: process_inbound_message awaits send_text_message
@@ -929,6 +1097,9 @@ impl Channel for WuKongIMChannel {
                 }
             }
         }
+        }.await;
+        *self.ws_sink.write().await = None;
+        res
     }
 
     async fn health_check(&self) -> bool {
