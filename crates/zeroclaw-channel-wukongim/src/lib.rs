@@ -1,3 +1,5 @@
+#![allow(clippy::collapsible_if, clippy::bool_assert_comparison, clippy::nonminimal_bool, dead_code)]
+
 //! WuKongIM channel implementation for ZeroClaw.
 //!
 //! 模块结构按职责域划分：

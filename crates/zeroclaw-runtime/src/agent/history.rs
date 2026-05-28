@@ -212,13 +212,13 @@ pub fn fast_trim_tool_results(
     protect_last_n: usize,
 ) -> usize {
     let trim_to = 2000;
-    let mut saved = 0;
+    let mut saved: usize = 0;
     let cutoff = history.len().saturating_sub(protect_last_n);
     for msg in &mut history[..cutoff] {
         if msg.role == "tool" && msg.content.len() > trim_to {
             let original_len = msg.content.len();
             msg.content = truncate_tool_message(&msg.content, trim_to);
-            saved += original_len - msg.content.len();
+            saved = saved.saturating_add(original_len.saturating_sub(msg.content.len()));
         }
     }
     saved
