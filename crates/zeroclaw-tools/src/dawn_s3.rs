@@ -93,10 +93,10 @@ impl DawnS3Tool {
             })?;
 
         let base_url = format!("{}/v1", self.endpoint.trim_end_matches('/'));
+        let full_url = format!("{}/{}", base_url, remote_path.trim_start_matches('/'));
         let result = serde_json::json!({
             "name": file_name,
-            "path": remote_path,
-            "base_url": base_url
+            "path": full_url
         });
         tracing::info!(target: "dawn_s3", "upload success, result: {}", result);
         Ok(result.to_string())
@@ -514,8 +514,10 @@ mod tests {
         assert!(result.success, "error: {:?}", result.error);
         let out: serde_json::Value = serde_json::from_str(&result.output).unwrap();
         assert_eq!(out["name"], "report.pptx");
-        assert_eq!(out["path"], "assistant/abc-123.pptx");
-        assert_eq!(out["base_url"], format!("{}/v1", server.uri()));
+        assert_eq!(
+            out["path"],
+            format!("{}/v1/assistant/abc-123.pptx", server.uri())
+        );
     }
 
     #[tokio::test]
