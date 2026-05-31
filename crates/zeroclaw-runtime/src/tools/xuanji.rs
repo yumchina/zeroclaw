@@ -151,11 +151,12 @@ impl Tool for XuanjiCreateTaskTool {
 
 pub struct XuanjiQueryTaskTool {
     xuanji_wk_uid: String,
+    la_id: String,
 }
 
 impl XuanjiQueryTaskTool {
-    pub fn new(xuanji_wk_uid: String) -> Self {
-        Self { xuanji_wk_uid }
+    pub fn new(xuanji_wk_uid: String, la_id: String) -> Self {
+        Self { xuanji_wk_uid, la_id }
     }
 }
 
@@ -167,19 +168,19 @@ impl Tool for XuanjiQueryTaskTool {
 
     fn description(&self) -> &str {
         "查询璇玑Agent 文档提取任务的进度和结果。\
-         传入 execution_id，返回当前状态（pending/running/completed/failed）和结果内容。"
+         传入 task_id，返回当前状态（pending/running/completed/failed）和结果内容。"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
-                "execution_id": {
+                "task_id": {
                     "type": "string",
-                    "description": "创建任务时返回的 execution_id"
+                    "description": "创建任务时返回的 task_id"
                 }
             },
-            "required": ["execution_id"]
+            "required": ["task_id"]
         })
     }
 
@@ -188,7 +189,7 @@ impl Tool for XuanjiQueryTaskTool {
             .get()
             .ok_or_else(|| anyhow::anyhow!("璇玑Agent 桥接未配置（XUANJI_BRIDGE 未设置）"))?;
 
-        let execution_id = args["execution_id"].as_str().unwrap_or_default();
+        let task_id = args["task_id"].as_str().unwrap_or_default();
         let user_id = CURRENT_FROM_UID.with(|c| c.borrow().clone()).unwrap_or_default();
 
         let payload = json!({
@@ -196,7 +197,8 @@ impl Tool for XuanjiQueryTaskTool {
             "cmd": "xuanji.query_extraction_task",
             "param": {
                 "user_id": user_id,
-                "execution_id": execution_id
+                "task_id": task_id,
+                "reply_to": self.la_id
             }
         });
 
@@ -206,7 +208,7 @@ impl Tool for XuanjiQueryTaskTool {
 
         Ok(ToolResult {
             success: true,
-            output: format!("已发送查询请求，execution_id: {}", execution_id),
+            output: format!("已发送查询请求，task_id: {}", task_id),
             error: None,
         })
     }
