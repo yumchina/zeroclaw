@@ -882,6 +882,9 @@ pub async fn run_tool_call_loop(
     receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
     collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
 ) -> Result<String> {
+    // 设置 Xuanji 工具的 reply_target，用于回复消息
+    crate::tools::xuanji::set_current_reply_target(channel_reply_target);
+
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
