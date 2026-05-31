@@ -684,6 +684,82 @@ impl WuKongIMChannel {
                 }
 
                 return Ok(());
+            } else if payload_json.get("cmd").and_then(|c| c.as_str()) == Some("xuanji.task_ack") {
+                let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
+
+                let param = payload_json.get("param");
+                let task_id = param.and_then(|p| p.get("task_id")).and_then(|t| t.as_str());
+                let status = param.and_then(|p| p.get("status")).and_then(|s| s.as_str());
+
+                tracing::info!("Xuanji: task_ack received, task_id={}, status={}",
+                    task_id.unwrap_or("unknown"), status.unwrap_or("unknown"));
+
+                let target_id = if params.channel_type == WkChannelType::PERSONAL {
+                    &params.from_uid
+                } else {
+                    &params.channel_id
+                };
+
+                let content = format!(
+                    "[璇玑任务确认] task_id={}，状态={}，正在处理中...",
+                    task_id.unwrap_or("unknown"), status.unwrap_or("unknown")
+                );
+
+                let ch_msg = ChannelMessage {
+                    id: params.message_id.clone(),
+                    sender: target_id.clone(),
+                    reply_target: format!("{}:{}", params.channel_type, target_id),
+                    content,
+                    channel: "wukongim".to_string(),
+                    timestamp: params.timestamp.max(0) as u64,
+                    thread_ts: None,
+                    interruption_scope_id: None,
+                    attachments: vec![],
+                };
+
+                if tx.send(ch_msg).await.is_ok() {
+                    self.update_sync_state(&params.channel_id, params.channel_type, params.message_seq, params.timestamp * 1_000_000_000).await?;
+                }
+
+                return Ok(());
+            } else if payload_json.get("cmd").and_then(|c| c.as_str()) == Some("xuanji.task_status") {
+                let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
+
+                let param = payload_json.get("param");
+                let task_id = param.and_then(|p| p.get("task_id")).and_then(|t| t.as_str());
+                let status = param.and_then(|p| p.get("status")).and_then(|s| s.as_str());
+
+                tracing::info!("Xuanji: task_status received, task_id={}, status={}",
+                    task_id.unwrap_or("unknown"), status.unwrap_or("unknown"));
+
+                let target_id = if params.channel_type == WkChannelType::PERSONAL {
+                    &params.from_uid
+                } else {
+                    &params.channel_id
+                };
+
+                let content = format!(
+                    "[璇玑任务状态] task_id={}，状态：{}",
+                    task_id.unwrap_or("unknown"), status.unwrap_or("unknown")
+                );
+
+                let ch_msg = ChannelMessage {
+                    id: params.message_id.clone(),
+                    sender: target_id.clone(),
+                    reply_target: format!("{}:{}", params.channel_type, target_id),
+                    content,
+                    channel: "wukongim".to_string(),
+                    timestamp: params.timestamp.max(0) as u64,
+                    thread_ts: None,
+                    interruption_scope_id: None,
+                    attachments: vec![],
+                };
+
+                if tx.send(ch_msg).await.is_ok() {
+                    self.update_sync_state(&params.channel_id, params.channel_type, params.message_seq, params.timestamp * 1_000_000_000).await?;
+                }
+
+                return Ok(());
             }
             return Ok(());
         }
