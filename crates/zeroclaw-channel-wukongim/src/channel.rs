@@ -602,6 +602,88 @@ impl WuKongIMChannel {
                     )
                     .await?;
                 }
+            } else if payload_json.get("cmd").and_then(|c| c.as_str()) == Some("xuanji.extraction_complete") {
+                // Handle xuanji extraction completion notification
+                let param = payload_json.get("param");
+                let status = param.and_then(|p| p.get("status")).and_then(|s| s.as_str());
+
+                // Only process completed status
+                if status != Some("completed") {
+                    tracing::info!("Xuanji: received extraction_complete with status={}", status.unwrap_or("unknown"));
+                    return Ok(());
+                }
+
+                let task_id = param.and_then(|p| p.get("task_id")).and_then(|t| t.as_str());
+                let user_id = param.and_then(|p| p.get("user_id")).and_then(|u| u.as_str());
+                let reply_target = param.and_then(|p| p.get("reply_target")).and_then(|r| r.as_str());
+                let user_text = param.and_then(|p| p.get("user_text")).and_then(|t| t.as_str());
+                let files = param.and_then(|p| p.get("files")).and_then(|f| f.as_array());
+
+                if let Some(files_arr) = files {
+                    // Download all result files
+                    let mut downloaded_files = Vec::new();
+                    for file in files_arr.as_slice() {
+                        let file_url = file.get("file_url").and_then(|u| u.as_str());
+                        let file_name = file.get("file_name").and_then(|n| n.as_str());
+
+                        if let (Some(url), Some(name)) = (file_url, file_name) {
+                            let result = download_file_to_workspace(url, &self.downloads_dir, Some(name)).await;
+                            match result {
+                                Ok(local_path) => {
+                                    tracing::info!("Xuanji: downloaded {} to {}", name, local_path);
+                                    downloaded_files.push((name.to_string(), local_path));
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Xuanji: failed to download {}: {}", name, e);
+                                }
+                            }
+                        }
+                    }
+
+                    // Build message content
+                    let file_list: String = downloaded_files.iter()
+                        .map(|(name, path)| format!("- {} (已下载到 {})", name, path))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
+                    let content = format!(
+                        "[璇玑文档提取完成] task_id={}\n\n用户原始请求：{}\n\n已下载文件：\n{}\n\n请根据用户请求和文件内容进行回复。",
+                        task_id.unwrap_or("unknown"),
+                        user_text.unwrap_or("无"),
+                        file_list
+                    );
+
+                    // Parse reply_target
+                    let (channel_type, target_id) = if let Some(rt) = reply_target {
+                        if rt.contains(':') {
+                            let parts: Vec<&str> = rt.split(':').collect();
+                            (parts[0].parse::<u8>().unwrap_or(2), parts[1].to_string())
+                        } else {
+                            (1u8, rt.to_string())
+                        }
+                    } else {
+                        (params.channel_type as u8, params.from_uid.clone())
+                    };
+
+                    let ch_msg = ChannelMessage {
+                        id: format!("xuanji_{}", task_id.unwrap_or("unknown")),
+                        sender: target_id.clone(),
+                        reply_target: format!("{}:{}", channel_type, target_id),
+                        content,
+                        channel: "wukongim".to_string(),
+                        timestamp: params.timestamp.max(0) as u64,
+                        thread_ts: None,
+                        interruption_scope_id: None,
+                        attachments: vec![],  // TODO: if attachments needed, fill here
+                    };
+
+                    if tx.send(ch_msg).await.is_ok() {
+                        tracing::info!("Xuanji: sent ChannelMessage to orchestrator");
+                        self.update_sync_state(&params.channel_id, params.channel_type, params.message_seq, params.timestamp * 1_000_000_000).await?;
+                    }
+                }
+
+                return Ok(());
             }
             return Ok(());
         }
