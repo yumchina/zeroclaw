@@ -22,8 +22,11 @@ thread_local! {
 }
 
 /// Set the current user context (called by orchestrator before agent turn).
+/// Parses WK UID format: `102535169_la_1779364164516` → `102535169`.
+/// If the UID does not contain `_la_`, uses the original value as-is.
 pub fn set_current_from_uid(uid: Option<&str>) {
-    CURRENT_FROM_UID.with(|c| *c.borrow_mut() = uid.map(String::from));
+    let parsed = uid.and_then(|u| u.split("_la_").next());
+    CURRENT_FROM_UID.with(|c| *c.borrow_mut() = parsed.map(String::from));
 }
 
 /// Set the current reply target (called by orchestrator before agent turn).
