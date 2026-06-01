@@ -84,7 +84,7 @@ pub(crate) fn event_to_status(
         ObserverEvent::LlmRequest { messages_count, .. } if cfg.llm_thinking => {
             Some(format!("正在调用大模型推理（{messages_count} 条消息）"))
         }
-        ObserverEvent::ToolCallStart { tool, arguments } if cfg.tool_call_start => {
+        ObserverEvent::ToolCallStart { tool, arguments, .. } if cfg.tool_call_start => {
             let snippet = summarize_tool_args(arguments.as_deref());
             Some(format_tool_start_desc(tool, snippet.as_deref()))
         }
@@ -92,6 +92,7 @@ pub(crate) fn event_to_status(
             tool,
             duration,
             success,
+            ..
         } if cfg.tool_call => {
             let elapsed_ms = duration.as_millis().min(u128::from(u64::MAX)) as u64;
             Some(if *success {
@@ -344,6 +345,7 @@ mod tests {
         let cfg = all_on();
         let event = ObserverEvent::ToolCallStart {
             tool: "shell".into(),
+            tool_call_id: None,
             arguments: Some(r#"{"command": "ls -la"}"#.into()),
         };
         assert_eq!(
@@ -357,6 +359,7 @@ mod tests {
         let cfg = all_on();
         let event = ObserverEvent::ToolCallStart {
             tool: "weird_custom_tool".into(),
+            tool_call_id: None,
             arguments: None,
         };
         assert_eq!(
@@ -370,8 +373,11 @@ mod tests {
         let cfg = all_on();
         let event = ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(456),
             success: true,
+            arguments: None,
+            result: None,
         };
         assert_eq!(
             event_to_status(&event, &cfg).as_deref(),
@@ -384,8 +390,11 @@ mod tests {
         let cfg = all_on();
         let event = ObserverEvent::ToolCall {
             tool: "shell".into(),
+            tool_call_id: None,
             duration: Duration::from_millis(456),
             success: false,
+            arguments: None,
+            result: None,
         };
         assert_eq!(
             event_to_status(&event, &cfg).as_deref(),
@@ -567,6 +576,7 @@ mod tests {
 
         obs.record_event(&ObserverEvent::ToolCallStart {
             tool: "shell".into(),
+            tool_call_id: None,
             arguments: Some(r#"{"command": "ls"}"#.into()),
         });
 
@@ -650,6 +660,7 @@ mod tests {
 
         obs.record_event(&ObserverEvent::ToolCallStart {
             tool: "shell".into(),
+            tool_call_id: None,
             arguments: None,
         });
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;

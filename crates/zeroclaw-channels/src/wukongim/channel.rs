@@ -522,6 +522,7 @@ impl WuKongIMChannel {
                     thread_ts: None,
                     interruption_scope_id: None,
                     attachments: vec![],
+                    subject: None,
                 };
                 if tx.send(ch_msg).await.is_ok() {
                     self.update_sync_state(
@@ -657,6 +658,7 @@ impl WuKongIMChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         };
 
         if tx.send(ch_msg).await.is_ok() {
@@ -866,6 +868,7 @@ impl WuKongIMChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            subject: None,
         };
 
         if tx.send(ch_msg).await.is_ok() {
