@@ -668,9 +668,10 @@ impl WuKongIMChannel {
                     let content = format!(
                         "[璇玑文档提取完成] task_id={}\n\n\
                          用户原始请求：{}\n\n\
-                         ⚠️ 已下载文件为璇玑 OCR 提取的 Markdown 文本，直接用 read 读取，禁止 shell/pdf-parse。\n\n\
+                         ⚠️ 已下载文件为璇玑 OCR 提取的 Markdown 文本，直接用 read 读取，禁止 shell/pdf-parse。\n\
+                         ⚠️ 不要再调用 xuanji_doc_create_task，任务已经完成。\n\n\
                          已下载文件：\n{}{}\n\n\
-                         请根据用户请求和文件内容直接回复用户。",
+                         请读取文件内容后直接回复用户。",
                         task_id.unwrap_or("unknown"),
                         user_text.unwrap_or("无"),
                         file_list,
