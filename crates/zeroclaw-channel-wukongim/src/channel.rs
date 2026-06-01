@@ -622,6 +622,7 @@ impl WuKongIMChannel {
                 if let Some(files_arr) = files {
                     // Download all result files
                     let mut downloaded_files = Vec::new();
+                    let mut failed_files = Vec::new();
                     for file in files_arr.as_slice() {
                         let file_url = file.get("file_url").and_then(|u| u.as_str());
                         let file_name = file.get("file_name").and_then(|n| n.as_str());
@@ -635,16 +636,26 @@ impl WuKongIMChannel {
                                 }
                                 Err(e) => {
                                     tracing::warn!("Xuanji: failed to download {}: {}", name, e);
+                                    failed_files.push((name.to_string(), url.to_string()));
                                 }
                             }
                         }
                     }
 
                     // Build message content
-                    let file_list: String = downloaded_files.iter()
-                        .map(|(name, path)| format!("- {} (已下载到 {})", name, path))
-                        .collect::<Vec<_>>()
-                        .join("\n");
+                    let mut file_list = String::new();
+                    if !downloaded_files.is_empty() {
+                        file_list.push_str("已下载：\n");
+                        for (name, path) in &downloaded_files {
+                            file_list.push_str(&format!("- {} (本地: {})\n", name, path));
+                        }
+                    }
+                    if !failed_files.is_empty() {
+                        file_list.push_str("\n下载失败（可直接访问 URL）：\n");
+                        for (name, url) in &failed_files {
+                            file_list.push_str(&format!("- {} \n  URL: {}\n", name, url));
+                        }
+                    }
 
                     // Extract summary from first result file (if any)
                     let summary_text = files_arr.first()
