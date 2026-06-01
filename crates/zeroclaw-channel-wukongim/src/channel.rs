@@ -646,11 +646,24 @@ impl WuKongIMChannel {
                         .collect::<Vec<_>>()
                         .join("\n");
 
+                    // Extract summary from first result file (if any)
+                    let summary_text = files_arr.first()
+                        .and_then(|f| f.get("summary"))
+                        .and_then(|s| s.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| format!("\n文件内容摘要：\n{}", s))
+                        .unwrap_or_default();
+
                     let content = format!(
-                        "[璇玑文档提取完成] task_id={}\n\n用户原始请求：{}\n\n已下载文件：\n{}\n\n请根据用户请求和文件内容进行回复。",
+                        "[璇玑文档提取完成] task_id={}\n\n\
+                         用户原始请求：{}\n\n\
+                         ⚠️ 已下载文件为璇玑 OCR 提取的 Markdown 文本，直接用 read 读取，禁止 shell/pdf-parse。\n\n\
+                         已下载文件：\n{}{}\n\n\
+                         请根据用户请求和文件内容直接回复用户。",
                         task_id.unwrap_or("unknown"),
                         user_text.unwrap_or("无"),
-                        file_list
+                        file_list,
+                        summary_text,
                     );
 
                     // Parse reply_target
