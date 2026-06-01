@@ -257,6 +257,9 @@ pub fn build_system_prompt_with_mode_and_autonomy(
              \n\
              共 12 页幻灯片...\n\
              \"\"\"\n\n\
+             IMPORTANT: If you later edit a file that was previously uploaded via dawn_s3,\n\
+             you MUST re-upload it and provide the updated link to the user.\n\
+             The old link becomes stale after any edit.\n\n\
              Do NOT upload temporary files, intermediate scripts, or debug output.\n\n",
         );
     }

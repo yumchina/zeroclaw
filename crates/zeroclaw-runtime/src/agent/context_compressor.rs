@@ -150,7 +150,7 @@ impl ContextCompressor {
         if max == 0 {
             return 0;
         }
-        let mut saved = 0;
+        let mut saved: usize = 0;
         let protect_start = self.config.protect_first_n.min(history.len());
         let protect_end = history.len().saturating_sub(self.config.protect_last_n);
 
@@ -180,7 +180,7 @@ impl ContextCompressor {
             }
             let original_len = msg.content.len();
             msg.content = crate::agent::history::truncate_tool_message(&msg.content, max);
-            saved += original_len - msg.content.len();
+            saved = saved.saturating_add(original_len.saturating_sub(msg.content.len()));
         }
         saved
     }
