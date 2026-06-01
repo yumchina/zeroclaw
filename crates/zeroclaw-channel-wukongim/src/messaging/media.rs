@@ -43,6 +43,7 @@ pub fn detect_image_mime(content_type: Option<&str>, bytes: &[u8]) -> Option<Str
 pub async fn download_image_as_base64(url: &str) -> Option<String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        .danger_accept_invalid_certs(true)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -106,6 +107,7 @@ pub async fn download_file_to_workspace(
     );
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
+        .danger_accept_invalid_certs(true)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new());
 
@@ -317,9 +319,10 @@ pub async fn process_markdown_resources(text: &str, downloads_dir: &std::path::P
         } else {
             match download_file_to_workspace(&url, downloads_dir, Some(&alt)).await {
                 Ok(local_path) => {
+                    // 保留原始 S3 URL 在 alt 文本中，LLM 可直接用于 xuanji_doc_create_task
                     result = result.replace(
                         &format!("[{}]({})", alt, url),
-                        &format!("[{}]({})", alt, local_path),
+                        &format!("[{}]({})  \n(S3 URL: {})", alt, local_path, url),
                     );
                 }
                 Err(err_msg) => {
