@@ -149,7 +149,7 @@ impl Tool for XuanjiCreateTaskTool {
         Ok(ToolResult {
             success: true,
             output: format!(
-                "已提交 {} 个文件的提取任务。请等待 extraction_complete 通知，不要再重复提交。",
+                "已提交 {} 个文件的提取任务，需要等待一段时间，完成后会主动通知您",
                 file_count
             ),
             error: None,
