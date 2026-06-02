@@ -121,6 +121,8 @@ pub use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
 // Optional Dawn SaaS integration tools (separate crate, feature-gated).
 #[cfg(feature = "dawn-tools")]
 pub use dawn_tools::DawnS3Tool;
+#[cfg(feature = "dawn-tools")]
+pub use dawn_tools::DawnWebSearchTool;
 
 // Traits from zeroclaw-api
 pub use zeroclaw_api::schema::{CleaningStrategy, SchemaCleanr};
@@ -760,6 +762,34 @@ pub fn all_tools_with_runtime(
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
                     .with_attrs(::serde_json::json!({"endpoint": root_config.dawn_s3.url})),
                 "dawn_s3: tool registered"
+            );
+        }
+    }
+
+    #[cfg(feature = "dawn-tools")]
+    if root_config.dawn.web_search.enabled {
+        let base_url = root_config.dawn.web_search.yumc_search_base_url.clone();
+        if base_url.as_deref().unwrap_or("").is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "dawn.web_search: enabled but [dawn.web_search].yumc_search_base_url is empty, skipping registration"
+            );
+        } else {
+            tool_arcs.push(Arc::new(DawnWebSearchTool::new(
+                root_config.dawn.web_search.yumc_search_api_key.clone(),
+                base_url,
+                root_config.dawn.web_search.max_results,
+                root_config.dawn.web_search.timeout_secs,
+                root_config.config_path.clone(),
+                root_config.secrets.encrypt,
+            )));
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Register)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success),
+                "dawn.web_search: tool registered"
             );
         }
     }
