@@ -114,6 +114,13 @@ impl Tool for XuanjiCreateTaskTool {
         let user_id = CURRENT_FROM_UID.with(|c| c.borrow().clone()).unwrap_or_default();
         let reply_target = CURRENT_REPLY_TARGET.with(|c| c.borrow().clone()).unwrap_or_default();
 
+        // reply_target 为空时用 user_id 构造备选
+        let reply_target = if reply_target.is_empty() || reply_target.ends_with(':') {
+            format!("1:{}", user_id)
+        } else {
+            reply_target
+        };
+
         if files.as_array().map_or(true, |a| a.is_empty()) {
             return Ok(ToolResult {
                 success: false,
