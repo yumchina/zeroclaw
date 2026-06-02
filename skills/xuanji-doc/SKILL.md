@@ -13,9 +13,13 @@ enabled: true
 
 ## 🚨 核心规则
 
-当用户消息中包含 PPT、Word、Excel、PDF 文件时，你**只有一个选择**：
+当用户消息中包含 PPT、Word、Excel、PDF 文件时：
 
-→ 调用 `xuanji_doc_create_task` 提交给璇玑Agent 处理。
+→ 调用 `xuanji_doc_create_task` 提交给璇玑Agent 处理
+→ **调用一次后立即停止，不要再调用第二次，无论是否收到结果通知**
+
+收到 `[璇玑文档提取完成]` 或 `[璇玑文档提取失败]` 时：
+→ 直接处理结果（读文件/告知失败），**不要再调用 xuanji_doc_create_task**
 
 ## ❌ 绝对禁止
 
