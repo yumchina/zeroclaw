@@ -607,16 +607,53 @@ impl WuKongIMChannel {
                 let param = payload_json.get("param");
                 let status = param.and_then(|p| p.get("status")).and_then(|s| s.as_str());
 
-                // Only process completed status
-                if status != Some("completed") {
-                    tracing::info!("Xuanji: received extraction_complete with status={}", status.unwrap_or("unknown"));
-                    return Ok(());
-                }
-
+                // Handle both completed and failed status
                 let task_id = param.and_then(|p| p.get("task_id")).and_then(|t| t.as_str());
                 let user_id = param.and_then(|p| p.get("user_id")).and_then(|u| u.as_str());
                 let reply_target = param.and_then(|p| p.get("reply_target")).and_then(|r| r.as_str());
                 let user_text = param.and_then(|p| p.get("user_text")).and_then(|t| t.as_str());
+
+                if status != Some("completed") {
+                    // Failed: notify Agent without downloading
+                    let error = param.and_then(|p| p.get("error")).and_then(|e| e.as_str());
+                    let content = format!(
+                        "[璇玑文档提取失败] task_id={}\n\n用户原始请求：{}\n\n失败原因：{}\n\n请告知用户处理失败，建议重试。",
+                        task_id.unwrap_or("unknown"),
+                        user_text.unwrap_or("无"),
+                        error.unwrap_or("未知错误"),
+                    );
+                    tracing::info!("Xuanji: extraction_complete failed, notifying agent");
+
+                    // Parse reply_target
+                    let (ct, tid) = if let Some(rt) = reply_target {
+                        if rt.contains(':') {
+                            let parts: Vec<&str> = rt.split(':').collect();
+                            (parts[0].parse::<u8>().unwrap_or(2), parts[1].to_string())
+                        } else {
+                            (1u8, rt.to_string())
+                        }
+                    } else {
+                        (params.channel_type as u8, params.from_uid.clone())
+                    };
+                    let ch_msg = ChannelMessage {
+                        id: format!("xuanji_{}", task_id.unwrap_or("unknown")),
+                        sender: tid.clone(),
+                        reply_target: format!("{}:{}", ct, tid),
+                        content,
+                        channel: "wukongim".to_string(),
+                        timestamp: params.timestamp.max(0) as u64,
+                        thread_ts: None,
+                        interruption_scope_id: None,
+                        attachments: vec![],
+                    };
+                    if tx.send(ch_msg).await.is_ok() {
+                        tracing::info!("Xuanji: sent failed ChannelMessage to orchestrator");
+                        self.update_sync_state(&params.channel_id, params.channel_type, params.message_seq, params.timestamp * 1_000_000_000).await?;
+                    }
+                    return Ok(());
+                }
+
+                // Completed: download files and notify Agent
                 let files = param.and_then(|p| p.get("files")).and_then(|f| f.as_array());
 
                 if let Some(files_arr) = files {
