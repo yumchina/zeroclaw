@@ -64,7 +64,10 @@ pub use crate::webhook::WebhookChannel;
 pub use crate::wechat::WeChatChannel;
 pub use crate::wecom::WeComChannel;
 pub use crate::whatsapp::WhatsAppChannel;
-pub use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+pub use zeroclaw_api::channel::{
+    Channel, ChannelMessage, SendMessage,
+    ChannelInterventionRequest, ChannelInterventionResponse,
+};
 // Local channel types (in misc, not zeroclaw-channels)
 pub use crate::cli::CliChannel;
 pub use crate::link_enricher;
@@ -96,8 +99,8 @@ use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, Provider};
 use zeroclaw_runtime::agent::loop_::{
-    build_tool_instructions_for_names, clear_model_switch_request, get_model_switch_state,
-    is_model_switch_requested, run_tool_call_loop, scope_session_key, scope_thread_id,
+    build_tool_instructions_for_names, get_model_switch_state,
+    run_tool_call_loop, scope_session_key, scope_thread_id,
     scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
@@ -2997,7 +3000,7 @@ async fn process_channel_message(
     }
 
     let runtime_defaults = runtime_defaults_snapshot(ctx.as_ref());
-    let mut active_provider =
+    let active_provider =
         match get_or_create_provider(ctx.as_ref(), &route.provider, route.api_key.as_deref()).await
         {
             Ok(provider) => provider,
@@ -3494,6 +3497,7 @@ async fn process_channel_message(
 
     // Wrap observer to forward tool events as live thread messages
     let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let error_observer = Arc::clone(&progress_inner);
     let notify_observer: Arc<ChannelNotifyObserver> = Arc::new(ChannelNotifyObserver {
         inner: progress_inner,
         tx: notify_tx,
@@ -3629,47 +3633,107 @@ async fn process_channel_message(
                 ) => LlmExecutionResult::Completed(result),
             };
 
-            // Handle model switch: re-create the provider and retry
-            if let LlmExecutionResult::Completed(Ok(Err(ref e))) = loop_result
-                && let Some((new_provider, new_model)) = is_model_switch_requested(e)
-            {
-                tracing::info!(
-                    "Model switch requested, switching from {} {} to {} {}",
-                    route.provider,
-                    route.model,
-                    new_provider,
-                    new_model
-                );
 
-                match create_resilient_provider_nonblocking(
-                    &new_provider,
-                    ctx.api_key.clone(),
-                    ctx.api_url.clone(),
-                    ctx.reliability.as_ref().clone(),
-                    ctx.provider_runtime_options.clone(),
-                )
-                .await
-                {
-                    Ok(new_prov) => {
-                        active_provider = Arc::from(new_prov);
-                        route.provider = new_provider;
-                        route.model = new_model;
-                        clear_model_switch_request();
-
-                        ctx.observer.record_event(&ObserverEvent::AgentStart {
-                            provider: route.provider.clone(),
-                            model: route.model.clone(),
-                        });
-
-                        continue;
+            let mut is_error = false;
+            match &loop_result {
+                LlmExecutionResult::Completed(res) => {
+                    match res {
+                        Ok(Err(_)) => is_error = true,
+                        Err(_) => is_error = true, // timeout
+                        _ => {}
                     }
-                    Err(err) => {
-                        tracing::error!("Failed to create provider after model switch: {err}");
-                        clear_model_switch_request();
-                        // Fall through with the original error
+                }
+                _ => {}
+            }
+
+            if is_error {
+                if let Some(channel) = target_channel.as_ref() {
+                    let reason = match &loop_result {
+                        LlmExecutionResult::Completed(res) => match res {
+                            Ok(Err(e)) => {
+                                let err_str = e.to_string();
+                                if err_str.contains("Loop break") || err_str.contains("circuit breaker") {
+                                    "死循环检测 (Loop Detected)".to_string()
+                                } else {
+                                    "步骤执行错误 (Step Error)".to_string()
+                                }
+                            }
+                            Err(_) => "步骤超时 (Step Timeout)".to_string(),
+                            _ => unreachable!(),
+                        }
+                        _ => unreachable!(),
+                    };
+                    let error_detail = match &loop_result {
+                        LlmExecutionResult::Completed(res) => match res {
+                            Ok(Err(e)) => e.to_string(),
+                            Err(_) => format!(
+                                "The LLM step execution exceeded the allocated budget or response timeout ({}s).",
+                                timeout_budget_secs
+                            ),
+                            _ => unreachable!(),
+                        }
+                        _ => unreachable!(),
+                    };
+                    let last_tool = get_last_tool_from_history(&history);
+                    let req = ChannelInterventionRequest {
+                        reason: reason.clone(),
+                        last_tool,
+                        error_detail,
+                    };
+
+                    // Send error status update to channel so user knows why we are requesting intervention
+                    notify_observer.record_event(&ObserverEvent::Error {
+                        component: "agent".into(),
+                        message: format!("异常待接管：{}", reason),
+                    });
+
+                    tracing::info!("Smart assistant encountered execution error or timeout. Requesting human intervention...");
+                    match channel.request_intervention(&msg.reply_target, &req).await {
+                        Ok(Some(ChannelInterventionResponse::Retry)) => {
+                            tracing::info!("User requested Retry via intervention card. Retrying step...");
+                            continue;
+                        }
+                        Ok(Some(ChannelInterventionResponse::Intervene)) => {
+                            tracing::info!("User requested manual instruction via intervention card. Waiting for input...");
+                            let prompt_text = "⚠️ 任务已挂起。请在当前会话中直接输入您的指令/提示词，智能体将在收到后继续迭代：";
+                            let _ = channel.send(
+                                &SendMessage::new(prompt_text, &msg.reply_target)
+                                    .in_thread(msg.thread_ts.clone())
+                            ).await;
+
+                            // Register suspended task and wait for oneshot
+                            let (itx, irx) = tokio::sync::oneshot::channel();
+                            let scope_key = interruption_scope_key(&msg);
+                            suspended_tasks().lock().unwrap().insert(scope_key.clone(), itx);
+
+                            // Wait for user instruction message with timeout
+                            let timeout_dur = Duration::from_secs(ctx.message_timeout_secs.max(600));
+                            match tokio::time::timeout(timeout_dur, irx).await {
+                                Ok(Ok(user_msg)) => {
+                                    tracing::info!("Received user manual instruction: {}", user_msg.content);
+                                    history.push(ChatMessage::user(user_msg.content));
+                                    // Send receipt ack to user
+                                    let _ = channel.send(
+                                        &SendMessage::new("👍 已收到您的指令，继续执行任务...", &msg.reply_target)
+                                            .in_thread(msg.thread_ts.clone())
+                                    ).await;
+                                    continue;
+                                }
+                                _ => {
+                                    tracing::warn!("Timeout waiting for user manual instruction. Cancelling task.");
+                                    suspended_tasks().lock().unwrap().remove(&scope_key);
+                                    // Timeout, let's treat it as Cancel
+                                }
+                            }
+                        }
+                        _ => {
+                            tracing::info!("User requested Cancel or intervention not handled. Bailing.");
+                        }
                     }
                 }
             }
+
+
 
             break loop_result;
         };
@@ -4099,6 +4163,10 @@ async fn process_channel_message(
                         ChatMessage::assistant("[Task failed — not continuing this request]"),
                     );
                 }
+                error_observer.record_event(&ObserverEvent::Error {
+                    component: "agent".into(),
+                    message: e.to_string(),
+                });
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(ref draft_id) = draft_message_id {
                         let _ = channel
@@ -4145,6 +4213,13 @@ async fn process_channel_message(
                 &history_key,
                 ChatMessage::assistant("[Task timed out — not continuing this request]"),
             );
+            error_observer.record_event(&ObserverEvent::Error {
+                component: "orchestrator".into(),
+                message: format!(
+                    "LLM response timed out after {}s (base={}s, max_tool_iterations={})",
+                    timeout_budget_secs, ctx.message_timeout_secs, ctx.max_tool_iterations
+                ),
+            });
             if let Some(channel) = target_channel.as_ref() {
                 let error_text = channel_runtime_string("channel-runtime-request-timed-out");
                 if let Some(ref draft_id) = draft_message_id {
@@ -4249,6 +4324,21 @@ async fn run_message_dispatch_loop(
     let task_sequence = Arc::new(AtomicU64::new(1));
 
     while let Some(msg) = rx.recv().await {
+        let scope_key = interruption_scope_key(&msg);
+        let suspended_sender = {
+            let mut active = suspended_tasks().lock().unwrap();
+            active.remove(&scope_key)
+        };
+        if let Some(tx) = suspended_sender {
+            tracing::info!(
+                channel = %msg.channel,
+                sender = %msg.sender,
+                "Intercepting user instruction for suspended task"
+            );
+            let _ = tx.send(msg);
+            continue;
+        }
+
         // Fast path: /stop cancels the in-flight task for this sender scope without
         // spawning a worker or registering a new task. Handled here — before semaphore
         // acquisition — so the target task is still in the store and is never replaced.
@@ -6645,6 +6735,39 @@ pub async fn deliver_announcement(
     }
     Ok(())
 }
+
+fn suspended_tasks() -> &'static StdMutex<HashMap<String, tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelMessage>>> {
+    static MAP: OnceLock<StdMutex<HashMap<String, tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelMessage>>>> = OnceLock::new();
+    MAP.get_or_init(|| StdMutex::new(HashMap::new()))
+}
+
+fn get_last_tool_from_history(history: &[ChatMessage]) -> Option<String> {
+    for msg in history.iter().rev() {
+        if msg.role == "tool" {
+            // Note: in provider.rs, ChatMessage contains role and content.
+            // If the role is tool, we might not have a direct tool name field in ChatMessage,
+            // but we can parse it from content if needed or search for the assistant message preceding it.
+            // Let's also look for assistant message tool_calls or function calls!
+        }
+        // Let's check assistant message function calls or tool calls. Since ChatMessage contains role and content,
+        // we can check if content contains XML tags like <tool_call> or <function_call>!
+        if msg.role == "assistant" {
+            if let Some(start) = msg.content.find("<tool_call>") {
+                if let Some(end) = msg.content.find("</tool_call>") {
+                    let xml = &msg.content[start + 11..end];
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(xml.trim()) {
+                        if let Some(name) = val.get("name").and_then(|n| n.as_str()) {
+                            return Some(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+use std::sync::Mutex as StdMutex;
 
 #[cfg(test)]
 mod tests {

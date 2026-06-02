@@ -1,7 +1,7 @@
 // src/approval/card.rs
 use crate::connection::WkMessageType;
 use serde::{Deserialize, Serialize};
-use zeroclaw_api::channel::ChannelApprovalRequest;
+use zeroclaw_api::channel::{ChannelApprovalRequest, ChannelInterventionRequest};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WkApprovalCard {
@@ -97,6 +97,50 @@ pub fn build_approval_card(
             WkAction {
                 text: "拒绝".to_string(),
                 value: "deny".to_string(),
+                style: "danger".to_string(),
+            },
+        ]),
+    }
+}
+
+pub fn build_intervention_card(
+    approval_id: &str,
+    request: &ChannelInterventionRequest,
+    timeout_secs: u64,
+) -> WkApprovalCard {
+    let content = format!(
+        "⚠️ **任务执行异常，需人工接管**\n\n\
+         **异常原因**: {}\n\
+         **最近执行的工具**: {}\n\
+         **错误详情**: {}\n\n\
+         请选择您的下一步操作:",
+        request.reason,
+        request.last_tool.as_deref().unwrap_or("无"),
+        request.error_detail
+    );
+
+    WkApprovalCard {
+        msg_type: WkMessageType::INTERACTIVE_CARD,
+        approval_id: approval_id.to_string(),
+        timeout_secs,
+        title: "⚠️ 智能体任务异常挂起".to_string(),
+        body: WkApprovalBody {
+            content,
+        },
+        actions: Some(vec![
+            WkAction {
+                text: "重试当前步骤".to_string(),
+                value: "retry".to_string(),
+                style: "primary".to_string(),
+            },
+            WkAction {
+                text: "人工输入指令".to_string(),
+                value: "intervene".to_string(),
+                style: "success".to_string(),
+            },
+            WkAction {
+                text: "终止任务".to_string(),
+                value: "cancel".to_string(),
                 style: "danger".to_string(),
             },
         ]),
