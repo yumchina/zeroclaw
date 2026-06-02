@@ -2877,6 +2877,10 @@ async fn process_channel_message(
         return;
     }
 
+    // Set user context for xuanji tools before the agent turn.
+    zeroclaw_runtime::tools::xuanji::set_current_from_uid(Some(&msg.sender));
+    zeroclaw_runtime::tools::xuanji::set_current_reply_target(Some(&msg.reply_target));
+
     println!(
         "  💬 [{}] from {}: {}",
         msg.channel,
@@ -6372,9 +6376,18 @@ pub async fn start_channels(
     // the gateway's HTTP /v1/channels/{name}/send endpoint and forwards them
     // through the WuKongIM channel's send_status_message.
     #[cfg(feature = "channel-wukongim")]
+    let has_rx = channel_msg_rx.is_some();
+    let has_wk = wukongim_channel.is_some();
     if let (Some(mut rx), Some(wk)) = (channel_msg_rx, wukongim_channel) {
+        tracing::info!("Bridge listener started (Gateway → WuKongIM)");
         tokio::spawn(async move {
             while let Some((recipient, channel_type, payload)) = rx.recv().await {
+                tracing::info!(
+                    recipient,
+                    channel_type,
+                    cmd = %payload.get("cmd").and_then(|v| v.as_str()).unwrap_or("?"),
+                    "Bridge: forwarding message to WuKongIM"
+                );
                 if let Err(e) = wk
                     .send_status_message(&recipient, channel_type, payload)
                     .await
@@ -6384,6 +6397,12 @@ pub async fn start_channels(
             }
             tracing::info!("Gateway → WuKongIM bridge closed");
         });
+    } else {
+        tracing::warn!(
+            has_rx,
+            has_wk,
+            "Bridge listener NOT started"
+        );
     }
 
     let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
