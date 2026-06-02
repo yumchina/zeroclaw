@@ -790,25 +790,53 @@ impl WuKongIMChannel {
                 let param = payload_json.get("param");
                 let task_id = param.and_then(|p| p.get("task_id")).and_then(|t| t.as_str());
                 let status = param.and_then(|p| p.get("status")).and_then(|s| s.as_str());
+                let reply_target = param.and_then(|p| p.get("reply_target")).and_then(|r| r.as_str());
+                let user_text = param.and_then(|p| p.get("user_text")).and_then(|t| t.as_str());
+                let files = param.and_then(|p| p.get("files")).and_then(|f| f.as_array());
 
                 tracing::info!("Xuanji: task_status received, task_id={}, status={}",
                     task_id.unwrap_or("unknown"), status.unwrap_or("unknown"));
 
-                let target_id = if params.channel_type == WkChannelType::PERSONAL {
-                    &params.from_uid
+                // Parse reply_target from param (not from from_uid)
+                let (ct, tid) = if let Some(rt) = reply_target {
+                    if rt.contains(':') {
+                        let parts: Vec<&str> = rt.split(':').collect();
+                        (parts[0].parse::<u8>().unwrap_or(2), parts[1].to_string())
+                    } else {
+                        (1u8, rt.to_string())
+                    }
                 } else {
-                    &params.channel_id
+                    (params.channel_type as u8, params.from_uid.clone())
                 };
 
-                let content = format!(
-                    "[璇玑任务状态] task_id={}，状态：{}",
-                    task_id.unwrap_or("unknown"), status.unwrap_or("unknown")
-                );
+                let file_list = files.map(|arr| {
+                    arr.iter()
+                        .filter_map(|f| {
+                            let name = f.get("file_name").and_then(|n| n.as_str()).unwrap_or("?");
+                            f.get("file_url").and_then(|u| u.as_str())
+                                .map(|url| format!("- {} ({})", name, url))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }).unwrap_or_default();
+
+                let content = match status {
+                    Some("completed") => format!(
+                        "[璇玑任务状态] task_id={}\n状态：已完成\n用户请求：{}\n结果文件：\n{}",
+                        task_id.unwrap_or("unknown"),
+                        user_text.unwrap_or("无"),
+                        file_list,
+                    ),
+                    _ => format!(
+                        "[璇玑任务状态] task_id={}，状态：{}",
+                        task_id.unwrap_or("unknown"), status.unwrap_or("unknown")
+                    ),
+                };
 
                 let ch_msg = ChannelMessage {
                     id: params.message_id.clone(),
-                    sender: target_id.clone(),
-                    reply_target: format!("{}:{}", params.channel_type, target_id),
+                    sender: tid.clone(),
+                    reply_target: format!("{}:{}", ct, tid),
                     content,
                     channel: "wukongim".to_string(),
                     timestamp: params.timestamp.max(0) as u64,
