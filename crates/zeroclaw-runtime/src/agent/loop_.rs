@@ -882,15 +882,8 @@ pub async fn run_tool_call_loop(
     receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
     collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
 ) -> Result<String> {
-    // Set Xuanji tools user_id from reply_target
-    crate::tools::xuanji::set_current_from_uid(channel_reply_target.and_then(|t| {
-        if t.contains(':') {
-            let uid = t.split(':').nth(1).unwrap_or(t);
-            Some(uid)
-        } else {
-            Some(t)
-        }
-    }));
+    // Xuanji user context is set by orchestrator before agent turn.
+    // (set_current_from_uid / set_current_reply_target handle _la_ suffix parsing)
 
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
