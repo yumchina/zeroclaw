@@ -762,8 +762,9 @@ impl WuKongIMChannel {
                     &params.channel_id
                 };
 
+                // 静默消息：agent 获取 task_id 但不回复用户
                 let content = format!(
-                    "[璇玑任务确认] task_id={}，状态={}，正在处理中...",
+                    "<!-- zeroclaw:silent -->[璇玑任务确认] task_id={}，状态={}",
                     task_id.unwrap_or("unknown"), status.unwrap_or("unknown")
                 );
 
