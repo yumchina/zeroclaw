@@ -5,7 +5,6 @@ pub enum WebSearchProviderRoute {
     SearXNG,
     Tavily,
     Jina,
-    YumcSearch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,7 +19,6 @@ const BRAVE_PROVIDER: &str = "brave";
 const SEARXNG_PROVIDER: &str = "searxng";
 const TAVILY_PROVIDER: &str = "tavily";
 const JINA_PROVIDER: &str = "jina";
-const YUMC_SEARCH_PROVIDER: &str = "yumc-search";
 
 pub fn resolve_web_search_provider(raw_model_provider: &str) -> WebSearchProviderResolution {
     let normalized = raw_model_provider.trim().to_ascii_lowercase();
@@ -52,13 +50,8 @@ pub fn resolve_web_search_provider(raw_model_provider: &str) -> WebSearchProvide
             canonical_provider: JINA_PROVIDER,
             used_fallback: false,
         },
-        "yumc-search" | "yumc_search" | "yumcsearch" => WebSearchProviderResolution {
-            route: WebSearchProviderRoute::YumcSearch,
-            canonical_provider: YUMC_SEARCH_PROVIDER,
-            used_fallback: false,
-        },
         // Warns for unknown model_providers, falls back to default.
-        // Known non-default model_providers: Brave, SearXNG, Tavily, Jina, YumcSearch.
+        // Known non-default model_providers: Brave, SearXNG, Tavily, Jina.
         _ => WebSearchProviderResolution {
             route: WebSearchProviderRoute::DuckDuckGo,
             canonical_provider: DEFAULT_WEB_SEARCH_PROVIDER,
@@ -122,17 +115,6 @@ mod tests {
             let resolved = resolve_web_search_provider(alias);
             assert_eq!(resolved.route, WebSearchProviderRoute::Jina);
             assert_eq!(resolved.canonical_provider, JINA_PROVIDER);
-            assert!(!resolved.used_fallback);
-        }
-    }
-
-    #[test]
-    fn resolve_aliases_to_yumc_search() {
-        let yumc_aliases = ["yumc-search", "yumc_search", "yumcsearch"];
-        for alias in yumc_aliases {
-            let resolved = resolve_web_search_provider(alias);
-            assert_eq!(resolved.route, WebSearchProviderRoute::YumcSearch);
-            assert_eq!(resolved.canonical_provider, YUMC_SEARCH_PROVIDER);
             assert!(!resolved.used_fallback);
         }
     }
