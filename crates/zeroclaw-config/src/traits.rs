@@ -134,17 +134,7 @@ impl HasPropKind for Vec<crate::schema::EmbeddingRouteConfig> {
 impl HasPropKind for Vec<crate::schema::GoogleWorkspaceAllowedOperation> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
 }
-impl HasPropKind for crate::schema::DawnConfig {
-    const PROP_KIND: PropKind = PropKind::Object;
-}
-impl MaskSecrets for crate::schema::DawnConfig {
-    fn mask_secrets(&mut self) {
-        MaskSecrets::mask_secrets(&mut self.web_search);
-    }
-    fn restore_secrets_from(&mut self, current: &Self) {
-        MaskSecrets::restore_secrets_from(&mut self.web_search, &current.web_search);
-    }
-}
+
 impl HasPropKind for Vec<crate::schema::McpServerConfig> {
     const PROP_KIND: PropKind = PropKind::ObjectArray;
 }

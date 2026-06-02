@@ -321,6 +321,7 @@ pub struct Config {
 
     /// Dawn SaaS tools configuration (`[dawn.*]`).
     #[serde(default)]
+    #[nested]
     pub dawn: DawnConfig,
 
     /// Link enricher configuration (`[link_enricher]`).
@@ -6173,11 +6174,13 @@ impl Default for DawnWebSearchConfig {
 }
 
 /// Container for all Dawn SaaS tool configurations (`[dawn.*]`).
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "dawn"]
 pub struct DawnConfig {
     /// Dawn enterprise web search tool (`[dawn.web_search]`).
     #[serde(default)]
+    #[nested]
     pub web_search: DawnWebSearchConfig,
 }
 
