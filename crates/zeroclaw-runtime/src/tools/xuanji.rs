@@ -149,7 +149,7 @@ impl Tool for XuanjiCreateTaskTool {
         Ok(ToolResult {
             success: true,
             output: format!(
-                "已提交 {} 个文件的提取任务，预计 30-60 秒完成，完成后会主动通知您",
+                "已提交 {} 个文件的提取任务。请等待 extraction_complete 通知，不要再重复提交。",
                 file_count
             ),
             error: None,
