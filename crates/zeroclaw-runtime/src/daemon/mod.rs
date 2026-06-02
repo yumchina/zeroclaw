@@ -160,6 +160,7 @@ pub async fn run(
     // the WuKongIM channel supervisor reads the receiver.
     let (channel_msg_tx, channel_msg_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, u8, serde_json::Value)>();
+    crate::tools::xuanji::set_xuanji_bridge(channel_msg_tx.clone());
     let channel_msg_tx = Some(channel_msg_tx);
     let mut channel_msg_rx = Some(channel_msg_rx);
 
