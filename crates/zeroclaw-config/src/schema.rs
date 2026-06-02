@@ -319,6 +319,10 @@ pub struct Config {
     #[nested]
     pub dawn_s3: DawnS3Config,
 
+    /// Dawn SaaS tools configuration (`[dawn.*]`).
+    #[serde(default)]
+    pub dawn: DawnConfig,
+
     /// Link enricher configuration (`[link_enricher]`).
     #[serde(default)]
     #[nested]
@@ -6122,6 +6126,59 @@ impl Default for WebSearchConfig {
             timeout_secs: default_web_search_timeout_secs(),
         }
     }
+}
+
+fn default_dawn_web_search_max_results() -> usize {
+    2
+}
+
+fn default_dawn_web_search_timeout_secs() -> u64 {
+    20
+}
+
+/// Dawn enterprise web search configuration (`[dawn.web_search]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "dawn-web-search"]
+pub struct DawnWebSearchConfig {
+    /// Enable the `dawn_web_search_tool`. Default: `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Maximum results per search (1-10). Default: `2`.
+    #[serde(default = "default_dawn_web_search_max_results")]
+    pub max_results: usize,
+    /// Request timeout in seconds. Default: `20`.
+    #[serde(default = "default_dawn_web_search_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Yumc-Search API key (required).
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub yumc_search_api_key: Option<String>,
+    /// Yumc-Search base URL (required), e.g. `"http://search.example.local/api/v1/search"`.
+    #[serde(default)]
+    pub yumc_search_base_url: Option<String>,
+}
+
+impl Default for DawnWebSearchConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_results: default_dawn_web_search_max_results(),
+            timeout_secs: default_dawn_web_search_timeout_secs(),
+            yumc_search_api_key: None,
+            yumc_search_base_url: None,
+        }
+    }
+}
+
+/// Container for all Dawn SaaS tool configurations (`[dawn.*]`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct DawnConfig {
+    /// Dawn enterprise web search tool (`[dawn.web_search]`).
+    #[serde(default)]
+    pub web_search: DawnWebSearchConfig,
 }
 
 // ── Project Intelligence ────────────────────────────────────────
@@ -13425,6 +13482,7 @@ impl Default for Config {
             media_pipeline: MediaPipelineConfig::default(),
             web_fetch: WebFetchConfig::default(),
             dawn_s3: DawnS3Config::default(),
+            dawn: DawnConfig::default(),
             link_enricher: LinkEnricherConfig::default(),
             text_browser: TextBrowserConfig::default(),
             web_search: WebSearchConfig::default(),
@@ -16882,6 +16940,7 @@ auto_save = true
             media_pipeline: MediaPipelineConfig::default(),
             web_fetch: WebFetchConfig::default(),
             dawn_s3: DawnS3Config::default(),
+            dawn: DawnConfig::default(),
             link_enricher: LinkEnricherConfig::default(),
             text_browser: TextBrowserConfig::default(),
             web_search: WebSearchConfig::default(),
@@ -17482,6 +17541,7 @@ default_temperature = 0.7
             media_pipeline: MediaPipelineConfig::default(),
             web_fetch: WebFetchConfig::default(),
             dawn_s3: DawnS3Config::default(),
+            dawn: DawnConfig::default(),
             link_enricher: LinkEnricherConfig::default(),
             text_browser: TextBrowserConfig::default(),
             web_search: WebSearchConfig::default(),
@@ -23153,5 +23213,37 @@ allowed_users = []
                 .classifier_provider
                 .is_empty()
         );
+    }
+}
+
+#[cfg(test)]
+mod dawn_config_tests {
+    use super::*;
+
+    #[test]
+    fn dawn_web_search_config_parses_from_toml() {
+        let toml_str = r#"
+[dawn.web_search]
+enabled = true
+max_results = 2
+timeout_secs = 20
+yumc_search_base_url = "http://search.example.local/api/v1/search"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert!(config.dawn.web_search.enabled);
+        assert_eq!(config.dawn.web_search.max_results, 2);
+        assert_eq!(config.dawn.web_search.timeout_secs, 20);
+        assert_eq!(
+            config.dawn.web_search.yumc_search_base_url.as_deref(),
+            Some("http://search.example.local/api/v1/search")
+        );
+    }
+
+    #[test]
+    fn dawn_web_search_config_defaults_to_disabled() {
+        let config: Config = toml::from_str("").unwrap();
+        assert!(!config.dawn.web_search.enabled);
+        assert_eq!(config.dawn.web_search.max_results, 2);
+        assert_eq!(config.dawn.web_search.timeout_secs, 20);
     }
 }
