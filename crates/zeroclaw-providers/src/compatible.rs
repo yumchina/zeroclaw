@@ -633,11 +633,20 @@ impl OpenAiCompatibleModelProvider {
     }
 }
 
+/// Kimi K2.5/K2.6 models enforce fixed temperatures per mode (1.0 thinking,
+/// 0.6 instant) and reject any other value with HTTP 400. Omit `temperature`
+/// for kimi-k2.* models so the backend chooses the correct mode default.
+/// Substring match covers k2.5, k2.6, and future k2.x variants.
+fn compatible_model_omits_temperature(model: &str) -> bool {
+    model.contains("kimi-k2")
+}
+
 #[derive(Debug, Serialize)]
 struct ApiChatRequest {
     model: String,
     messages: Vec<Message>,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -936,7 +945,8 @@ struct Function {
 struct NativeChatRequest {
     model: String,
     messages: Vec<NativeMessage>,
-    temperature: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stream: Option<bool>,
     /// Mirrors `ApiChatRequest::stream_options`. Without this, tool-enabled
@@ -1713,7 +1723,7 @@ impl OpenAiCompatibleModelProvider {
         effective_messages: &[ChatMessage],
         tools: Option<Vec<serde_json::Value>>,
         model: &str,
-        temperature: f64,
+        temperature: Option<f64>,
         allow_user_image_parts: bool,
     ) -> NativeChatRequest {
         let has_tool_entries = tools.as_ref().is_some_and(|tools| !tools.is_empty());
@@ -2223,7 +2233,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
+        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
+            None
+        } else {
+            Some(temperature.unwrap_or(self.default_temperature()))
+        };
         let credential = self.credential.as_deref();
 
         // Normalize image markers (e.g. local file paths from channel
@@ -2336,7 +2350,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<String> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
+        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
+            None
+        } else {
+            Some(temperature.unwrap_or(self.default_temperature()))
+        };
         let credential = self.credential.as_deref();
 
         let normalized = Self::normalize_messages_for_upstream(messages).await?;
@@ -2418,7 +2436,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
+        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
+            None
+        } else {
+            Some(temperature.unwrap_or(self.default_temperature()))
+        };
         let credential = self.credential.as_deref();
 
         let normalized = Self::normalize_messages_for_upstream(messages).await?;
@@ -2459,9 +2481,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                         self.name
                     )
                 );
-                let text = self
-                    .chat_with_history(messages, model, Some(temperature))
-                    .await?;
+                let text = self.chat_with_history(messages, model, temperature).await?;
                 return Ok(ProviderChatResponse {
                     text: Some(text),
                     tool_calls: vec![],
@@ -2528,7 +2548,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         model: &str,
         temperature: Option<f64>,
     ) -> anyhow::Result<ProviderChatResponse> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
+        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
+            None
+        } else {
+            Some(temperature.unwrap_or(self.default_temperature()))
+        };
         let credential = self.credential.as_deref();
 
         let normalized = Self::normalize_messages_for_upstream(request.messages).await?;
@@ -2573,7 +2597,7 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
                 let fallback_messages =
                     Self::with_prompt_guided_tool_instructions(request.messages, request.tools);
                 let text = self
-                    .chat_with_history(&fallback_messages, model, Some(temperature))
+                    .chat_with_history(&fallback_messages, model, temperature)
                     .await?;
                 return Ok(ProviderChatResponse {
                     text: Some(text),
@@ -2637,7 +2661,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
             return stream::once(async { Ok(StreamEvent::Final) }).boxed();
         }
 
-        let temperature = temperature.unwrap_or(self.default_temperature());
+        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
+            None
+        } else {
+            Some(temperature.unwrap_or(self.default_temperature()))
+        };
         let provider = self.clone();
         let messages_owned: Vec<ChatMessage> = request.messages.to_vec();
         let tools_owned: Option<Vec<zeroclaw_api::tool::ToolSpec>> =
@@ -2785,7 +2813,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
+        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
+            None
+        } else {
+            Some(temperature.unwrap_or(self.default_temperature()))
+        };
         let provider = self.clone();
         let system_prompt_owned: Option<String> = system_prompt.map(str::to_string);
         let message_owned = message.to_string();
@@ -2922,7 +2954,11 @@ impl ModelProvider for OpenAiCompatibleModelProvider {
         temperature: Option<f64>,
         options: StreamOptions,
     ) -> stream::BoxStream<'static, StreamResult<StreamChunk>> {
-        let temperature = temperature.unwrap_or(self.default_temperature());
+        let temperature = if temperature.is_none() && compatible_model_omits_temperature(model) {
+            None
+        } else {
+            Some(temperature.unwrap_or(self.default_temperature()))
+        };
         let provider = self.clone();
         let messages_owned: Vec<ChatMessage> = messages.to_vec();
         let model = model.to_string();
@@ -3106,7 +3142,7 @@ mod tests {
                 tool_calls: None,
                 reasoning_content: None,
             }],
-            temperature: 0.7,
+            temperature: Some(0.7),
             stream: Some(true),
             stream_options: Some(StreamOptionsBody {
                 include_usage: true,
@@ -3137,7 +3173,7 @@ mod tests {
         let req = NativeChatRequest {
             model: "gpt-4o".to_string(),
             messages: vec![],
-            temperature: 0.7,
+            temperature: Some(0.7),
             stream: Some(false),
             stream_options: None,
             reasoning_effort: None,
@@ -3181,7 +3217,7 @@ mod tests {
                     content: MessageContent::Text("hello".to_string()),
                 },
             ],
-            temperature: 0.4,
+            temperature: Some(0.4),
             stream: Some(false),
             stream_options: None,
             reasoning_effort: None,
@@ -3757,7 +3793,7 @@ mod tests {
         let req = NativeChatRequest {
             model: "mistral-large-latest".to_string(),
             messages: provider.convert_messages_for_native(&messages, true),
-            temperature: 0.7,
+            temperature: Some(0.7),
             stream: Some(false),
             stream_options: None,
             reasoning_effort: None,
@@ -4269,7 +4305,7 @@ mod tests {
                 role: "user".to_string(),
                 content: MessageContent::Text("What is the weather?".to_string()),
             }],
-            temperature: 0.7,
+            temperature: Some(0.7),
             stream: Some(false),
             stream_options: None,
             reasoning_effort: None,
@@ -4293,7 +4329,7 @@ mod tests {
                 role: "user".to_string(),
                 content: MessageContent::Text("List /tmp".to_string()),
             }],
-            temperature: 0.7,
+            temperature: Some(0.7),
             stream: Some(false),
             stream_options: None,
             reasoning_effort: None,
@@ -4328,7 +4364,7 @@ mod tests {
                 role: "user".to_string(),
                 content: MessageContent::Text("List /tmp".to_string()),
             }],
-            temperature: 0.7,
+            temperature: Some(0.7),
             stream: Some(false),
             stream_options: None,
             reasoning_effort: None,
@@ -4504,7 +4540,7 @@ mod tests {
             &messages,
             Some(tools),
             "deepseek-v4-flash",
-            0.7,
+            Some(0.7),
             true,
         );
         let value = serde_json::to_value(&request).unwrap();
@@ -5464,5 +5500,22 @@ mod tests {
         assert!(!is_provider_acceptable_image_url("ftp://x.test/y.png"));
         assert!(!is_provider_acceptable_image_url(""));
         assert!(!is_provider_acceptable_image_url("   "));
+    }
+
+    #[test]
+    fn compatible_model_omits_temperature_matches_kimi_k2() {
+        assert!(compatible_model_omits_temperature("kimi-k2.5"));
+        assert!(compatible_model_omits_temperature("kimi-k2.6"));
+        assert!(compatible_model_omits_temperature("kimi-k2.7"));
+        assert!(compatible_model_omits_temperature("kimi-k2"));
+    }
+
+    #[test]
+    fn compatible_model_omits_temperature_skips_other_models() {
+        assert!(!compatible_model_omits_temperature("kimi-k1"));
+        assert!(!compatible_model_omits_temperature("kimi-latest"));
+        assert!(!compatible_model_omits_temperature("gpt-4o"));
+        assert!(!compatible_model_omits_temperature("claude-sonnet-4-6"));
+        assert!(!compatible_model_omits_temperature("llama-3.1-70b"));
     }
 }

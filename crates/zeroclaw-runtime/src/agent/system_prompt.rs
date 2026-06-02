@@ -43,7 +43,7 @@ fn load_openclaw_bootstrap_files(
 /// 3. Skills — full skill instructions and tool metadata
 /// 4. Workspace — working directory
 /// 5. Bootstrap files — AGENTS, SOUL, TOOLS, IDENTITY, USER, BOOTSTRAP, MEMORY
-/// 6. Date & Time — timezone for cache stability
+/// 6. Date — timezone offset for cache stability
 /// 7. Runtime — host, OS, model
 ///
 /// When `identity_config` is set to AIEOS format, the bootstrap files section
@@ -322,7 +322,7 @@ pub fn build_system_prompt_with_mode_and_autonomy(
         load_openclaw_bootstrap_files(&mut prompt, workspace_dir, max_chars);
     }
 
-    // ── 6. Date & Time ──────────────────────────────────────────
+    // ── 6. Date ─────────────────────────────────────────────────
     let now = chrono::Local::now();
     let _ = writeln!(
         prompt,
