@@ -26,6 +26,28 @@ pub enum ChannelApprovalResponse {
     AlwaysApprove,
 }
 
+// ── Channel intervention/takeover types ──────────────────────────
+
+/// Request for human takeover/intervention.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelInterventionRequest {
+    pub reason: String,              // Why are we halting (e.g. "Step Timeout", "Loop Detected")
+    pub last_tool: Option<String>,    // Last executed tool (if any)
+    pub error_detail: String,         // Specific error text/details
+}
+
+/// Operator response to intervention request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChannelInterventionResponse {
+    /// Retry execution of the current turn/tool call.
+    Retry,
+    /// Cancel the entire task.
+    Cancel,
+    /// Provide manual instruction/hints.
+    Intervene,
+}
+
 /// A message received from or sent to a channel
 #[derive(Debug, Clone)]
 pub struct ChannelMessage {
@@ -300,6 +322,15 @@ pub trait Channel: Send + Sync {
     /// fast with a useful error instead of timing out on `listen`.
     fn supports_free_form_ask(&self) -> bool {
         true
+    }
+
+    /// Request human intervention when a runtime block/timeout occurs.
+    async fn request_intervention(
+        &self,
+        _recipient: &str,
+        _request: &ChannelInterventionRequest,
+    ) -> anyhow::Result<Option<ChannelInterventionResponse>> {
+        Ok(None)
     }
 }
 

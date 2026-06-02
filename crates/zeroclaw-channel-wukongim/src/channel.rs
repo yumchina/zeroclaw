@@ -12,10 +12,14 @@ use tokio_tungstenite::tungstenite::Message as WsMsg;
 use uuid::Uuid;
 use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+    ChannelInterventionRequest, ChannelInterventionResponse,
 };
 use zeroclaw_api::memory_traits::{Memory, MemoryCategory};
 
-use crate::approval::{PendingApprovals, WkApprovalAction, build_approval_card};
+use crate::approval::{
+    ActivePendingApproval, PendingApprovals, WkApprovalAction, build_approval_card,
+    PendingInterventions, build_intervention_card,
+};
 use crate::config::WuKongIMConfig;
 use crate::connection::{
     ClearUnreadRequest, ConnectParams, HEARTBEAT_TIMEOUT, JsonRpcNotification, JsonRpcRequest,
@@ -82,6 +86,7 @@ pub struct WuKongIMChannel {
     pub(crate) pending_responses:
         Arc<RwLock<HashMap<String, tokio::sync::oneshot::Sender<serde_json::Value>>>>,
     pub(crate) pending_approvals: Arc<PendingApprovals>,
+    pub(crate) pending_interventions: Arc<PendingInterventions>,
     pub(crate) ws_sink: Arc<RwLock<Option<WsSink>>>,
     pub(crate) downloads_dir: PathBuf,
     pub(crate) last_message_time: Arc<RwLock<HashMap<String, Instant>>>,
@@ -122,6 +127,7 @@ impl WuKongIMChannel {
             memory,
             pending_responses: Arc::new(RwLock::new(HashMap::new())),
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
+            pending_interventions: Arc::new(RwLock::new(HashMap::new())),
             ws_sink: Arc::new(RwLock::new(None)),
             downloads_dir,
             last_message_time: Arc::new(RwLock::new(HashMap::new())),
@@ -600,7 +606,7 @@ impl WuKongIMChannel {
             return Ok(());
         }
 
-        // Interactive response (approval answer)
+        // Interactive response (approval or intervention answer)
         if msg_type == WkMessageType::INTERACTIVE_RESPONSE as u64 {
             let _ = self
                 .send_ack(params.message_id.clone(), params.message_seq)
@@ -613,8 +619,24 @@ impl WuKongIMChannel {
                     _ => None,
                 };
                 if let Some(r) = resp
-                    && let Some(ptx) = self
+                    && let Some(active_approval) = self
                         .pending_approvals
+                        .write()
+                        .await
+                        .remove(&action.approval_id)
+                {
+                    let _ = active_approval.tx.send(r);
+                }
+
+                let intervention_resp = match action.action.as_str() {
+                    "retry" => Some(ChannelInterventionResponse::Retry),
+                    "intervene" => Some(ChannelInterventionResponse::Intervene),
+                    "cancel" => Some(ChannelInterventionResponse::Cancel),
+                    _ => None,
+                };
+                if let Some(r) = intervention_resp
+                    && let Some(ptx) = self
+                        .pending_interventions
                         .write()
                         .await
                         .remove(&action.approval_id)
@@ -623,6 +645,25 @@ impl WuKongIMChannel {
                 }
             }
             return Ok(());
+        }
+
+        // Implicit Deny: If there is an active pending approval for this conversation,
+        // cancel it immediately to allow the new message to break the deadlock and be processed.
+        let recipient_key = format!("{}:{}", params.channel_id, params.channel_type);
+        {
+            let mut pending = self.pending_approvals.write().await;
+            let keys_to_deny: Vec<String> = pending
+                .iter()
+                .filter(|(_, active)| active.recipient == recipient_key)
+                .map(|(k, _)| k.clone())
+                .collect();
+
+            for key in keys_to_deny {
+                if let Some(active_approval) = pending.remove(&key) {
+                    tracing::info!("WuKongIM: Implicit Deny triggered for pending approval {} due to new message", key);
+                    let _ = active_approval.tx.send(ChannelApprovalResponse::Deny);
+                }
+            }
         }
 
         // mention_only filter for group messages
@@ -1358,6 +1399,52 @@ impl Channel for WuKongIMChannel {
         let params = SendParams {
             from_uid: Some(self.uid.clone()),
             client_msg_no: Uuid::new_v4().to_string(),
+            channel_id: channel_id.clone(),
+            channel_type,
+            payload: serde_json::Value::String(payload_b64),
+            header: None,
+            setting: None,
+            msg_key: None,
+            expire: None,
+            stream_no: None,
+            topic: None,
+        };
+        let (otx, orx) = tokio::sync::oneshot::channel();
+        let recipient_key = format!("{channel_id}:{channel_type}");
+        self.pending_approvals
+            .write()
+            .await
+            .insert(
+                approval_id.clone(),
+                ActivePendingApproval {
+                    tx: otx,
+                    recipient: recipient_key,
+                },
+            );
+        self.send_rpc::<_, serde_json::Value>("send", params)
+            .await?;
+        match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), orx).await {
+            Ok(Ok(resp)) => Ok(Some(resp)),
+            _ => {
+                self.pending_approvals.write().await.remove(&approval_id);
+                Ok(Some(ChannelApprovalResponse::Deny))
+            }
+        }
+    }
+
+    async fn request_intervention(
+        &self,
+        recipient: &str,
+        request: &ChannelInterventionRequest,
+    ) -> anyhow::Result<Option<ChannelInterventionResponse>> {
+        let approval_id = Uuid::new_v4().to_string();
+        let card = build_intervention_card(&approval_id, request, self.approval_timeout_secs);
+        let payload_b64 =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(&card)?);
+        let (channel_id, channel_type) = parse_recipient(recipient);
+        let params = SendParams {
+            from_uid: Some(self.uid.clone()),
+            client_msg_no: Uuid::new_v4().to_string(),
             channel_id,
             channel_type,
             payload: serde_json::Value::String(payload_b64),
@@ -1369,7 +1456,7 @@ impl Channel for WuKongIMChannel {
             topic: None,
         };
         let (otx, orx) = tokio::sync::oneshot::channel();
-        self.pending_approvals
+        self.pending_interventions
             .write()
             .await
             .insert(approval_id.clone(), otx);
@@ -1378,8 +1465,8 @@ impl Channel for WuKongIMChannel {
         match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), orx).await {
             Ok(Ok(resp)) => Ok(Some(resp)),
             _ => {
-                self.pending_approvals.write().await.remove(&approval_id);
-                Ok(Some(ChannelApprovalResponse::Deny))
+                self.pending_interventions.write().await.remove(&approval_id);
+                Ok(Some(ChannelInterventionResponse::Cancel))
             }
         }
     }
