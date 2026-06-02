@@ -26,8 +26,9 @@ enabled: true
 
 ## ✅ 正确流程
 
-1. 调用 `xuanji_doc_create_task`（`file_url` 用消息中已有的 S3 URL）
-2. 告诉用户 "文件正在提取中，预计 30-60 秒，完成后主动通知您"
-3. 用户询问进度时，调用 `xuanji_doc_query_task`
+1. **只调用一次** `xuanji_doc_create_task`（`file_url` 用消息中已有的 S3 URL）
+2. 告诉用户 "文件正在提取中，完成后主动通知您"
+3. **等待 `extraction_complete` 通知，不要再重复调用 `xuanji_doc_create_task`**
+4. 用户询问进度时，调用 `xuanji_doc_query_task`
 
 支持：.pdf .docx .pptx .xlsx，多文件一次提交。
