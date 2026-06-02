@@ -5,5 +5,6 @@
 //! tools live alongside it under their own sub-modules.
 
 pub mod s3;
+pub mod web_search;
 
 pub use s3::DawnS3Tool;
