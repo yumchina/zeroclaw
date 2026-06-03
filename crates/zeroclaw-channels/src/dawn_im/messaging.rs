@@ -1,4 +1,4 @@
-//! Message encoding + media download for WuKongIM.
+//! Message encoding + media download for DawnIM.
 
 use std::time::Duration;
 
@@ -19,7 +19,7 @@ const SUPPORTED_IMAGE_MIMES: &[&str] = &[
     "image/bmp",
 ];
 
-/// Encode a text content string as a WuKongIM type-14 Markdown Base64 payload.
+/// Encode a text content string as a DawnIM type-14 Markdown Base64 payload.
 pub fn encode_text_payload(content: &str) -> anyhow::Result<String> {
     let obj = serde_json::json!({
         "type": 14,
@@ -67,7 +67,7 @@ pub async fn download_image_as_base64(url: &str) -> Option<String> {
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                &format!("wukongim media: request failed: url={url}, err={e}")
+                &format!("dawnIM media: request failed: url={url}, err={e}")
             );
             return None;
         }
@@ -77,7 +77,7 @@ pub async fn download_image_as_base64(url: &str) -> Option<String> {
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-            &format!("wukongim media: HTTP {}: {url}", resp.status())
+            &format!("dawnIM media: HTTP {}: {url}", resp.status())
         );
         return None;
     }
@@ -88,7 +88,7 @@ pub async fn download_image_as_base64(url: &str) -> Option<String> {
             WARN,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                 .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-            &format!("wukongim media: image too large ({cl} bytes): {url}")
+            &format!("dawnIM media: image too large ({cl} bytes): {url}")
         );
         return None;
     }
@@ -106,7 +106,7 @@ pub async fn download_image_as_base64(url: &str) -> Option<String> {
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                &format!("wukongim media: body read failed: {url}, {e}")
+                &format!("dawnIM media: body read failed: {url}, {e}")
             );
             return None;
         }
@@ -122,7 +122,7 @@ pub async fn download_image_as_base64(url: &str) -> Option<String> {
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                &format!("wukongim media: unsupported MIME {other:?}: {url}")
+                &format!("dawnIM media: unsupported MIME {other:?}: {url}")
             );
             return None;
         }

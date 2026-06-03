@@ -10507,10 +10507,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub mqtt: HashMap<String, MqttConfig>,
-    /// WuKongIM channel instances (`[channels.wukongim.<alias>]`).
+    /// DawnIM channel instances (`[channels.dawnIM.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
-    pub wukongim: HashMap<String, WuKongIMConfig>,
+    pub dawn_im: HashMap<String, DawnIMConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -10812,10 +10812,10 @@ impl ChannelsConfig {
                 configured: !self.webhook.is_empty(),
             },
             ChannelInfo {
-                kind: "wukongim",
-                name: "WuKongIM",
-                desc: "WuKongIM messaging platform",
-                configured: !self.wukongim.is_empty(),
+                kind: "dawnIM",
+                name: "DawnIM",
+                desc: "DawnIM messaging platform",
+                configured: !self.dawn_im.is_empty(),
             },
         ]
     }
@@ -10905,7 +10905,7 @@ impl Default for ChannelsConfig {
             voice_wake: HashMap::new(),
             voice_duplex: HashMap::new(),
             mqtt: HashMap::new(),
-            wukongim: HashMap::new(),
+            dawn_im: HashMap::new(),
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
             show_tool_calls: false,
@@ -11392,21 +11392,21 @@ impl ChannelConfig for WebhookConfig {
     }
 }
 
-/// WuKongIM channel configuration.
+/// DawnIM channel configuration.
 ///
-/// WuKongIM is a high-performance open-source instant messaging engine.
-/// Bot communicates with the WuKongIM server over WebSocket using JSON-RPC 2.0.
+/// DawnIM is a high-performance open-source instant messaging engine.
+/// Bot communicates with the DawnIM server over WebSocket using JSON-RPC 2.0.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "channels.wukongim"]
-pub struct WuKongIMConfig {
+#[prefix = "channels.dawnIM"]
+pub struct DawnIMConfig {
     /// Whether this channel is active. The runtime only loads channels whose
     /// `enabled = true`. Default: `false`.
     #[serde(default)]
     pub enabled: bool,
-    /// WebSocket URL for WuKongIM (e.g. `ws://host:5200`).
+    /// WebSocket URL for DawnIM (e.g. `ws://host:5200`).
     pub ws_url: String,
-    /// Bot user ID registered on the WuKongIM server.
+    /// Bot user ID registered on the DawnIM server.
     pub uid: String,
     /// Auth token for the user.
     #[secret]
@@ -11415,7 +11415,7 @@ pub struct WuKongIMConfig {
     /// Device ID (e.g. `"web-001"`).
     pub device_id: String,
     /// Device flag: `0=App`, `1=Web`, `2=Sys`. Default: `1` (Web).
-    #[serde(default = "default_wukongim_device_flag")]
+    #[serde(default = "default_dawn_im_device_flag")]
     pub device_flag: i32,
     /// Allowed user IDs (empty = deny all, `"*"` = allow all).
     #[serde(default)]
@@ -11425,11 +11425,11 @@ pub struct WuKongIMConfig {
     #[serde(default)]
     pub mention_only: bool,
     /// How long (seconds) to wait for the operator to approve a tool call. Default: `300`.
-    #[serde(default = "default_wukongim_approval_timeout_secs")]
+    #[serde(default = "default_dawn_im_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
     /// Directory for downloaded files (relative to workspace or absolute path).
     /// Default: `"downloads"` (i.e., `{workspace_dir}/downloads`).
-    #[serde(default = "default_wukongim_downloads_dir")]
+    #[serde(default = "default_dawn_im_downloads_dir")]
     pub downloads_dir: String,
     /// Dawn API base URL for history synchronization and unread clearing.
     #[serde(default)]
@@ -11447,7 +11447,7 @@ pub struct WuKongIMConfig {
     pub ack_reactions_message: String,
     /// Minimum interval (seconds) between acknowledgment messages for the same sender.
     /// Messages received within this window will not trigger a quick reply. Default: `300`.
-    #[serde(default = "default_wukongim_ack_reactions_delay")]
+    #[serde(default = "default_dawn_im_ack_reactions_delay")]
     pub ack_reactions_delay: u64,
     /// Whether to opt in to receiving real-time agent-progress updates
     /// (the `send_status_update` Channel hook). Default: `false`.
@@ -11458,28 +11458,28 @@ pub struct WuKongIMConfig {
     pub progress_streaming: bool,
 }
 
-impl ChannelConfig for WuKongIMConfig {
+impl ChannelConfig for DawnIMConfig {
     fn name() -> &'static str {
-        "WuKongIM"
+        "DawnIM"
     }
     fn desc() -> &'static str {
-        "WuKongIM messaging channel"
+        "DawnIM messaging channel"
     }
 }
 
-fn default_wukongim_device_flag() -> i32 {
+fn default_dawn_im_device_flag() -> i32 {
     1
 }
 
-fn default_wukongim_approval_timeout_secs() -> u64 {
+fn default_dawn_im_approval_timeout_secs() -> u64 {
     300
 }
 
-fn default_wukongim_downloads_dir() -> String {
+fn default_dawn_im_downloads_dir() -> String {
     "downloads".to_string()
 }
 
-fn default_wukongim_ack_reactions_delay() -> u64 {
+fn default_dawn_im_ack_reactions_delay() -> u64 {
     300
 }
 
@@ -17396,7 +17396,7 @@ auto_save = true
                 voice_duplex: HashMap::new(),
                 voice_wake: HashMap::new(),
                 mqtt: HashMap::new(),
-                wukongim: HashMap::new(),
+                dawn_im: HashMap::new(),
                 message_timeout_secs: 300,
                 ack_reactions: true,
                 show_tool_calls: true,
@@ -18721,7 +18721,7 @@ allowed_users = ["@u:matrix.org"]
             voice_duplex: HashMap::new(),
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
-            wukongim: HashMap::new(),
+            dawn_im: HashMap::new(),
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
@@ -19145,7 +19145,7 @@ allowed_numbers = ["+1", "+2"]
             voice_duplex: HashMap::new(),
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
-            wukongim: HashMap::new(),
+            dawn_im: HashMap::new(),
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,

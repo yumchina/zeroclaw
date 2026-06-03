@@ -279,7 +279,7 @@ channels-full = [
     "channel-linq", "channel-wati", "channel-nextcloud",
     "channel-mochat", "channel-wecom", "channel-wecom-ws", "channel-clawdtalk",
     "channel-webhook", "channel-acp-server", "channel-whatsapp-cloud",
-    "channel-voice-call", "channel-wukongim",
+    "channel-voice-call", "channel-dawnIM",
     "dawn-tools",
 ]
 
@@ -323,7 +323,7 @@ channel-webhook = ["zeroclaw-channels/channel-webhook"]
 channel-acp-server = ["zeroclaw-channels/channel-acp-server", "zeroclaw-gateway?/channel-acp-server"]
 channel-whatsapp-cloud = ["zeroclaw-channels/channel-whatsapp-cloud", "zeroclaw-gateway?/channel-whatsapp-cloud"]
 channel-voice-call = ["zeroclaw-channels/channel-voice-call"]
-channel-wukongim = ["zeroclaw-channels/channel-wukongim"]
+channel-dawnIM = ["zeroclaw-channels/channel-dawnIM"]
 dawn-tools = ["zeroclaw-runtime/dawn-tools"]
 channel-line = ["zeroclaw-channels/channel-line"]
 # Feishu uses the same channel implementation as Lark; `use_feishu = true`

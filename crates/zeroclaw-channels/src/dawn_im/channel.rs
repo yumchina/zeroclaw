@@ -1,4 +1,4 @@
-//! Main WuKongIM channel — struct, RPC plumbing, listen loop, Channel trait impl.
+//! Main DawnIM channel — struct, RPC plumbing, listen loop, Channel trait impl.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -16,13 +16,13 @@ use zeroclaw_api::channel::{
     Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
 };
 use zeroclaw_api::memory_traits::{Memory, MemoryCategory};
-use zeroclaw_config::schema::WuKongIMConfig;
+use zeroclaw_config::schema::DawnIMConfig;
 
 use super::approval::{PendingApprovals, WkApprovalAction, build_approval_card};
 use super::connection::{
     ClearUnreadRequest, ConnectParams, HEARTBEAT_TIMEOUT, Header, JsonRpcNotification,
     JsonRpcRequest, JsonRpcResponse, PING_INTERVAL, RecvAckParams, RecvNotificationParams,
-    SendParams, SyncRequest, SyncResponse, WUKONGIM_RPC_VERSION, WkChannelType, WkMessageType,
+    SendParams, SyncRequest, SyncResponse, DAWN_IM_RPC_VERSION, WkChannelType, WkMessageType,
     WsSink,
 };
 use super::filter::{is_mentioned, is_user_allowed, parse_recipient};
@@ -67,7 +67,7 @@ struct SyncState {
 
 #[derive(Clone)]
 #[allow(dead_code)]
-pub struct WuKongIMChannel {
+pub struct DawnIMChannel {
     pub(crate) alias: String,
     pub(crate) ws_url: String,
     pub(crate) uid: String,
@@ -101,9 +101,9 @@ pub struct WuKongIMChannel {
     pub(crate) progress_streaming: bool,
 }
 
-impl WuKongIMChannel {
+impl DawnIMChannel {
     pub fn from_config(
-        config: &WuKongIMConfig,
+        config: &DawnIMConfig,
         alias: impl Into<String>,
         workspace_dir: &Path,
         memory: Arc<dyn Memory>,
@@ -152,7 +152,7 @@ impl WuKongIMChannel {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let id = Uuid::new_v4().to_string();
         let req = JsonRpcRequest {
-            jsonrpc: WUKONGIM_RPC_VERSION.to_string(),
+            jsonrpc: DAWN_IM_RPC_VERSION.to_string(),
             method: method.to_string(),
             id: id.clone(),
             params,
@@ -167,15 +167,15 @@ impl WuKongIMChannel {
                         INFO,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
                             .with_attrs(::serde_json::json!({"method": method, "id": id})),
-                        "WuKongIM: RPC send"
+                        "DawnIM: RPC send"
                     );
                     if let Err(e) = s.send(WsMsg::Text(msg.into())).await {
                         *g = None;
-                        return Err(anyhow::anyhow!("WuKongIM RPC send failed: {}", e));
+                        return Err(anyhow::anyhow!("DawnIM RPC send failed: {}", e));
                     }
                     Ok(())
                 }
-                None => anyhow::bail!("WuKongIM: WebSocket not connected"),
+                None => anyhow::bail!("DawnIM: WebSocket not connected"),
             }
         }
         .await;
@@ -187,25 +187,25 @@ impl WuKongIMChannel {
             Ok(Ok(val)) => {
                 let resp: JsonRpcResponse<R> = serde_json::from_value(val)?;
                 if let Some(err) = resp.error {
-                    anyhow::bail!("WuKongIM RPC error: {} (code {})", err.message, err.code);
+                    anyhow::bail!("DawnIM RPC error: {} (code {})", err.message, err.code);
                 }
                 resp.result
-                    .ok_or_else(|| anyhow::Error::msg("WuKongIM RPC: missing result"))
+                    .ok_or_else(|| anyhow::Error::msg("DawnIM RPC: missing result"))
             }
             Ok(Err(_)) => {
                 self.pending_responses.write().await.remove(&id);
-                anyhow::bail!("WuKongIM RPC: response channel closed for {}", method);
+                anyhow::bail!("DawnIM RPC: response channel closed for {}", method);
             }
             Err(_) => {
                 self.pending_responses.write().await.remove(&id);
-                anyhow::bail!("WuKongIM RPC timeout: {}", method);
+                anyhow::bail!("DawnIM RPC timeout: {}", method);
             }
         }
     }
 
     async fn send_ack(&self, message_id: String, message_seq: u32) -> anyhow::Result<()> {
         let req = JsonRpcNotification {
-            jsonrpc: WUKONGIM_RPC_VERSION.to_string(),
+            jsonrpc: DAWN_IM_RPC_VERSION.to_string(),
             method: "recvack".to_string(),
             params: RecvAckParams {
                 message_id,
@@ -218,14 +218,14 @@ impl WuKongIMChannel {
             && let Err(e) = s.send(WsMsg::Text(msg.into())).await
         {
             *g = None;
-            return Err(anyhow::anyhow!("WuKongIM ACK send failed: {}", e));
+            return Err(anyhow::anyhow!("DawnIM ACK send failed: {}", e));
         }
         Ok(())
     }
 
     fn get_sync_state_path(&self) -> PathBuf {
         self.workspace_dir
-            .join(format!("wukongim_sync_{}.json", self.alias))
+            .join(format!("dawn_im_sync_{}.json", self.alias))
     }
 
     async fn load_sync_state(&self) -> SyncState {
@@ -248,7 +248,7 @@ impl WuKongIMChannel {
     }
 
     fn get_pending_outbound_path(&self) -> PathBuf {
-        self.workspace_dir.join("wukongim_pending_outbound.json")
+        self.workspace_dir.join("dawn_im_pending_outbound.json")
     }
 
     async fn load_pending_outbound(&self) {
@@ -270,7 +270,7 @@ impl WuKongIMChannel {
                 .collect();
             *self.pending_outbound.lock().await = pending_send;
             tracing::info!(
-                "WuKongIM: loaded {} pending outbound messages from disk",
+                "DawnIM: loaded {} pending outbound messages from disk",
                 count
             );
         }
@@ -320,7 +320,7 @@ impl WuKongIMChannel {
                     .with_attrs(
                         ::serde_json::json!({"seq_key": seq_key, "from": current_seq, "to": seq})
                     ),
-                "WuKongIM: updating sequence"
+                "DawnIM: updating sequence"
             );
             state.channel_seqs.insert(seq_key, seq);
             changed = true;
@@ -333,7 +333,7 @@ impl WuKongIMChannel {
                     .with_attrs(
                         ::serde_json::json!({"from": state.max_version, "to": timestamp_ns})
                     ),
-                "WuKongIM: updating max_version"
+                "DawnIM: updating max_version"
             );
             state.max_version = timestamp_ns;
             changed = true;
@@ -345,7 +345,7 @@ impl WuKongIMChannel {
 
         // Also persist seq to memory for cross-restart dedup.
         let seq_key_mem = format!(
-            "wukongim:channel_seq:{}:{}:{}",
+            "dawnIM:channel_seq:{}:{}:{}",
             self.alias, channel_id, channel_type
         );
         let mem_current = self
@@ -365,7 +365,7 @@ impl WuKongIMChannel {
                 )
                 .await
             {
-                tracing::error!("WuKongIM: failed to update sequence in memory: {}", e);
+                tracing::error!("DawnIM: failed to update sequence in memory: {}", e);
             }
         }
 
@@ -408,7 +408,7 @@ impl WuKongIMChannel {
                         "status": resp.status().as_u16(),
                         "url": url,
                     })),
-                "WuKongIM: failed to clear unread"
+                "DawnIM: failed to clear unread"
             );
         }
         Ok(())
@@ -429,7 +429,7 @@ impl WuKongIMChannel {
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Start).with_attrs(
                 ::serde_json::json!({"version": version, "last_msg_seqs": last_msg_seqs})
             ),
-            "WuKongIM: starting history sync"
+            "DawnIM: starting history sync"
         );
 
         let url = format!(
@@ -453,10 +453,10 @@ impl WuKongIMChannel {
                 .send(),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("WuKongIM history sync HTTP request timed out"))??;
+        .map_err(|_| anyhow::anyhow!("DawnIM history sync HTTP request timed out"))??;
 
         if !resp.status().is_success() {
-            anyhow::bail!("WuKongIM sync failed: status={}", resp.status());
+            anyhow::bail!("DawnIM sync failed: status={}", resp.status());
         }
 
         let body_text = resp.text().await?;
@@ -468,9 +468,9 @@ impl WuKongIMChannel {
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"err": e.to_string(), "body": body_text})),
-                    "WuKongIM: failed to decode sync response"
+                    "DawnIM: failed to decode sync response"
                 );
-                anyhow::bail!("WuKongIM: sync decode error: {}", e);
+                anyhow::bail!("DawnIM: sync decode error: {}", e);
             }
         };
         let mut all_history = Vec::new();
@@ -486,7 +486,7 @@ impl WuKongIMChannel {
                         "last_seq": conv.last_msg_seq,
                         "version": conv.version,
                     })),
-                "WuKongIM: syncing conversation"
+                "DawnIM: syncing conversation"
             );
             if let Some(messages) = conv.recents {
                 total_messages += messages.len();
@@ -534,7 +534,7 @@ impl WuKongIMChannel {
                             .with_attrs(
                                 ::serde_json::json!({"from_uid": m.from_uid, "summary": summary})
                             ),
-                        "WuKongIM: history entry"
+                        "DawnIM: history entry"
                     );
                 }
             }
@@ -553,7 +553,7 @@ impl WuKongIMChannel {
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Complete)
                     .with_outcome(::zeroclaw_log::EventOutcome::Success),
-                "WuKongIM: history sync completed, no new updates from server"
+                "DawnIM: history sync completed, no new updates from server"
             );
         } else {
             ::zeroclaw_log::record!(
@@ -564,7 +564,7 @@ impl WuKongIMChannel {
                         "messages": total_messages,
                         "conversations": num_conversations,
                     })),
-                "WuKongIM: history sync completed"
+                "DawnIM: history sync completed"
             );
         }
         Ok(all_history)
@@ -580,7 +580,7 @@ impl WuKongIMChannel {
         }
 
         let seq_key = format!(
-            "wukongim:channel_seq:{}:{}:{}",
+            "dawnIM:channel_seq:{}:{}:{}",
             self.alias, params.channel_id, params.channel_type
         );
         let mem_seq = self
@@ -605,7 +605,7 @@ impl WuKongIMChannel {
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({"from_uid": params.from_uid})),
-                "WuKongIM: unauthorized sender"
+                "DawnIM: unauthorized sender"
             );
             return Ok(());
         }
@@ -642,7 +642,7 @@ impl WuKongIMChannel {
                     sender: target_id.clone(),
                     reply_target: format!("{}:{}", params.channel_type, target_id),
                     content: content.to_string(),
-                    channel: "wukongim".to_string(),
+                    channel: "dawnIM".to_string(),
                     channel_alias: Some(self.alias.clone()),
                     timestamp: u64::try_from(params.timestamp.max(0)).unwrap_or(0),
                     thread_ts: None,
@@ -713,7 +713,7 @@ impl WuKongIMChannel {
                         "uid": self.uid,
                         "content_len": final_content_str.len(),
                     })),
-                "WuKongIM: Group message mention check"
+                "DawnIM: Group message mention check"
             );
 
             if !mentioned {
@@ -722,7 +722,7 @@ impl WuKongIMChannel {
                 ::zeroclaw_log::record!(
                     INFO,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-                    "WuKongIM: Metadata mention detected, prepending bot UID to force orchestrator reply"
+                    "DawnIM: Metadata mention detected, prepending bot UID to force orchestrator reply"
                 );
                 final_content_str = format!("@{} {}", self.uid, final_content_str);
             }
@@ -778,7 +778,7 @@ impl WuKongIMChannel {
             } else {
                 content
             },
-            channel: "wukongim".to_string(),
+            channel: "dawnIM".to_string(),
             channel_alias: Some(self.alias.clone()),
             timestamp: u64::try_from(params.timestamp.max(0)).unwrap_or(0),
             thread_ts: None,
@@ -795,7 +795,7 @@ impl WuKongIMChannel {
                         "message_seq": params.message_seq,
                         "ts": params.timestamp,
                     })),
-                "WuKongIM: message sent to orchestrator, updating sync state"
+                "DawnIM: message sent to orchestrator, updating sync state"
             );
             self.update_sync_state(
                 &params.channel_id,
@@ -889,7 +889,7 @@ impl WuKongIMChannel {
                     "is_silent": is_silent,
                 })
             ),
-            "WuKongIM: processing offline batch"
+            "DawnIM: processing offline batch"
         );
 
         self.send_offline_batch_as_single_message(sorted_messages, is_silent, tx)
@@ -988,7 +988,7 @@ impl WuKongIMChannel {
             } else {
                 combined_content
             },
-            channel: "wukongim".to_string(),
+            channel: "dawnIM".to_string(),
             channel_alias: Some(self.alias.clone()),
             timestamp: u64::try_from(last.timestamp.max(0)).unwrap_or(0),
             thread_ts: None,
@@ -1007,7 +1007,7 @@ impl WuKongIMChannel {
                         "channel_type": channel_type,
                         "seq": last.message_seq,
                     })),
-                "WuKongIM: offline batch sent, updating sync state"
+                "DawnIM: offline batch sent, updating sync state"
             );
             self.update_sync_state(
                 channel_id,
@@ -1022,7 +1022,7 @@ impl WuKongIMChannel {
     }
 }
 
-impl Attributable for WuKongIMChannel {
+impl Attributable for DawnIMChannel {
     fn role(&self) -> Role {
         Role::Channel(ChannelKind::WuKongIm)
     }
@@ -1032,9 +1032,9 @@ impl Attributable for WuKongIMChannel {
 }
 
 #[async_trait]
-impl Channel for WuKongIMChannel {
+impl Channel for DawnIMChannel {
     fn name(&self) -> &str {
-        "wukongim"
+        "dawnIM"
     }
 
     fn self_handle(&self) -> Option<String> {
@@ -1069,7 +1069,7 @@ impl Channel for WuKongIMChannel {
         match g.as_mut() {
             Some(s) => {
                 let req = JsonRpcRequest {
-                    jsonrpc: WUKONGIM_RPC_VERSION.to_string(),
+                    jsonrpc: DAWN_IM_RPC_VERSION.to_string(),
                     method: "send".to_string(),
                     id: Uuid::new_v4().to_string(),
                     params,
@@ -1079,20 +1079,20 @@ impl Channel for WuKongIMChannel {
                     Ok(_) => {
                         drop(g);
                         if let Err(e) = self.remove_from_pending_outbound(message).await {
-                            tracing::debug!("WuKongIM: remove_from_pending_outbound: {}", e);
+                            tracing::debug!("DawnIM: remove_from_pending_outbound: {}", e);
                         }
                         Ok(())
                     }
                     Err(err) => {
                         tracing::warn!(
-                            "WuKongIM: WebSocket send failed: {}. Clearing sink and buffering message.",
+                            "DawnIM: WebSocket send failed: {}. Clearing sink and buffering message.",
                             err
                         );
                         *g = None;
                         drop(g);
                         self.pending_outbound.lock().await.push(message.clone());
                         if let Err(e) = self.save_pending_outbound().await {
-                            tracing::warn!("WuKongIM: failed to persist pending outbound: {}", e);
+                            tracing::warn!("DawnIM: failed to persist pending outbound: {}", e);
                         }
                         Ok(())
                     }
@@ -1102,10 +1102,10 @@ impl Channel for WuKongIMChannel {
                 drop(g);
                 self.pending_outbound.lock().await.push(message.clone());
                 if let Err(e) = self.save_pending_outbound().await {
-                    tracing::warn!("WuKongIM: failed to persist pending outbound: {}", e);
+                    tracing::warn!("DawnIM: failed to persist pending outbound: {}", e);
                 }
                 tracing::warn!(
-                    "WuKongIM: not connected, buffered message ({} pending)",
+                    "DawnIM: not connected, buffered message ({} pending)",
                     self.pending_outbound.lock().await.len()
                 );
                 Ok(())
@@ -1115,7 +1115,7 @@ impl Channel for WuKongIMChannel {
 
     /// Ephemeral progress text rendered as a short chat message.
     ///
-    /// WuKongIM lacks a Slack-style assistant-status banner and JSON-RPC
+    /// DawnIM lacks a Slack-style assistant-status banner and JSON-RPC
     /// `send` is the only push primitive we have. To keep these updates
     /// out of message history (so they don't bloat replay / sync), we set
     /// `noPersist = true` and `redDot = false` so:
@@ -1168,7 +1168,7 @@ impl Channel for WuKongIMChannel {
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({"err": e.to_string()})),
-                "WuKongIM: history sync failed"
+                "DawnIM: history sync failed"
             );
             vec![]
         });
@@ -1177,21 +1177,21 @@ impl Channel for WuKongIMChannel {
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Connect)
                 .with_attrs(::serde_json::json!({"ws_url": self.ws_url})),
-            "WuKongIM: connecting"
+            "DawnIM: connecting"
         );
         let (ws_stream, _) = tokio::time::timeout(
             Duration::from_secs(10),
             tokio_tungstenite::connect_async(&self.ws_url),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("WuKongIM WebSocket connection timed out"))??;
+        .map_err(|_| anyhow::anyhow!("DawnIM WebSocket connection timed out"))??;
         let (write, mut read) = ws_stream.split();
         *self.ws_sink.write().await = Some(write);
 
         {
             let connect_id = Uuid::new_v4().to_string();
             let req = JsonRpcRequest {
-                jsonrpc: WUKONGIM_RPC_VERSION.to_string(),
+                jsonrpc: DAWN_IM_RPC_VERSION.to_string(),
                 method: "connect".to_string(),
                 id: connect_id,
                 params: ConnectParams {
@@ -1208,12 +1208,12 @@ impl Channel for WuKongIMChannel {
             }
             let connack = tokio::time::timeout(Duration::from_secs(15), read.next())
                 .await
-                .map_err(|_| anyhow::Error::msg("WuKongIM: connect timeout"))?
-                .ok_or_else(|| anyhow::Error::msg("WuKongIM: stream closed during connect"))??;
+                .map_err(|_| anyhow::Error::msg("DawnIM: connect timeout"))?
+                .ok_or_else(|| anyhow::Error::msg("DawnIM: stream closed during connect"))??;
             if let WsMsg::Text(text) = connack {
                 let val: serde_json::Value = serde_json::from_str(&text)?;
                 if let Some(err) = val.get("error").filter(|e| !e.is_null()) {
-                    anyhow::bail!("WuKongIM: connect rejected: {}", err);
+                    anyhow::bail!("DawnIM: connect rejected: {}", err);
                 }
             }
         }
@@ -1222,7 +1222,7 @@ impl Channel for WuKongIMChannel {
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Connect)
                 .with_outcome(::zeroclaw_log::EventOutcome::Success)
                 .with_attrs(::serde_json::json!({"uid": self.uid})),
-            "WuKongIM: connected"
+            "DawnIM: connected"
         );
 
         // Process offline history (now that WS is connected, agent can reply).
@@ -1243,7 +1243,7 @@ impl Channel for WuKongIMChannel {
                         "channel_type": channel_type,
                         "count": messages.len(),
                     })),
-                "WuKongIM: processing offline batch for channel"
+                "DawnIM: processing offline batch for channel"
             );
             if let Err(e) = self.process_offline_batch(messages, &tx).await {
                 ::zeroclaw_log::record!(
@@ -1251,7 +1251,7 @@ impl Channel for WuKongIMChannel {
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"err": e.to_string()})),
-                    "WuKongIM: offline batch processing failed"
+                    "DawnIM: offline batch processing failed"
                 );
             }
         }
@@ -1261,10 +1261,10 @@ impl Channel for WuKongIMChannel {
         self.load_pending_outbound().await;
         let pending = self.pending_outbound.lock().await.clone();
         if !pending.is_empty() {
-            tracing::info!("WuKongIM: retrying {} buffered messages", pending.len());
+            tracing::info!("DawnIM: retrying {} buffered messages", pending.len());
             for msg in pending {
                 if let Err(e) = self.send(&msg).await {
-                    tracing::warn!("WuKongIM: retry failed for buffered message: {}", e);
+                    tracing::warn!("DawnIM: retry failed for buffered message: {}", e);
                 }
             }
         }
@@ -1281,10 +1281,10 @@ impl Channel for WuKongIMChannel {
             tokio::select! {
                 _ = hb.tick() => {
                     if last_activity.elapsed() > HEARTBEAT_TIMEOUT {
-                        anyhow::bail!("WuKongIM: heartbeat timeout");
+                        anyhow::bail!("DawnIM: heartbeat timeout");
                     }
                     let ping = JsonRpcRequest {
-                        jsonrpc: WUKONGIM_RPC_VERSION.to_string(),
+                        jsonrpc: DAWN_IM_RPC_VERSION.to_string(),
                         method: "ping".to_string(),
                         id: Uuid::new_v4().to_string(),
                         params: serde_json::json!({}),
@@ -1296,7 +1296,7 @@ impl Channel for WuKongIMChannel {
                     }
                 }
                 frame = read.next() => {
-                    let frame = frame.ok_or_else(|| anyhow::Error::msg("WuKongIM: stream closed"))??;
+                    let frame = frame.ok_or_else(|| anyhow::Error::msg("DawnIM: stream closed"))??;
                     last_activity = Instant::now();
                     let WsMsg::Text(text) = frame else { continue; };
                     let val: serde_json::Value = serde_json::from_str(&text)?;
@@ -1330,7 +1330,7 @@ impl Channel for WuKongIMChannel {
                                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
                                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                                     .with_attrs(::serde_json::json!({"err": e.to_string()})),
-                                "WuKongIM: inbound processing failed"
+                                "DawnIM: inbound processing failed"
                             );
                         }
                     });

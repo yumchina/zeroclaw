@@ -85,8 +85,8 @@ pub use crate::wecom::WeComChannel;
 pub use crate::wecom_ws::WeComWsChannel;
 #[cfg(feature = "channel-whatsapp-cloud")]
 pub use crate::whatsapp::WhatsAppChannel;
-#[cfg(feature = "channel-wukongim")]
-pub use crate::wukongim::WuKongIMChannel;
+#[cfg(feature = "channel-dawnIM")]
+pub use crate::dawn_im::DawnIMChannel;
 pub use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 // Local channel types (in misc, not zeroclaw-channels)
 pub use crate::cli::CliChannel;
@@ -4041,7 +4041,7 @@ async fn process_channel_message_body(
     // events (AgentStart / LlmRequest / ToolCallStart / ToolCall / AgentEnd /
     // Error) get translated to status text and fire `update_draft_progress`
     // on the target channel. Decoupled from draft streaming so channels
-    // that only want ephemeral status (e.g. WuKongIM) can opt in by
+    // that only want ephemeral status (e.g. DawnIM) can opt in by
     // overriding `update_draft_progress` alone. No-op when no target
     // channel is available or no toggle is enabled in config.
     let progress_observer: Arc<dyn Observer> = match target_channel.as_ref() {
@@ -4646,8 +4646,8 @@ async fn process_channel_message_body(
                 // channel implementations can intercept it in `send()` and show
                 // a localised message. Channels that don't intercept will
                 // surface the raw code — by design, so the operator notices
-                // and adds an intercept for their channel. WuKongIM (see
-                // `wukongim/channel.rs` `send()`) is the first interceptor;
+                // and adds an intercept for their channel. DawnIM (see
+                // `dawn_im/channel.rs` `send()`) is the first interceptor;
                 // other channels render the ERR code verbatim until they grow
                 // their own.
                 let error_text = "ERR:context_window_exceeded";
@@ -6296,9 +6296,9 @@ fn collect_configured_channels(
         });
     }
 
-    #[cfg(feature = "channel-wukongim")]
-    for (alias, wk) in &config.channels.wukongim {
-        if !active_channel_aliases.contains(&format!("wukongim.{alias}")) {
+    #[cfg(feature = "channel-dawnIM")]
+    for (alias, wk) in &config.channels.dawn_im {
+        if !active_channel_aliases.contains(&format!("dawnIM.{alias}")) {
             continue;
         }
         if !wk.enabled {
@@ -6308,7 +6308,7 @@ fn collect_configured_channels(
             match zeroclaw_memory::SqliteMemory::new_named(
                 "sqlite",
                 &config.data_dir,
-                &format!("wukongim_{alias}"),
+                &format!("dawn_im_{alias}"),
             ) {
                 Ok(mem) => Arc::new(mem),
                 Err(e) => {
@@ -6320,15 +6320,15 @@ fn collect_configured_channels(
                                 "error": format!("{}", e),
                                 "alias": alias,
                             })),
-                        "wukongim: failed to open sqlite memory backend"
+                        "dawnIM: failed to open sqlite memory backend"
                     );
                     continue;
                 }
             };
         channels.push(ConfiguredChannel {
-            display_name: "WuKongIM",
+            display_name: "DawnIM",
             alias: Some(alias.clone()),
-            channel: Arc::new(WuKongIMChannel::from_config(
+            channel: Arc::new(DawnIMChannel::from_config(
                 wk,
                 alias.clone(),
                 &config.data_dir,
@@ -8747,14 +8747,14 @@ pub async fn deliver_announcement(
         "wechat" => {
             anyhow::bail!("WeChat channel requires the `channel-wechat` feature");
         }
-        #[cfg(feature = "channel-wukongim")]
-        "wukongim" => {
+        #[cfg(feature = "channel-dawnIM")]
+        "dawnIM" => {
             let wk = config
                 .channels
-                .wukongim
+                .dawn_im
                 .get(alias)
                 .ok_or_else(not_configured)?;
-            let peers = config.channel_external_peers("wukongim", alias);
+            let peers = config.channel_external_peers("dawnIM", alias);
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
             let _ = peer_resolver;
@@ -8762,15 +8762,15 @@ pub async fn deliver_announcement(
                 Arc::new(zeroclaw_memory::SqliteMemory::new_named(
                     "sqlite",
                     &config.data_dir,
-                    &format!("wukongim_{alias}"),
+                    &format!("dawn_im_{alias}"),
                 )?);
             let ch =
-                crate::wukongim::WuKongIMChannel::from_config(wk, alias, &config.data_dir, memory);
+                crate::dawn_im::DawnIMChannel::from_config(wk, alias, &config.data_dir, memory);
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
-        #[cfg(not(feature = "channel-wukongim"))]
-        "wukongim" => {
-            anyhow::bail!("WuKongIM channel requires the `channel-wukongim` feature");
+        #[cfg(not(feature = "channel-dawnIM"))]
+        "dawnIM" => {
+            anyhow::bail!("DawnIM channel requires the `channel-dawnIM` feature");
         }
         #[cfg(feature = "channel-lark")]
         "lark" | "feishu" => {

@@ -1,4 +1,4 @@
-//! Tool-call approval flow for WuKongIM.
+//! Tool-call approval flow for DawnIM.
 //!
 //! Combines the master `approval/mod.rs` (PendingApprovals state) and
 //! `approval/card.rs` (interactive card UI builders) into a single file.

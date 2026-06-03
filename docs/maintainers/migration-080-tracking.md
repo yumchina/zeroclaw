@@ -19,7 +19,7 @@ This report tracks which local-fork functionality has been ported to the
 
 | Area | Commits | Status | Owner of completion |
 |------|---------|--------|---------------------|
-| **A. WuKongIM channel** | ~70 | ✅ Migrated (minus progress_streaming) | `7759e1d52` |
+| **A. DawnIM channel** | ~70 | ✅ Migrated (minus progress_streaming) | `7759e1d52` |
 | **B. dawn_s3 / DawnS3Tool** | 9 | ✅ Migrated (new `dawn-tools` crate) | `688cd30a7` |
 | **C. Web search routing (YumcSearch)** | 2 | ✅ Migrated | `d608b8f1b` |
 | **D. Local logging refactor** | 9 | ⏸️ Deferred (superseded by `zeroclaw-log`) | — |
@@ -36,10 +36,10 @@ This report tracks which local-fork functionality has been ported to the
 
 ---
 
-## A. WuKongIM channel (✅ Migrated — 1 commit on 0.8.0)
+## A. DawnIM channel (✅ Migrated — 1 commit on 0.8.0)
 
 All listed functionality was unified into a single port commit on 0.8.0:
-**`7759e1d52` feat(channels/wukongim): port WuKongIM channel to 0.8.0 architecture**
+**`7759e1d52` feat(channels/wukongim): port DawnIM channel to 0.8.0 architecture**
 
 The port covers everything in this list **except** the explicitly-deferred
 items at the bottom.
@@ -48,18 +48,18 @@ items at the bottom.
 
 | Status | Commit | Title |
 |--------|--------|-------|
-| ✅ | `67c52ee63` | chore(channels): scaffold zeroclaw-channel-wukongim crate with 5 domain modules |
-| ✅ | `d24a550ff` | chore: add default-features = false to zeroclaw-channel-wukongim |
-| ✅ | `c6f54c1f0` | feat(channel-wukongim): add connection module — JSON-RPC types + WS constants |
-| ✅ | `ec4813f65` | feat(channel-wukongim): add messaging module — media download + payload encoding |
-| ✅ | `a74d44b12` | feat(channel-wukongim): add filter module — allowlist + mention detection |
-| ✅ | `047092a90` | feat(channel-wukongim): add approval module — card types + pending state alias |
-| ✅ | `36425401b` | feat(channel-wukongim): add config module — re-export WuKongIMConfig |
-| ✅ | `e1371de5c` | feat(channel-wukongim): implement WuKongIMChannel orchestrating all 5 modules |
-| ✅ | `ab93c51a0` | fix(channel-wukongim): send_rpc leak, health_check URL, FILE constant, timestamp cast |
-| ✅ | `7f00d5230` | refactor(channels): wire zeroclaw-channel-wukongim as optional dep |
-| ✅ | `4f9099eb0` | fix(channels): import WuKongIMChannel via crate re-export |
-| ✅ | `83b852aad` | style(channel-wukongim): cargo fmt |
+| ✅ | `67c52ee63` | chore(channels): scaffold zeroclaw-channel-dawnIM crate with 5 domain modules |
+| ✅ | `d24a550ff` | chore: add default-features = false to zeroclaw-channel-dawnIM |
+| ✅ | `c6f54c1f0` | feat(channel-dawnIM): add connection module — JSON-RPC types + WS constants |
+| ✅ | `ec4813f65` | feat(channel-dawnIM): add messaging module — media download + payload encoding |
+| ✅ | `a74d44b12` | feat(channel-dawnIM): add filter module — allowlist + mention detection |
+| ✅ | `047092a90` | feat(channel-dawnIM): add approval module — card types + pending state alias |
+| ✅ | `36425401b` | feat(channel-dawnIM): add config module — re-export DawnIMConfig |
+| ✅ | `e1371de5c` | feat(channel-dawnIM): implement DawnIMChannel orchestrating all 5 modules |
+| ✅ | `ab93c51a0` | fix(channel-dawnIM): send_rpc leak, health_check URL, FILE constant, timestamp cast |
+| ✅ | `7f00d5230` | refactor(channels): wire zeroclaw-channel-dawnIM as optional dep |
+| ✅ | `4f9099eb0` | fix(channels): import DawnIMChannel via crate re-export |
+| ✅ | `83b852aad` | style(channel-dawnIM): cargo fmt |
 
 > **0.8.0 change**: inlined as `crates/zeroclaw-channels/src/wukongim/` sub-module (not separate crate).
 
@@ -67,13 +67,13 @@ items at the bottom.
 
 | Status | Commit | Title |
 |--------|--------|-------|
-| ✅ | `365f0b616` | feat(wukongim): 集成 WuKongIM JSON-RPC 消息频道 |
+| ✅ | `365f0b616` | feat(wukongim): 集成 DawnIM JSON-RPC 消息频道 |
 | ✅ | `4cf83c1b0` | feat(wukongim): fix message delivery and add group chat support |
-| ✅ | `cb6e31424` | feat(channel): 支持WuKongIM的Markdown消息类型处理 |
-| ✅ | `c27e8e6ec` | feat(channel): 增强WuKongIM channel的文件上传功能 |
+| ✅ | `cb6e31424` | feat(channel): 支持DawnIM的Markdown消息类型处理 |
+| ✅ | `c27e8e6ec` | feat(channel): 增强DawnIM channel的文件上传功能 |
 | ✅ | `7a7c7cfb8` | fix(wukongim): 修复编译错误和 clippy 警告 |
 | ✅ | `12d8b1c7c` | style: 格式化代码并修复 lint 问题 |
-| ✅ | `e0292befa` | feat(channel-wukongim): read device_id and device_flag from config |
+| ✅ | `e0292befa` | feat(channel-dawnIM): read device_id and device_flag from config |
 | ✅ | `cb1d62a72` | feat(channels/wukongim): read device_id and device_flag from config (dup branch) |
 
 ### A.3 Approval flow (v1 → v2 → polish)
@@ -86,7 +86,7 @@ items at the bottom.
 | ✅ | `903e1ed1e` | test(wukongim): add tests for approval flow structs |
 | ✅ | `13d12dbb7` | feat(wukongim): simplify approval UI and refactor message types to constants |
 | ✅ | `fe05425ad` | feat(wukongim): (dup) simplify approval UI and refactor message types |
-| ✅ | `1c04e9811` | feat: 优化 WuKongIM 审批流卡片及消息发送接收逻辑 |
+| ✅ | `1c04e9811` | feat: 优化 DawnIM 审批流卡片及消息发送接收逻辑 |
 | ✅ | `5be6a0e7c` | fix(channels): add missing actions field in WkApprovalCard test |
 | ✅ | `3939c90b9` | feat(channels): localize approval card title to Chinese |
 | ✅ | `34d9a05a7` | merge: feat/wukongim-approval-v2 |
@@ -115,13 +115,13 @@ items at the bottom.
 | ✅ | `7d33de305` | feat(wukongim): add file download to workspace function |
 | ✅ | `c294711e4` | feat(wukongim): rename and extend process_markdown_resources to handle files |
 | ✅ | `ba54567c6` | feat(wukongim): update re-exports for file download functionality |
-| ✅ | `b0203af0b` | feat(wukongim): add workspace_dir field to WuKongIMChannel |
+| ✅ | `b0203af0b` | feat(wukongim): add workspace_dir field to DawnIMChannel |
 | ✅ | `d69692c72` | feat(wukongim): use process_markdown_resources in message handling |
-| ✅ | `a488a45ff` | feat(wukongim): pass workspace_dir to WuKongIMChannel |
+| ✅ | `a488a45ff` | feat(wukongim): pass workspace_dir to DawnIMChannel |
 | ✅ | `696a668ef` | fix(wukongim): address clippy warning and formatting |
 | ✅ | `71edf265b` | feat(wukongim): download type=5 FILE messages to workspace |
-| ✅ | `647fbec8b` | docs: mark WuKongIM file download feature as implemented |
-| ✅ | `43f804efd` | feat(channel-wukongim): support configurable downloads_dir |
+| ✅ | `647fbec8b` | docs: mark DawnIM file download feature as implemented |
+| ✅ | `43f804efd` | feat(channel-dawnIM): support configurable downloads_dir |
 | ✅ | `061800c66` | style: fix fmt issues |
 | ✅ | `443b900bd` | fix(wukongim): remove unused workspace_dir field |
 | ✅ | `4f62a5dda` | remote record.dir to allowed_roots |
@@ -130,7 +130,7 @@ items at the bottom.
 
 | Status | Commit | Title |
 |--------|--------|-------|
-| ✅ | `a60b478d5` | feat: WuKongIM historical message sync via memory traits |
+| ✅ | `a60b478d5` | feat: DawnIM historical message sync via memory traits |
 | ✅ | `b41f7ea17` | fix(wukongim): align sync protocol + file-based state persistence |
 | ✅ | `66fcca3f4` | 提交离线消息处理 (offline message handling) |
 | ✅ | `590582ac4` | modify offline |
@@ -155,13 +155,13 @@ lands and we can re-implement on top of it.
 
 | Status | Commit | Title |
 |--------|--------|-------|
-| ⏸️ | `54e88a764` | feat(channel-wukongim): add progress_streaming opt-in field |
-| ⏸️ | `645de638a` | feat(channel-wukongim): implement send_status_update and send_cmd_message |
+| ⏸️ | `54e88a764` | feat(channel-dawnIM): add progress_streaming opt-in field |
+| ⏸️ | `645de638a` | feat(channel-dawnIM): implement send_status_update and send_cmd_message |
 | ⏸️ | `fb9d11b4d` | fix(wukongim): base64-encode cmd payload before sending |
 | ⏸️ | `38d0e716a` | fix(wukongim): change status update to type=23 content message |
 | ⏸️ | `7bb9ecd4a` | refactor(wukongim): rename send_cmd_message to send_status_message |
 | ⏸️ | `af1aef21e` | feat(wukongim): update default ack message |
-| ⏸️ | `f2fbd542e` | fix(channel-wukongim): add failure messages and from_config mapping |
+| ⏸️ | `f2fbd542e` | fix(channel-dawnIM): add failure messages and from_config mapping |
 
 ---
 
@@ -314,7 +314,7 @@ overriding the trait method:
 - **Slack** — `update_draft_progress` calls `set_assistant_status`,
   rendering the latest status in the assistant banner above the input.
   No extra chat noise.
-- **WuKongIM** — sends the text as a `noPersist: true` + `redDot: false`
+- **DawnIM** — sends the text as a `noPersist: true` + `redDot: false`
   chat message with a 💭 prefix. Broadcast to currently-connected clients,
   not persisted to history, doesn't bump unread counters. (Master's
   `progress_streaming` Area A item is satisfied by this — no separate
@@ -327,7 +327,7 @@ overriding the trait method:
 - `LlmRequest` is the only signal mapped to "thinking" today;
   `LlmResponse` is not surfaced (matches master's design).
 - No rate-limiting layer in the observer itself. Slack's
-  `set_assistant_status` is rate-limited server-side; WuKongIM's
+  `set_assistant_status` is rate-limited server-side; DawnIM's
   `send_rpc("send")` is not, so under a fast tool storm each
   `ToolCallStart` would spawn one RPC. If this becomes hot, add a
   per-recipient debounce in `ProgressObserver::record_event` (~10
@@ -432,8 +432,8 @@ remained relevant are ported together in
 | Status | Commit | Title |
 |--------|--------|-------|
 | ✅ | `f10b6b0a8` | feat: working_dir + skill_directory — **already ported via Area L** (`b46b802de`) |
-| ✅ | `37284dcc7` | feat(channels): structured error codes + context-window user message — orchestrator emits `ERR:context_window_exceeded`; WuKongIM intercepts (Area A); structured logging at the same site was already in 0.8.0 |
-| 🟡 | `fbea7dc70` | feat(channels): wukongim + cron scheduling — sub-features ported piecemeal: `maybe_inject` allowlist + cron_add enum + cron_add description + system_prompt UTC note + `deliver_announcement` arm; `cron/mod.rs` validator + WuKongIM approval card both **moot** (Area A already handled) |
+| ✅ | `37284dcc7` | feat(channels): structured error codes + context-window user message — orchestrator emits `ERR:context_window_exceeded`; DawnIM intercepts (Area A); structured logging at the same site was already in 0.8.0 |
+| 🟡 | `fbea7dc70` | feat(channels): wukongim + cron scheduling — sub-features ported piecemeal: `maybe_inject` allowlist + cron_add enum + cron_add description + system_prompt UTC note + `deliver_announcement` arm; `cron/mod.rs` validator + DawnIM approval card both **moot** (Area A already handled) |
 | ⏸️ | `f96238e45` | fix(channels): reply-intent classifier honor image attachments — **deferred**: 0.8.0 rewrote `classify_channel_reply_intent` with a 4-way typology + explicit "default REPLY" rule; master's regression doesn't reproduce on the new prompt |
 | 🟡 | `80db3718d` | fix(channels,runtime): preserve tool_calls JSON across consecutive assistants — orchestrator half ported (`normalize_cached_channel_turns` + `looks_like_tool_calls_json` + 2 tests); `history_pruner.rs` half **already covered** by upstream (which independently shipped the same `PrunedOrphans` / `extract_assistant_tool_call_ids` structural fix) |
 | ⏸️ | `2a9e3c488` | docs(contributing): add zh-CN developer guide — skipped (written against pre-V3 crate layout; would mislead new contributors on the current structure) |
@@ -567,8 +567,8 @@ or deferred work, or targets files that no longer exist on this branch.
 
 | Status | Commit | Title |
 |--------|--------|-------|
-| ⏸️ | `e95a51288` | docs: WuKongIM file download implementation plan — historical, feature done in Area A |
-| ⏸️ | `3cdc23601` | docs: WuKongIM file download feature design spec — historical, feature done in Area A |
+| ⏸️ | `e95a51288` | docs: DawnIM file download implementation plan — historical, feature done in Area A |
+| ⏸️ | `3cdc23601` | docs: DawnIM file download feature design spec — historical, feature done in Area A |
 | ⏸️ | `404888fa4` | docs: clarify blacklisted file handling in data flow — 1-line tweak to the above spec |
 | ⏸️ | `d957d2ee5` | docs(plan): progress streaming implementation plan — paired with **deferred** Area E |
 | ⏸️ | `76bf5b723` | docs(spec): progress streaming via sidelined observer — paired with **deferred** Area E |
@@ -615,7 +615,7 @@ Based on dependency and risk:
 ## Verification
 
 After each batch is migrated, run:
-- `cargo check --all-targets --features channel-wukongim`
+- `cargo check --all-targets --features channel-dawnIM`
 - `cargo clippy --all-targets -- -D warnings`
 - `cargo test --workspace`
 - `./dev/ci.sh all` for full validation

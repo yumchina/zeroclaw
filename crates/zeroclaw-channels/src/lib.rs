@@ -87,5 +87,5 @@ pub mod whatsapp;
 pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_web;
-#[cfg(feature = "channel-wukongim")]
-pub mod wukongim;
+#[cfg(feature = "channel-dawnIM")]
+pub mod dawn_im;

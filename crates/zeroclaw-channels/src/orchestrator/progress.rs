@@ -4,7 +4,7 @@
 //! Chinese status text and calls `Channel::update_draft_progress` directly
 //! (fire-and-forget). Each channel decides how to render the status —
 //! Slack shows it in the assistant status banner via `set_assistant_status`;
-//! WuKongIM sends it as a `noPersist` ephemeral chat message; others can
+//! DawnIM sends it as a `noPersist` ephemeral chat message; others can
 //! plug in their own implementation by overriding the trait method.
 //!
 //! Translation logic mirrors the master-fork `progress-observer` crate but
@@ -118,7 +118,7 @@ pub(crate) fn event_to_status(
 /// so this wrapper never breaks an existing chain.
 ///
 /// `draft_message_id` is forwarded verbatim to the channel; channels that
-/// don't need it (today: WuKongIM, Slack via `set_assistant_status`)
+/// don't need it (today: DawnIM, Slack via `set_assistant_status`)
 /// simply ignore the argument.
 pub(crate) struct ProgressObserver {
     inner: Arc<dyn Observer>,

@@ -1,4 +1,4 @@
-//! WebSocket connection + JSON-RPC 2.0 protocol types for WuKongIM.
+//! WebSocket connection + JSON-RPC 2.0 protocol types for DawnIM.
 
 use std::time::Duration;
 
@@ -6,7 +6,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 
-pub const WUKONGIM_RPC_VERSION: &str = "2.0";
+pub const DAWN_IM_RPC_VERSION: &str = "2.0";
 
 pub const PING_INTERVAL: Duration = Duration::from_secs(30);
 pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
