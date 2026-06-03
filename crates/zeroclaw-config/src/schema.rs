@@ -10812,6 +10812,7 @@ impl ChannelsConfig {
                 configured: !self.webhook.is_empty(),
             },
             ChannelInfo {
+                kind: "wukongim",
                 name: "WuKongIM",
                 desc: "WuKongIM messaging platform",
                 configured: !self.wukongim.is_empty(),
