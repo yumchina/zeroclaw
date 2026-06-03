@@ -1043,61 +1043,74 @@ impl Agent {
         );
 
         // First try to find tool in static registry, then in activated MCP tools.
-        let (result, success) =
-            if let Some(tool) = self.tools.iter().find(|t| t.name() == tool_name) {
-                match tool.execute(tool_args.clone()).await {
-                    Ok(r) => {
-                        self.observer.record_event(&ObserverEvent::ToolCall {
-                            tool: tool_name.clone(),
-                            duration: start.elapsed(),
-                            success: r.success,
-                        });
-                        if r.success {
-                            (r.output, true)
-                        } else {
-                            (format!("Error: {}", r.error.unwrap_or(r.output)), false)
-                        }
-                    }
-                    Err(e) => {
-                        self.observer.record_event(&ObserverEvent::ToolCall {
-                            tool: tool_name.clone(),
-                            duration: start.elapsed(),
-                            success: false,
-                        });
-                        (format!("Error executing {}: {e}", tool_name), false)
-                    }
-                }
-            } else if let Some(activated_arc) = self.activated_tools.as_ref() {
-                let activated_opt = activated_arc.lock().unwrap().get_resolved(&tool_name);
-                if let Some(tool) = activated_opt {
-                    match tool.execute(tool_args.clone()).await {
-                        Ok(r) => {
-                            self.observer.record_event(&ObserverEvent::ToolCall {
-                                tool: tool_name.clone(),
-                                duration: start.elapsed(),
-                                success: r.success,
-                            });
-                            if r.success {
-                                (r.output, true)
-                            } else {
-                                (format!("Error: {}", r.error.unwrap_or(r.output)), false)
+        let call_id = call.tool_call_id.clone();
+        let name_opt = Some(tool_name.clone());
+        let (result, success) = zeroclaw_api::CURRENT_TOOL_CALL_ID
+            .scope(call_id, async {
+                zeroclaw_api::CURRENT_TOOL_NAME
+                    .scope(name_opt, async {
+                        if let Some(tool) = self.tools.iter().find(|t| t.name() == tool_name) {
+                            match tool.execute(tool_args.clone()).await {
+                                Ok(r) => {
+                                    self.observer.record_event(&ObserverEvent::ToolCall {
+                                        tool: tool_name.clone(),
+                                        duration: start.elapsed(),
+                                        success: r.success,
+                                    });
+                                    if r.success {
+                                        (r.output, true)
+                                    } else {
+                                        (format!("Error: {}", r.error.unwrap_or(r.output)), false)
+                                    }
+                                }
+                                Err(e) => {
+                                    self.observer.record_event(&ObserverEvent::ToolCall {
+                                        tool: tool_name.clone(),
+                                        duration: start.elapsed(),
+                                        success: false,
+                                    });
+                                    (format!("Error executing {}: {e}", tool_name), false)
+                                }
                             }
+                        } else if let Some(activated_arc) = self.activated_tools.as_ref() {
+                            let activated_opt =
+                                activated_arc.lock().unwrap().get_resolved(&tool_name);
+                            if let Some(tool) = activated_opt {
+                                match tool.execute(tool_args.clone()).await {
+                                    Ok(r) => {
+                                        self.observer.record_event(&ObserverEvent::ToolCall {
+                                            tool: tool_name.clone(),
+                                            duration: start.elapsed(),
+                                            success: r.success,
+                                        });
+                                        if r.success {
+                                            (r.output, true)
+                                        } else {
+                                            (
+                                                format!("Error: {}", r.error.unwrap_or(r.output)),
+                                                false,
+                                            )
+                                        }
+                                    }
+                                    Err(e) => {
+                                        self.observer.record_event(&ObserverEvent::ToolCall {
+                                            tool: tool_name.clone(),
+                                            duration: start.elapsed(),
+                                            success: false,
+                                        });
+                                        (format!("Error executing {}: {e}", tool_name), false)
+                                    }
+                                }
+                            } else {
+                                (format!("Unknown tool: {}", tool_name), false)
+                            }
+                        } else {
+                            (format!("Unknown tool: {}", tool_name), false)
                         }
-                        Err(e) => {
-                            self.observer.record_event(&ObserverEvent::ToolCall {
-                                tool: tool_name.clone(),
-                                duration: start.elapsed(),
-                                success: false,
-                            });
-                            (format!("Error executing {}: {e}", tool_name), false)
-                        }
-                    }
-                } else {
-                    (format!("Unknown tool: {}", tool_name), false)
-                }
-            } else {
-                (format!("Unknown tool: {}", tool_name), false)
-            };
+                    })
+                    .await
+            })
+            .await;
 
         let duration = start.elapsed();
 

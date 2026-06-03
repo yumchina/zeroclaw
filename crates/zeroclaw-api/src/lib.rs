@@ -39,4 +39,10 @@ tokio::task_local! {
     /// Session key for the currently active session.
     /// Scoped by gateway and channel turns, read by SessionsCurrentTool.
     pub static TOOL_LOOP_SESSION_KEY: Option<String>;
+
+    /// Current tool call ID. Set by the agent loop / tool executor, read by the progress observer and channel.
+    pub static CURRENT_TOOL_CALL_ID: Option<String>;
+
+    /// Current tool name. Set by the agent loop / tool executor, read by the progress observer and channel.
+    pub static CURRENT_TOOL_NAME: Option<String>;
 }

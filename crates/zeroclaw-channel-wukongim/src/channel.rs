@@ -11,14 +11,14 @@ use tokio::sync::RwLock;
 use tokio_tungstenite::tungstenite::Message as WsMsg;
 use uuid::Uuid;
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
-    ChannelInterventionRequest, ChannelInterventionResponse,
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelInterventionRequest,
+    ChannelInterventionResponse, ChannelMessage, SendMessage, StatusPhase,
 };
 use zeroclaw_api::memory_traits::{Memory, MemoryCategory};
 
 use crate::approval::{
-    ActivePendingApproval, PendingApprovals, WkApprovalAction, build_approval_card,
-    PendingInterventions, build_intervention_card,
+    ActivePendingApproval, PendingApprovals, PendingInterventions, WkApprovalAction,
+    build_approval_card, build_intervention_card,
 };
 use crate::config::WuKongIMConfig;
 use crate::connection::{
@@ -660,7 +660,10 @@ impl WuKongIMChannel {
 
             for key in keys_to_deny {
                 if let Some(active_approval) = pending.remove(&key) {
-                    tracing::info!("WuKongIM: Implicit Deny triggered for pending approval {} due to new message", key);
+                    tracing::info!(
+                        "WuKongIM: Implicit Deny triggered for pending approval {} due to new message",
+                        key
+                    );
                     let _ = active_approval.tx.send(ChannelApprovalResponse::Deny);
                 }
             }
@@ -1200,14 +1203,49 @@ impl Channel for WuKongIMChannel {
             return Ok(());
         }
         let (channel_id, channel_type) = parse_recipient(recipient);
-        let payload = serde_json::json!({
-            "type": 23,
-            "content": {
-                "title": phase_to_content(&update.phase),
-                "mid": update.execution_id,
-                "type": update.name,
-                "desc": update.desc,
+
+        let status_str = match &update.phase {
+            StatusPhase::AgentStart => "agent_start",
+            StatusPhase::LlmThinking => "thinking",
+            StatusPhase::ToolStart => "tool_start",
+            StatusPhase::ToolDone { success: true, .. } => "tool_success",
+            StatusPhase::ToolDone { success: false, .. } => "tool_failed",
+            StatusPhase::Error => "error",
+            StatusPhase::AgentEnd => "agent_end",
+        };
+
+        let mut content = serde_json::json!({
+            "title": phase_to_content(&update.phase),
+            "mid": update.execution_id,
+            "type": update.name,
+            "desc": update.desc,
+            "status": status_str,
+        });
+
+        // Read from task locals
+        let tool_call_id = zeroclaw_api::CURRENT_TOOL_CALL_ID.with(|id| id.clone());
+        let tool_name = zeroclaw_api::CURRENT_TOOL_NAME.with(|name| name.clone());
+
+        if let Some(obj) = content.as_object_mut() {
+            if let Some(ref name) = tool_name {
+                obj.insert("tool_name".to_string(), serde_json::json!(name));
             }
+            if let Some(ref call_id) = tool_call_id {
+                obj.insert("tool_call_id".to_string(), serde_json::json!(call_id));
+            }
+            if let StatusPhase::ToolDone {
+                success,
+                elapsed_ms,
+            } = update.phase
+            {
+                obj.insert("success".to_string(), serde_json::json!(success));
+                obj.insert("elapsed_ms".to_string(), serde_json::json!(elapsed_ms));
+            }
+        }
+
+        let payload = serde_json::json!({
+            "type": WkMessageType::STATUS_UPDATE,
+            "content": content
         });
         self.send_status_message(&channel_id, channel_type, payload)
             .await
@@ -1411,16 +1449,13 @@ impl Channel for WuKongIMChannel {
         };
         let (otx, orx) = tokio::sync::oneshot::channel();
         let recipient_key = format!("{channel_id}:{channel_type}");
-        self.pending_approvals
-            .write()
-            .await
-            .insert(
-                approval_id.clone(),
-                ActivePendingApproval {
-                    tx: otx,
-                    recipient: recipient_key,
-                },
-            );
+        self.pending_approvals.write().await.insert(
+            approval_id.clone(),
+            ActivePendingApproval {
+                tx: otx,
+                recipient: recipient_key,
+            },
+        );
         self.send_rpc::<_, serde_json::Value>("send", params)
             .await?;
         match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), orx).await {
@@ -1465,7 +1500,10 @@ impl Channel for WuKongIMChannel {
         match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), orx).await {
             Ok(Ok(resp)) => Ok(Some(resp)),
             _ => {
-                self.pending_interventions.write().await.remove(&approval_id);
+                self.pending_interventions
+                    .write()
+                    .await
+                    .remove(&approval_id);
                 Ok(Some(ChannelInterventionResponse::Cancel))
             }
         }
