@@ -40,105 +40,117 @@ pub struct ToolExecutionOutcome {
 pub async fn execute_one_tool(
     call_name: &str,
     call_arguments: serde_json::Value,
+    tool_call_id: Option<String>,
     tools_registry: &[Box<dyn Tool>],
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
     receipt_generator: Option<&super::tool_receipts::ReceiptGenerator>,
 ) -> Result<ToolExecutionOutcome> {
-    let args_summary = truncate_with_ellipsis(&call_arguments.to_string(), 300);
-    observer.record_event(&ObserverEvent::ToolCallStart {
-        tool: call_name.to_string(),
-        arguments: Some(args_summary),
-    });
-    let start = Instant::now();
+    let call_id = tool_call_id.clone();
+    let name_opt = Some(call_name.to_string());
 
-    let static_tool = find_tool(tools_registry, call_name);
-    let activated_arc = if static_tool.is_none() {
-        activated_tools.and_then(|at| at.lock().unwrap().get_resolved(call_name))
-    } else {
-        None
-    };
-    let Some(tool) = static_tool.or(activated_arc.as_deref()) else {
-        let reason = format!("Unknown tool: {call_name}");
-        let duration = start.elapsed();
-        observer.record_event(&ObserverEvent::ToolCall {
-            tool: call_name.to_string(),
-            duration,
-            success: false,
-        });
-        return Ok(ToolExecutionOutcome {
-            output: reason.clone(),
-            success: false,
-            error_reason: Some(scrub_credentials(&reason)),
-            duration,
-            receipt: None,
-        });
-    };
+    zeroclaw_api::CURRENT_TOOL_CALL_ID
+        .scope(call_id, async move {
+            zeroclaw_api::CURRENT_TOOL_NAME
+                .scope(name_opt, async move {
+                    let args_summary = truncate_with_ellipsis(&call_arguments.to_string(), 300);
+                    observer.record_event(&ObserverEvent::ToolCallStart {
+                        tool: call_name.to_string(),
+                        arguments: Some(args_summary),
+                    });
+                    let start = Instant::now();
 
-    let tool_future = tool.execute(call_arguments.clone());
-    let tool_result = if let Some(token) = cancellation_token {
-        tokio::select! {
-            () = token.cancelled() => return Err(ToolLoopCancelled.into()),
-            result = tool_future => result,
-        }
-    } else {
-        tool_future.await
-    };
+                    let static_tool = find_tool(tools_registry, call_name);
+                    let activated_arc = if static_tool.is_none() {
+                        activated_tools.and_then(|at| at.lock().unwrap().get_resolved(call_name))
+                    } else {
+                        None
+                    };
+                    let Some(tool) = static_tool.or(activated_arc.as_deref()) else {
+                        let reason = format!("Unknown tool: {call_name}");
+                        let duration = start.elapsed();
+                        observer.record_event(&ObserverEvent::ToolCall {
+                            tool: call_name.to_string(),
+                            duration,
+                            success: false,
+                        });
+                        return Ok(ToolExecutionOutcome {
+                            output: reason.clone(),
+                            success: false,
+                            error_reason: Some(scrub_credentials(&reason)),
+                            duration,
+                            receipt: None,
+                        });
+                    };
 
-    match tool_result {
-        Ok(r) => {
-            let duration = start.elapsed();
-            observer.record_event(&ObserverEvent::ToolCall {
-                tool: call_name.to_string(),
-                duration,
-                success: r.success,
-            });
-            if r.success {
-                let normalized_output = if r.output.is_empty() {
-                    "(no output)"
-                } else {
-                    &r.output
-                };
-                let output = scrub_credentials(normalized_output);
-                let receipt = receipt_generator.map(|receipt_gen| {
-                    receipt_gen.generate_now(call_name, &call_arguments, &output)
-                });
-                Ok(ToolExecutionOutcome {
-                    output,
-                    success: true,
-                    error_reason: None,
-                    duration,
-                    receipt,
+                    let tool_future = tool.execute(call_arguments.clone());
+                    let tool_result = if let Some(token) = cancellation_token {
+                        tokio::select! {
+                            () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+                            result = tool_future => result,
+                        }
+                    } else {
+                        tool_future.await
+                    };
+
+                    match tool_result {
+                        Ok(r) => {
+                            let duration = start.elapsed();
+                            observer.record_event(&ObserverEvent::ToolCall {
+                                tool: call_name.to_string(),
+                                duration,
+                                success: r.success,
+                            });
+                            if r.success {
+                                let normalized_output = if r.output.is_empty() {
+                                    "(no output)"
+                                } else {
+                                    &r.output
+                                };
+                                let output = scrub_credentials(normalized_output);
+                                let receipt = receipt_generator.map(|receipt_gen| {
+                                    receipt_gen.generate_now(call_name, &call_arguments, &output)
+                                });
+                                Ok(ToolExecutionOutcome {
+                                    output,
+                                    success: true,
+                                    error_reason: None,
+                                    duration,
+                                    receipt,
+                                })
+                            } else {
+                                let reason = r.error.unwrap_or(r.output);
+                                Ok(ToolExecutionOutcome {
+                                    output: format!("Error: {reason}"),
+                                    success: false,
+                                    error_reason: Some(scrub_credentials(&reason)),
+                                    duration,
+                                    receipt: None,
+                                })
+                            }
+                        }
+                        Err(e) => {
+                            let duration = start.elapsed();
+                            observer.record_event(&ObserverEvent::ToolCall {
+                                tool: call_name.to_string(),
+                                duration,
+                                success: false,
+                            });
+                            let reason = format!("Error executing {call_name}: {e}");
+                            Ok(ToolExecutionOutcome {
+                                output: reason.clone(),
+                                success: false,
+                                error_reason: Some(scrub_credentials(&reason)),
+                                duration,
+                                receipt: None,
+                            })
+                        }
+                    }
                 })
-            } else {
-                let reason = r.error.unwrap_or(r.output);
-                Ok(ToolExecutionOutcome {
-                    output: format!("Error: {reason}"),
-                    success: false,
-                    error_reason: Some(scrub_credentials(&reason)),
-                    duration,
-                    receipt: None,
-                })
-            }
-        }
-        Err(e) => {
-            let duration = start.elapsed();
-            observer.record_event(&ObserverEvent::ToolCall {
-                tool: call_name.to_string(),
-                duration,
-                success: false,
-            });
-            let reason = format!("Error executing {call_name}: {e}");
-            Ok(ToolExecutionOutcome {
-                output: reason.clone(),
-                success: false,
-                error_reason: Some(scrub_credentials(&reason)),
-                duration,
-                receipt: None,
-            })
-        }
-    }
+                .await
+        })
+        .await
 }
 
 // ── Parallel / sequential decision ───────────────────────────────────────
@@ -186,6 +198,7 @@ pub async fn execute_tools_parallel(
             execute_one_tool(
                 &call.name,
                 call.arguments.clone(),
+                call.tool_call_id.clone(),
                 tools_registry,
                 activated_tools,
                 observer,
@@ -216,6 +229,7 @@ pub async fn execute_tools_sequential(
             execute_one_tool(
                 &call.name,
                 call.arguments.clone(),
+                call.tool_call_id.clone(),
                 tools_registry,
                 activated_tools,
                 observer,

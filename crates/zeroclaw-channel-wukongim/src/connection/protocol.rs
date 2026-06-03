@@ -12,6 +12,7 @@ impl WkMessageType {
     pub const MARKDOWN: u32 = 14;
     pub const INTERACTIVE_CARD: u32 = 20;
     pub const INTERACTIVE_RESPONSE: u32 = 21;
+    pub const STATUS_UPDATE: u32 = 23;
     pub const CMD: u32 = 99;
 }
 
@@ -186,6 +187,7 @@ mod tests {
         assert_eq!(WkMessageType::MARKDOWN, 14);
         assert_eq!(WkMessageType::INTERACTIVE_CARD, 20);
         assert_eq!(WkMessageType::INTERACTIVE_RESPONSE, 21);
+        assert_eq!(WkMessageType::STATUS_UPDATE, 23);
         assert_eq!(WkMessageType::CMD, 99);
     }
 

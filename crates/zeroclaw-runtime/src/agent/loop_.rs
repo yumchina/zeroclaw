@@ -1329,7 +1329,10 @@ pub async fn run_tool_call_loop(
 
                 // 打印 LLM 响应内容
                 let response_preview = if response_text.len() > 1000 {
-                    let end = (0..=1000).rev().find(|&i| response_text.is_char_boundary(i)).unwrap_or(0);
+                    let end = (0..=1000)
+                        .rev()
+                        .find(|&i| response_text.is_char_boundary(i))
+                        .unwrap_or(0);
                     format!("{}...", &response_text[..end])
                 } else {
                     response_text.clone()
@@ -4134,6 +4137,7 @@ mod tests {
         let result = execute_one_tool(
             "unknown_tool",
             call_arguments,
+            None,
             &[],
             None,
             &observer,
@@ -4165,6 +4169,7 @@ mod tests {
         let outcome = execute_one_tool(
             "extract_text",
             serde_json::json!({ "value": "ok" }),
+            None,
             &[],
             Some(&activated),
             &observer,
@@ -4187,6 +4192,7 @@ mod tests {
         let outcome = execute_one_tool(
             "empty_success",
             serde_json::json!({}),
+            None,
             &tools,
             None,
             &observer,

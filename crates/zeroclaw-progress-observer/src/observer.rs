@@ -85,17 +85,27 @@ impl Observer for ProgressReportingObserver {
             let ch = Arc::clone(&self.target_channel);
             let recip = self.recipient.clone();
             let thread = self.thread_ts.clone();
+            let tool_call_id = zeroclaw_api::CURRENT_TOOL_CALL_ID.with(|id| id.clone());
+            let tool_name = zeroclaw_api::CURRENT_TOOL_NAME.with(|name| name.clone());
             tokio::spawn(async move {
-                if let Err(e) = ch
-                    .send_status_update(&recip, thread.as_deref(), update)
+                zeroclaw_api::CURRENT_TOOL_CALL_ID
+                    .scope(tool_call_id, async move {
+                        zeroclaw_api::CURRENT_TOOL_NAME
+                            .scope(tool_name, async move {
+                                if let Err(e) = ch
+                                    .send_status_update(&recip, thread.as_deref(), update)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        target: "zeroclaw::progress_observer",
+                                        error = %e,
+                                        "progress status_update failed"
+                                    );
+                                }
+                            })
+                            .await
+                    })
                     .await
-                {
-                    tracing::warn!(
-                        target: "zeroclaw::progress_observer",
-                        error = %e,
-                        "progress status_update failed"
-                    );
-                }
             });
         }
         self.inner.record_event(event);
@@ -109,9 +119,13 @@ impl Observer for ProgressReportingObserver {
         self.inner.flush();
     }
 
-    fn name(&self) -> &str { "progress-reporting" }
+    fn name(&self) -> &str {
+        "progress-reporting"
+    }
 
-    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[cfg(test)]
@@ -126,23 +140,36 @@ mod tests {
         events: Mutex<usize>,
     }
     impl NoopObserver {
-        fn new() -> Self { Self { events: Mutex::new(0) } }
-        fn count(&self) -> usize { *self.events.lock().unwrap() }
+        fn new() -> Self {
+            Self {
+                events: Mutex::new(0),
+            }
+        }
+        fn count(&self) -> usize {
+            *self.events.lock().unwrap()
+        }
     }
     impl Observer for NoopObserver {
         fn record_event(&self, _: &ObserverEvent) {
             *self.events.lock().unwrap() += 1;
         }
         fn record_metric(&self, _: &ObserverMetric) {}
-        fn name(&self) -> &str { "noop" }
-        fn as_any(&self) -> &dyn std::any::Any { self }
+        fn name(&self) -> &str {
+            "noop"
+        }
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
 
     fn all_on() -> ProgressEventToggles {
         ProgressEventToggles {
-            agent_start: true, agent_end: true,
-            tool_call_start: true, tool_call: true,
-            llm_thinking: true, error: true,
+            agent_start: true,
+            agent_end: true,
+            tool_call_start: true,
+            tool_call: true,
+            llm_thinking: true,
+            error: true,
         }
     }
 
@@ -187,7 +214,8 @@ mod tests {
         );
 
         obs.record_event(&ObserverEvent::AgentStart {
-            provider: "p".into(), model: "m".into(),
+            provider: "p".into(),
+            model: "m".into(),
         });
 
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -211,7 +239,8 @@ mod tests {
 
         obs.record_event(&ObserverEvent::HeartbeatTick);
         obs.record_event(&ObserverEvent::CacheHit {
-            cache_type: "hot".into(), tokens_saved: 50,
+            cache_type: "hot".into(),
+            tokens_saved: 50,
         });
 
         tokio::time::sleep(Duration::from_millis(20)).await;
