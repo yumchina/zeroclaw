@@ -320,11 +320,6 @@ pub struct Config {
     #[nested]
     pub web_fetch: WebFetchConfig,
 
-    /// Dawn S3 file-upload tool configuration (`[dawn_s3]`).
-    #[serde(default)]
-    #[nested]
-    pub dawn_s3: DawnS3Config,
-
     /// Dawn SaaS tools configuration (`[dawn.*]`).
     #[serde(default)]
     #[nested]
@@ -5989,7 +5984,7 @@ pub struct WebFetchConfig {
 /// and returns a download URL the model can share with the user.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "dawn-s3"]
+#[prefix = "s3"]
 pub struct DawnS3Config {
     /// Enable the `dawn_s3` tool. Default: `false`.
     #[serde(default)]
@@ -6325,6 +6320,10 @@ impl Default for DawnWebSearchConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "dawn"]
 pub struct DawnConfig {
+    /// Dawn S3 file-upload tool configuration (`[dawn.s3]`).
+    #[serde(default)]
+    #[nested]
+    pub s3: DawnS3Config,
     /// Dawn enterprise web search tool (`[dawn.web_search]`).
     #[serde(default)]
     #[nested]
@@ -8789,6 +8788,7 @@ pub struct MemoryConfig {
     /// `Config.storage.<backend>.<alias>` at runtime. Bare backend names
     /// (`"sqlite"`) are treated as `"<backend>.default"`. Set to `"none"` to
     /// disable persistence entirely.
+    #[serde(default = "default_memory_backend")]
     pub backend: String,
     /// Auto-save what *you* tell ZeroClaw into memory as conversation history — the agent's own replies are not saved. Turn off if you want memory to only hold things you explicitly record via the memory tool.
     #[serde(default = "default_auto_save")]
@@ -8947,6 +8947,9 @@ fn default_pgvector_dimensions() -> usize {
 
 fn default_embedding_provider() -> String {
     "none".into()
+}
+fn default_memory_backend() -> String {
+    "sqlite".into()
 }
 fn default_auto_save() -> bool {
     true
@@ -13895,7 +13898,6 @@ impl Default for Config {
             multimodal: MultimodalConfig::default(),
             media_pipeline: MediaPipelineConfig::default(),
             web_fetch: WebFetchConfig::default(),
-            dawn_s3: DawnS3Config::default(),
             dawn: DawnConfig::default(),
             link_enricher: LinkEnricherConfig::default(),
             text_browser: TextBrowserConfig::default(),
@@ -17420,7 +17422,6 @@ auto_save = true
             multimodal: MultimodalConfig::default(),
             media_pipeline: MediaPipelineConfig::default(),
             web_fetch: WebFetchConfig::default(),
-            dawn_s3: DawnS3Config::default(),
             dawn: DawnConfig::default(),
             link_enricher: LinkEnricherConfig::default(),
             text_browser: TextBrowserConfig::default(),
@@ -18038,7 +18039,6 @@ default_temperature = 0.7
             multimodal: MultimodalConfig::default(),
             media_pipeline: MediaPipelineConfig::default(),
             web_fetch: WebFetchConfig::default(),
-            dawn_s3: DawnS3Config::default(),
             dawn: DawnConfig::default(),
             link_enricher: LinkEnricherConfig::default(),
             text_browser: TextBrowserConfig::default(),

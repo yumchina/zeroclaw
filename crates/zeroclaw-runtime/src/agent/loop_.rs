@@ -3625,7 +3625,7 @@ pub async fn run(
         ));
         }
         #[cfg(feature = "dawn-tools")]
-        if config.dawn_s3.enabled {
+        if config.dawn.s3.enabled {
             tool_descs.push((
                 "dawn_s3",
                 "Upload a local file to Dawn S3 compatible storage. Returns a download URL. Use when: user needs a shareable link for generated files (reports, presentations, PDFs). Don't use for temporary or intermediate files.",
@@ -4903,7 +4903,7 @@ pub async fn process_message(
             tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
         }
         #[cfg(feature = "dawn-tools")]
-        if config.dawn_s3.enabled {
+        if config.dawn.s3.enabled {
             tool_descs.push((
                 "dawn_s3",
                 "Upload a local file to Dawn S3 and return a shareable URL.",
