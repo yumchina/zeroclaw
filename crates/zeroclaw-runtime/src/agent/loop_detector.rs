@@ -246,22 +246,56 @@ impl LoopDetector {
             }
         }
 
-        if cycles >= MIN_CYCLES + 2 {
-            Some(LoopDetectionResult::Break(format!(
-                "Circuit breaker: tools '{}' and '{}' have been alternating for {} cycles",
-                a_name, b_name, cycles
-            )))
-        } else if cycles > MIN_CYCLES {
-            Some(LoopDetectionResult::Block(format!(
-                "Blocked: tools '{}' and '{}' have been alternating for {} cycles",
+        // Check whether each tool is truly stuck: both args and results must be
+        // stagnant. If either varies, the agent may be making progress (e.g.
+        // running different shell commands that all return "success").
+        let a_stagnant = {
+            let first = extended.iter().find(|r| &r.name == a_name)?;
+            extended
+                .iter()
+                .filter(|r| &r.name == a_name)
+                .all(|r| r.args_hash == first.args_hash && r.result_hash == first.result_hash)
+        };
+        let b_stagnant = {
+            let first = extended.iter().find(|r| &r.name == b_name)?;
+            extended
+                .iter()
+                .filter(|r| &r.name == b_name)
+                .all(|r| r.args_hash == first.args_hash && r.result_hash == first.result_hash)
+        };
+        let is_true_loop = a_stagnant && b_stagnant;
+
+        if is_true_loop {
+            // Both tools stuck — genuine loop. Escalate aggressively.
+            if cycles >= MIN_CYCLES + 2 {
+                Some(LoopDetectionResult::Break(format!(
+                    "Circuit breaker: tools '{}' and '{}' have been alternating for {} cycles",
+                    a_name, b_name, cycles
+                )))
+            } else if cycles > MIN_CYCLES {
+                Some(LoopDetectionResult::Block(format!(
+                    "Blocked: tools '{}' and '{}' have been alternating for {} cycles",
+                    a_name, b_name, cycles
+                )))
+            } else {
+                Some(LoopDetectionResult::Warning(format!(
+                    "Warning: tools '{}' and '{}' appear to be alternating ({} cycles) with identical inputs and outputs. \
+                     Consider a different strategy.",
+                    a_name, b_name, cycles
+                )))
+            }
+        } else if cycles >= MIN_CYCLES + 2 {
+            // Inputs or outputs vary — agent may be making progress.
+            // Only warn, don't block or break.
+            Some(LoopDetectionResult::Warning(format!(
+                "Warning: tools '{}' and '{}' have been alternating for {} cycles, \
+                 but inputs or outputs are changing — may still be making progress. \
+                 Evaluate whether this pattern is productive.",
                 a_name, b_name, cycles
             )))
         } else {
-            Some(LoopDetectionResult::Warning(format!(
-                "Warning: tools '{}' and '{}' appear to be alternating ({} cycles). \
-                 Consider a different strategy.",
-                a_name, b_name, cycles
-            )))
+            // Moderate cycles with varying inputs/outputs — don't interfere.
+            None
         }
     }
 
@@ -417,9 +451,10 @@ mod tests {
         let args = json!({});
 
         // 4 full cycles = 8 calls: A B A B A B A B
+        // Same args + same results for stagnation to trigger.
         for i in 0..8 {
             let name = if i % 2 == 0 { "read" } else { "write" };
-            let result = det.record(name, &args, &format!("r{i}"));
+            let result = det.record(name, &args, "same_output");
             if i < 7 {
                 assert_eq!(result, LoopDetectionResult::Ok, "iteration {i}");
             } else {
@@ -440,13 +475,13 @@ mod tests {
         let mut det = LoopDetector::new(default_config());
         let args = json!({});
 
-        // 5 cycles = 10 calls.  The 10th call (completing cycle 5) triggers Block.
+        // 5 cycles = 10 calls with stagnant args+results.
         for i in 0..10 {
             let name = if i % 2 == 0 { "fetch" } else { "parse" };
-            det.record(name, &args, &format!("r{i}"));
+            det.record(name, &args, "same_output");
         }
         // 11th call extends to 5.5 cycles; detector still counts 5 full -> Block.
-        let r = det.record("fetch", &args, "r10");
+        let r = det.record("fetch", &args, "same_output");
         match r {
             LoopDetectionResult::Block(msg) => {
                 assert!(msg.contains("fetch"));
@@ -593,28 +628,97 @@ mod tests {
         assert_eq!(det.window.front().unwrap().name, "tool_1");
     }
 
-    // ── Ping-pong with varying args ─────────────────────────────
+    // ── Ping-pong with varying inputs/outputs ─────────────────────
 
     #[test]
-    fn ping_pong_detects_alternation_with_varying_args() {
+    fn ping_pong_varying_args_no_detection_at_moderate_cycles() {
         let mut det = LoopDetector::new(default_config());
 
-        // A->B->A->B with different args each time — ping-pong cares only
-        // about tool names, not argument equality.
+        // A->B->A->B with varying args and results — agent is trying
+        // different things, so the detector should not fire at 4 cycles.
         for i in 0..8 {
             let name = if i % 2 == 0 { "read" } else { "write" };
             let args = json!({"attempt": i});
             let result = det.record(name, &args, &format!("r{i}"));
-            if i < 7 {
+            assert_eq!(
+                result,
+                LoopDetectionResult::Ok,
+                "varying inputs/outputs at iteration {i} should be Ok"
+            );
+        }
+    }
+
+    #[test]
+    fn ping_pong_varying_args_warns_at_high_cycles() {
+        let mut det = LoopDetector::new(default_config());
+
+        // 6 full cycles = 12 calls with varying args/results.
+        // Should only warn, not block or break.
+        for i in 0..12 {
+            let name = if i % 2 == 0 { "read" } else { "write" };
+            let args = json!({"attempt": i});
+            let result = det.record(name, &args, &format!("r{i}"));
+            if i < 11 {
                 assert_eq!(result, LoopDetectionResult::Ok, "iteration {i}");
             } else {
                 match result {
                     LoopDetectionResult::Warning(msg) => {
                         assert!(msg.contains("read"));
                         assert!(msg.contains("write"));
-                        assert!(msg.contains("4 cycles"));
+                        assert!(msg.contains("6 cycles"));
+                        assert!(msg.contains("may still be making progress"));
                     }
-                    other => panic!("expected Warning at cycle 4, got {other:?}"),
+                    other => panic!("expected Warning at 6 cycles, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ping_pong_stagnant_args_varying_results_no_escalation() {
+        let mut det = LoopDetector::new(default_config());
+
+        // Same args each time but varying results — tools may be
+        // observing changing state (e.g. re-reading a log file).
+        // Should only warn at high cycles.
+        let args = json!({});
+        for i in 0..12 {
+            let name = if i % 2 == 0 { "read" } else { "write" };
+            let result = det.record(name, &args, &format!("r{i}"));
+            if i < 11 {
+                assert_eq!(result, LoopDetectionResult::Ok, "iteration {i}");
+            } else {
+                match result {
+                    LoopDetectionResult::Warning(_) => {}
+                    other => panic!("expected Warning at 6 cycles, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ping_pong_one_tool_stagnant_one_varying_no_escalation() {
+        let mut det = LoopDetector::new(default_config());
+        let args = json!({});
+
+        // read: always same args + same result (stagnant)
+        // write: same args + varying results (not stagnant)
+        // Only one tool stagnant → not a true loop.
+        for i in 0..12 {
+            let name = if i % 2 == 0 { "read" } else { "write" };
+            let result_str = if i % 2 == 0 {
+                "same_read_output"
+            } else {
+                // Allocate a new string each time so result_hash differs.
+                &format!("write_output_{i}")
+            };
+            let result = det.record(name, &args, result_str);
+            if i < 11 {
+                assert_eq!(result, LoopDetectionResult::Ok, "iteration {i}");
+            } else {
+                match result {
+                    LoopDetectionResult::Warning(_) => {}
+                    other => panic!("expected Warning at 6 cycles, got {other:?}"),
                 }
             }
         }
