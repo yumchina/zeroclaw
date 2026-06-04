@@ -95,7 +95,9 @@ use std::time::{Duration, Instant, SystemTime};
 use tokio_util::sync::CancellationToken;
 use zeroclaw_api::session_keys::sanitize_session_key;
 use zeroclaw_config::schema::Config;
+use zeroclaw_config::schema::ProgressObserverConfig;
 use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
+use zeroclaw_progress_observer::{ProgressEventToggles, ProgressReportingObserver};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, Provider};
 use zeroclaw_runtime::agent::loop_::{
@@ -107,8 +109,6 @@ use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::i18n;
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
 use zeroclaw_runtime::observability::{self, Observer, runtime_trace};
-use zeroclaw_config::schema::ProgressObserverConfig;
-use zeroclaw_progress_observer::{ProgressEventToggles, ProgressReportingObserver};
 use zeroclaw_runtime::platform;
 use zeroclaw_runtime::security::{AutonomyLevel, SecurityPolicy};
 use zeroclaw_runtime::tools::{self, Tool};
@@ -1042,7 +1042,6 @@ fn decrypt_optional_secret_for_runtime_reload(
 }
 
 async fn load_runtime_defaults_from_config_file(path: &Path) -> Result<ChannelRuntimeDefaults> {
-
     let contents = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("Failed to read {}", path.display()))?;
@@ -2877,9 +2876,11 @@ async fn process_channel_message(
         return;
     }
 
-    // Set user context for xuanji tools before the agent turn.
-    zeroclaw_runtime::tools::xuanji::set_current_from_uid(Some(&msg.sender));
-    zeroclaw_runtime::tools::xuanji::set_current_reply_target(Some(&msg.reply_target));
+    // Parse sender UID for xuanji context (102535169_la_1780499236481 → 102535169).
+    let xuanji_ctx = zeroclaw_runtime::tools::xuanji::XuanjiContext {
+        from_uid: msg.sender.split("_la_").next().unwrap_or(&msg.sender).to_string(),
+        reply_target: msg.reply_target.clone(),
+    };
 
     println!(
         "  💬 [{}] from {}: {}",
@@ -2921,7 +2922,11 @@ async fn process_channel_message(
     let mut silent_request = false;
     if msg.content.contains("<!-- zeroclaw:silent -->") {
         silent_request = true;
-        msg.content = msg.content.replace("<!-- zeroclaw:silent -->", "").trim().to_string();
+        msg.content = msg
+            .content
+            .replace("<!-- zeroclaw:silent -->", "")
+            .trim()
+            .to_string();
         tracing::debug!(
             channel = %msg.channel,
             sender = %msg.sender,
@@ -3590,6 +3595,8 @@ async fn process_channel_message(
                             cost_tracking_context.clone(),
                         zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT.scope(
                             receipt_scope.clone(),
+                        zeroclaw_runtime::tools::xuanji::XUANJI_CONTEXT.scope(
+                            xuanji_ctx.clone(),
                         run_tool_call_loop(
                         active_provider.as_ref(),
                         &mut history,
@@ -3629,6 +3636,7 @@ async fn process_channel_message(
                         ctx.receipt_generator
                             .as_ref()
                             .map(|_| tool_receipts_collector.as_ref()),
+                    ),
                     ),
                     ),
                     ),
@@ -4853,7 +4861,10 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                 .wukongim
                 .as_ref()
                 .context("WuKongIM channel is not configured")?;
-            let memory = Arc::new(zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "wukongim")?);
+            let memory = Arc::new(zeroclaw_memory::SqliteMemory::new_named(
+                &config.workspace_dir,
+                "wukongim",
+            )?);
             Ok(Arc::new(WuKongIMChannel::from_config(
                 wk,
                 &config.workspace_dir,
@@ -5822,7 +5833,11 @@ fn collect_configured_channels(
     #[cfg(feature = "channel-wukongim")]
     if let Some(ref wk) = config.channels.wukongim {
         if wk.enabled {
-            let arc = Arc::new(WuKongIMChannel::from_config(wk, &config.workspace_dir, _memory.clone()));
+            let arc = Arc::new(WuKongIMChannel::from_config(
+                wk,
+                &config.workspace_dir,
+                _memory.clone(),
+            ));
             wukongim_channel = Some(arc.clone());
             channels.push(ConfiguredChannel {
                 display_name: "WuKongIM",
@@ -5846,7 +5861,10 @@ fn collect_configured_channels(
 /// Run health checks for configured channels.
 pub async fn doctor_channels(config: Config) -> Result<()> {
     #[allow(unused_mut)]
-    let memory = Arc::new(zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "doctor")?);
+    let memory = Arc::new(zeroclaw_memory::SqliteMemory::new_named(
+        &config.workspace_dir,
+        "doctor",
+    )?);
     let (channels, _wk) = collect_configured_channels(&config, "health check", &[], memory);
 
     #[cfg(feature = "channel-nostr")]
@@ -6392,17 +6410,17 @@ pub async fn start_channels(
                     .send_status_message(&recipient, channel_type, payload)
                     .await
                 {
-                    tracing::error!(?e, recipient, "Failed to forward gateway message to WuKongIM");
+                    tracing::error!(
+                        ?e,
+                        recipient,
+                        "Failed to forward gateway message to WuKongIM"
+                    );
                 }
             }
             tracing::info!("Gateway → WuKongIM bridge closed");
         });
     } else {
-        tracing::warn!(
-            has_rx,
-            has_wk,
-            "Bridge listener NOT started"
-        );
+        tracing::warn!(has_rx, has_wk, "Bridge listener NOT started");
     }
 
     let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
@@ -6757,7 +6775,10 @@ pub async fn deliver_announcement(
                 .wukongim
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("wukongim channel not configured"))?;
-            let memory = Arc::new(zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "wukongim")?);
+            let memory = Arc::new(zeroclaw_memory::SqliteMemory::new_named(
+                &config.workspace_dir,
+                "wukongim",
+            )?);
             let ch = WuKongIMChannel::from_config(wk, &config.workspace_dir, memory);
             zeroclaw_api::channel::Channel::send(&ch, &SendMessage::new(&safe_output, target))
                 .await?;
@@ -12744,7 +12765,9 @@ This is an example JSON object for profile settings."#;
             proxy_url: None,
         });
 
-        let memory = Arc::new(zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "test").unwrap());
+        let memory = Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "test").unwrap(),
+        );
         let (channels, _wk) = collect_configured_channels(&config, "test", &[], memory);
 
         assert!(
@@ -12768,7 +12791,9 @@ This is an example JSON object for profile settings."#;
             ..Default::default()
         });
 
-        let memory = Arc::new(zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "test").unwrap());
+        let memory = Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "test").unwrap(),
+        );
         let (channels, _wk) = collect_configured_channels(&config, "test", &[], memory);
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Email"),
@@ -12785,7 +12810,9 @@ This is an example JSON object for profile settings."#;
             ..Default::default()
         });
 
-        let memory = Arc::new(zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "test").unwrap());
+        let memory = Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "test").unwrap(),
+        );
         let (channels, _wk) = collect_configured_channels(&config, "test", &[], memory);
         assert!(
             !channels

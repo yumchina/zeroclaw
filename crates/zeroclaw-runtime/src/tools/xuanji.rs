@@ -1,37 +1,32 @@
 //! Built-in tools for 璇玑Agent (Xuanji) document extraction.
 //!
 //! Two tools: `xuanji_doc_create_task` and `xuanji_doc_query_task`.
-//! Both send CMD messages (type=99) through a global mpsc bridge to the
+//! Both send CMD messages (type=2000) through a global mpsc bridge to the
 //! WuKongIM channel supervisor, which forwards them to 璇玑Agent.
-
-use std::cell::RefCell;
-use std::sync::OnceLock;
 
 use async_trait::async_trait;
 use serde_json::json;
+use std::sync::OnceLock;
 use tokio::sync::mpsc;
 use zeroclaw_api::tool::{Tool, ToolResult};
 
-// ── Thread-local user context ────────────────────────────────────
-// The orchestrator sets the current from_uid before each agent turn.
-// Xuanji tools read it during execute() to include in CMD messages.
+// ── Task-local user context ────────────────────────────────────────
+// Uses tokio::task_local! so the context follows the task across thread
+// migrations, unlike std::thread_local! which is per-OS-thread.
+// The orchestrator wraps each agent turn in XUANJI_CONTEXT.scope().
 
-thread_local! {
-    static CURRENT_FROM_UID: RefCell<Option<String>> = RefCell::new(None);
-    static CURRENT_REPLY_TARGET: RefCell<Option<String>> = RefCell::new(None);
+#[derive(Clone, Default)]
+pub struct XuanjiContext {
+    pub from_uid: String,
+    pub reply_target: String,
 }
 
-/// Set the current user context (called by orchestrator before agent turn).
-/// Parses WK UID format: `102535169_la_1779364164516` → `102535169`.
-/// If the UID does not contain `_la_`, uses the original value as-is.
-pub fn set_current_from_uid(uid: Option<&str>) {
-    let parsed = uid.and_then(|u| u.split("_la_").next());
-    CURRENT_FROM_UID.with(|c| *c.borrow_mut() = parsed.map(String::from));
+tokio::task_local! {
+    pub static XUANJI_CONTEXT: XuanjiContext;
 }
 
-/// Set the current reply target (called by orchestrator before agent turn).
-pub fn set_current_reply_target(target: Option<&str>) {
-    CURRENT_REPLY_TARGET.with(|c| *c.borrow_mut() = target.map(String::from));
+fn read_context() -> XuanjiContext {
+    XUANJI_CONTEXT.try_with(|c| c.clone()).unwrap_or_default()
 }
 
 // ── Global mpsc bridge ──────────────────────────────────────────
@@ -111,18 +106,12 @@ impl Tool for XuanjiCreateTaskTool {
 
         let user_text = args["user_text"].as_str().unwrap_or_default();
         let files = &args["files"];
-        let user_id = CURRENT_FROM_UID
-            .with(|c| c.borrow().clone())
-            .unwrap_or_default();
-        let reply_target = CURRENT_REPLY_TARGET
-            .with(|c| c.borrow().clone())
-            .unwrap_or_default();
-
-        // reply_target 为空时用 user_id 构造备选
-        let reply_target = if reply_target.is_empty() || reply_target.ends_with(':') {
+        let ctx = read_context();
+        let user_id = ctx.from_uid;
+        let reply_target = if ctx.reply_target.is_empty() || ctx.reply_target.ends_with(':') {
             format!("1:{}", user_id)
         } else {
-            reply_target
+            ctx.reply_target
         };
 
         if files.as_array().map_or(true, |a| a.is_empty()) {
@@ -207,9 +196,8 @@ impl Tool for XuanjiQueryTaskTool {
             .ok_or_else(|| anyhow::anyhow!("璇玑Agent 桥接未配置（XUANJI_BRIDGE 未设置）"))?;
 
         let task_id = args["task_id"].as_str().unwrap_or_default();
-        let user_id = CURRENT_FROM_UID
-            .with(|c| c.borrow().clone())
-            .unwrap_or_default();
+        let ctx = read_context();
+        let user_id = ctx.from_uid;
 
         let payload = json!({
             "type": 2000,
