@@ -46,14 +46,14 @@ pub fn set_xuanji_bridge(tx: XuanjiBridgeTx) {
     let _ = XUANJI_BRIDGE.set(tx);
 }
 
-// ── XuanjiCreateTaskTool ────────────────────────────────────────
+// ── DawnXuanjiCreateTask ────────────────────────────────────────
 
-pub struct XuanjiCreateTaskTool {
+pub struct DawnXuanjiCreateTask {
     xuanji_wk_uid: String,
     la_id: String,
 }
 
-impl XuanjiCreateTaskTool {
+impl DawnXuanjiCreateTask {
     pub fn new(xuanji_wk_uid: String, la_id: String) -> Self {
         Self {
             xuanji_wk_uid,
@@ -63,14 +63,14 @@ impl XuanjiCreateTaskTool {
 }
 
 #[async_trait]
-impl Tool for XuanjiCreateTaskTool {
+impl Tool for DawnXuanjiCreateTask {
     fn name(&self) -> &str {
         "xuanji_doc_create_task"
     }
 
     fn description(&self) -> &str {
         "向璇玑Agent 提交文档内容提取任务。支持 pdf/docx/pptx/xlsx 格式，一次可提交多个文件。\
-         传入文件的 S3 URL、文件名、文件类型和用户原文，返回 execution_id。\
+         传入文件的下载链接、文件名、文件类型和用户原文，返回 execution_id。\
          提交后璇玑Agent 异步处理，完成后会主动推送结果。"
     }
 
@@ -88,7 +88,7 @@ impl Tool for XuanjiCreateTaskTool {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "file_url": {"type": "string", "description": "文件的 S3 URL"},
+                            "file_url": {"type": "string", "description": "文件的下载链接（从消息中的 (文件链接: ...) 标记获取）"},
                             "file_name": {"type": "string", "description": "原始文件名"},
                             "file_type": {"type": "string", "description": "文件类型：pdf/docx/pptx/xlsx"}
                         }
@@ -150,14 +150,14 @@ impl Tool for XuanjiCreateTaskTool {
     }
 }
 
-// ── XuanjiQueryTaskTool ─────────────────────────────────────────
+// ── DawnXuanjiQueryTask ─────────────────────────────────────────
 
-pub struct XuanjiQueryTaskTool {
+pub struct DawnXuanjiQueryTask {
     xuanji_wk_uid: String,
     la_id: String,
 }
 
-impl XuanjiQueryTaskTool {
+impl DawnXuanjiQueryTask {
     pub fn new(xuanji_wk_uid: String, la_id: String) -> Self {
         Self {
             xuanji_wk_uid,
@@ -167,7 +167,7 @@ impl XuanjiQueryTaskTool {
 }
 
 #[async_trait]
-impl Tool for XuanjiQueryTaskTool {
+impl Tool for DawnXuanjiQueryTask {
     fn name(&self) -> &str {
         "xuanji_doc_query_task"
     }
