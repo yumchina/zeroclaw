@@ -1223,8 +1223,14 @@ impl Channel for WuKongIMChannel {
         });
 
         // Read from task locals
-        let tool_call_id = zeroclaw_api::CURRENT_TOOL_CALL_ID.with(|id| id.clone());
-        let tool_name = zeroclaw_api::CURRENT_TOOL_NAME.with(|name| name.clone());
+        let tool_call_id = zeroclaw_api::CURRENT_TOOL_CALL_ID
+            .try_with(Clone::clone)
+            .ok()
+            .flatten();
+        let tool_name = zeroclaw_api::CURRENT_TOOL_NAME
+            .try_with(Clone::clone)
+            .ok()
+            .flatten();
 
         if let Some(obj) = content.as_object_mut() {
             if let Some(ref name) = tool_name {
