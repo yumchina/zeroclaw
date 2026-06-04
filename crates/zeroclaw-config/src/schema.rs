@@ -5982,22 +5982,32 @@ pub struct WebFetchConfig {
 /// Configures the `dawn_s3` tool (provided by the `dawn-tools` crate).
 /// The tool uploads local files to a Dawn S3-compatible storage endpoint
 /// and returns a download URL the model can share with the user.
-#[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "s3"]
 pub struct DawnS3Config {
-    /// Enable the `dawn_s3` tool. Default: `false`.
-    #[serde(default)]
-    pub enabled: bool,
-    /// Dawn API base URL (e.g. `http://dawn.example.com:8091`).
-    #[serde(default)]
-    pub url: String,
-    /// Assistant token for authentication. Falls back to the
-    /// `DAWN_S3_TOKEN` environment variable when empty.
+    /// Dawn S3 base URL. Default: `"https://dawn-server.hwwt2.com"`.
+    #[serde(default = "default_dawn_s3_base_url")]
+    pub base_url: Option<String>,
+    /// Authentication token. When absent, falls back to `[dawn].token`,
+    /// then to the `DAWN_S3_TOKEN` environment variable.
     #[serde(default)]
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub token: String,
+    pub token: Option<String>,
+}
+
+fn default_dawn_s3_base_url() -> Option<String> {
+    Some("https://dawn-server.hwwt2.com".into())
+}
+
+impl Default for DawnS3Config {
+    fn default() -> Self {
+        Self {
+            base_url: default_dawn_s3_base_url(),
+            token: None,
+        }
+    }
 }
 
 /// Firecrawl fallback mode: scrape a single page or crawl linked pages.
@@ -6284,33 +6294,70 @@ fn default_dawn_web_search_timeout_secs() -> u64 {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "dawn-web-search"]
 pub struct DawnWebSearchConfig {
-    /// Enable the `dawn_web_search_tool`. Default: `false`.
-    #[serde(default)]
-    pub enabled: bool,
     /// Maximum results per search (1-10). Default: `2`.
     #[serde(default = "default_dawn_web_search_max_results")]
     pub max_results: usize,
     /// Request timeout in seconds. Default: `20`.
     #[serde(default = "default_dawn_web_search_timeout_secs")]
     pub timeout_secs: u64,
-    /// Yumc-Search API key (required).
+    /// Authentication token (API key). When absent, falls back to `[dawn].token`.
     #[serde(default)]
     #[secret]
     #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
-    pub yumc_search_api_key: Option<String>,
-    /// Yumc-Search base URL (required), e.g. `"http://search.example.local/api/v1/search"`.
-    #[serde(default)]
-    pub yumc_search_base_url: Option<String>,
+    pub token: Option<String>,
+    /// Search API base URL. Default: the internal Yumc-Search endpoint.
+    #[serde(default = "default_dawn_web_search_base_url")]
+    pub base_url: Option<String>,
+}
+
+fn default_dawn_web_search_base_url() -> Option<String> {
+    Some("http://share-nextg-nexx-gray.prd.yumc.local/tool/294/api/v1/search".into())
 }
 
 impl Default for DawnWebSearchConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
             max_results: default_dawn_web_search_max_results(),
             timeout_secs: default_dawn_web_search_timeout_secs(),
-            yumc_search_api_key: None,
-            yumc_search_base_url: None,
+            token: None,
+            base_url: default_dawn_web_search_base_url(),
+        }
+    }
+}
+
+/// Dawn page-crawl configuration (`[dawn.crawl]` section).
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "dawn-crawl"]
+pub struct DawnCrawlConfig {
+    /// Authentication token. When absent, falls back to `[dawn].token`.
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub token: Option<String>,
+    /// Dawn crawl service base URL.
+    /// Default: the internal Yumc crawl endpoint.
+    #[serde(default = "default_dawn_crawl_base_url")]
+    pub base_url: Option<String>,
+    /// Request timeout in seconds. Default: `20`.
+    #[serde(default = "default_dawn_crawl_timeout_secs")]
+    pub timeout_secs: u64,
+}
+
+fn default_dawn_crawl_base_url() -> Option<String> {
+    Some("http://share-nextg-nexx-gray.prd.yumc.local/tool/294/api/v1/crawl".into())
+}
+
+fn default_dawn_crawl_timeout_secs() -> u64 {
+    20
+}
+
+impl Default for DawnCrawlConfig {
+    fn default() -> Self {
+        Self {
+            token: None,
+            base_url: default_dawn_crawl_base_url(),
+            timeout_secs: default_dawn_crawl_timeout_secs(),
         }
     }
 }
@@ -6320,6 +6367,13 @@ impl Default for DawnWebSearchConfig {
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 #[prefix = "dawn"]
 pub struct DawnConfig {
+    /// Shared authentication token used as a fallback for sub-sections that
+    /// do not define their own `token`. Sub-section tokens take precedence
+    /// when present and non-empty.
+    #[serde(default)]
+    #[secret]
+    #[cfg_attr(feature = "schema-export", schemars(extend("x-secret" = true)))]
+    pub token: Option<String>,
     /// Dawn S3 file-upload tool configuration (`[dawn.s3]`).
     #[serde(default)]
     #[nested]
@@ -6328,6 +6382,10 @@ pub struct DawnConfig {
     #[serde(default)]
     #[nested]
     pub web_search: DawnWebSearchConfig,
+    /// Dawn page-crawl tool (`[dawn.crawl]`).
+    #[serde(default)]
+    #[nested]
+    pub crawl: DawnCrawlConfig,
 }
 
 // ── Project Intelligence ────────────────────────────────────────
@@ -23711,26 +23769,63 @@ mod dawn_config_tests {
     fn dawn_web_search_config_parses_from_toml() {
         let toml_str = r#"
 [dawn.web_search]
-enabled = true
 max_results = 2
 timeout_secs = 20
-yumc_search_base_url = "http://search.example.local/api/v1/search"
+base_url = "http://search.example.local/api/v1/search"
+token = "my-search-key"
 "#;
         let config: Config = toml::from_str(toml_str).unwrap();
-        assert!(config.dawn.web_search.enabled);
         assert_eq!(config.dawn.web_search.max_results, 2);
         assert_eq!(config.dawn.web_search.timeout_secs, 20);
         assert_eq!(
-            config.dawn.web_search.yumc_search_base_url.as_deref(),
+            config.dawn.web_search.base_url.as_deref(),
             Some("http://search.example.local/api/v1/search")
+        );
+        assert_eq!(
+            config.dawn.web_search.token.as_deref(),
+            Some("my-search-key")
         );
     }
 
     #[test]
-    fn dawn_web_search_config_defaults_to_disabled() {
+    fn dawn_token_fallback_parses_from_toml() {
+        let toml_str = r#"
+[dawn]
+token = "shared-dawn-token"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.dawn.token.as_deref(), Some("shared-dawn-token"));
+        assert!(config.dawn.s3.token.is_none());
+        assert!(config.dawn.web_search.token.is_none());
+    }
+
+    #[test]
+    fn dawn_s3_config_parses_base_url() {
+        let toml_str = r#"
+[dawn.s3]
+base_url = "https://dawn-server.example.com"
+token = "s3-tok"
+"#;
+        let config: Config = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.dawn.s3.base_url.as_deref(),
+            Some("https://dawn-server.example.com")
+        );
+        assert_eq!(config.dawn.s3.token.as_deref(), Some("s3-tok"));
+    }
+
+    #[test]
+    fn dawn_configs_have_correct_defaults() {
         let config: Config = toml::from_str("").unwrap();
-        assert!(!config.dawn.web_search.enabled);
         assert_eq!(config.dawn.web_search.max_results, 2);
         assert_eq!(config.dawn.web_search.timeout_secs, 20);
+        assert_eq!(
+            config.dawn.web_search.base_url.as_deref(),
+            Some("http://share-nextg-nexx-gray.prd.yumc.local/tool/294/api/v1/search")
+        );
+        assert_eq!(
+            config.dawn.s3.base_url.as_deref(),
+            Some("https://dawn-server.hwwt2.com")
+        );
     }
 }

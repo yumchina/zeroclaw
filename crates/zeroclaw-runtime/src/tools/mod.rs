@@ -119,6 +119,8 @@ pub use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
 
 // Optional Dawn SaaS integration tools (separate crate, feature-gated).
 #[cfg(feature = "dawn-tools")]
+pub use dawn_tools::DawnCrawlTool;
+#[cfg(feature = "dawn-tools")]
 pub use dawn_tools::DawnS3Tool;
 #[cfg(feature = "dawn-tools")]
 pub use dawn_tools::DawnWebSearchTool;
@@ -713,56 +715,77 @@ pub fn all_tools_with_runtime(
     }
 
     #[cfg(feature = "dawn-tools")]
-    if root_config.dawn.s3.enabled {
-        let token = if root_config.dawn.s3.token.is_empty() {
-            std::env::var("DAWN_S3_TOKEN").unwrap_or_default()
-        } else {
-            root_config.dawn.s3.token.clone()
-        };
-        if root_config.dawn.s3.url.is_empty() {
+    {
+        // Resolve: [dawn.s3].token → [dawn].token → $DAWN_S3_TOKEN
+        let s3_token = root_config
+            .dawn
+            .s3
+            .token
+            .as_deref()
+            .filter(|t| !t.is_empty())
+            .or_else(|| root_config.dawn.token.as_deref().filter(|t| !t.is_empty()))
+            .map(str::to_owned)
+            .unwrap_or_else(|| std::env::var("DAWN_S3_TOKEN").unwrap_or_default());
+        let s3_base_url = root_config
+            .dawn
+            .s3
+            .base_url
+            .as_deref()
+            .unwrap_or("")
+            .to_owned();
+        if s3_base_url.is_empty() {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                "dawn_s3: enabled but [dawn.s3].url is empty, skipping registration"
+                "dawn_s3: [dawn.s3].base_url is empty, skipping registration"
             );
-        } else if token.is_empty() {
+        } else if s3_token.is_empty() {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                "dawn_s3: enabled but token missing (neither [dawn.s3].token nor $DAWN_S3_TOKEN set), skipping registration"
+                "dawn_s3: token missing (none of [dawn.s3].token, [dawn].token, $DAWN_S3_TOKEN set), skipping registration"
             );
         } else {
             tool_arcs.push(Arc::new(DawnS3Tool::new(
                 security.clone(),
-                root_config.dawn.s3.url.clone(),
-                token,
+                s3_base_url.clone(),
+                s3_token,
             )));
             ::zeroclaw_log::record!(
                 INFO,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Register)
                     .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                    .with_attrs(::serde_json::json!({"endpoint": root_config.dawn.s3.url})),
+                    .with_attrs(::serde_json::json!({"endpoint": s3_base_url})),
                 "dawn_s3: tool registered"
             );
         }
     }
 
     #[cfg(feature = "dawn-tools")]
-    if root_config.dawn.web_search.enabled {
-        let base_url = root_config.dawn.web_search.yumc_search_base_url.clone();
-        if base_url.as_deref().unwrap_or("").is_empty() {
+    {
+        let web_search_base_url = root_config.dawn.web_search.base_url.clone();
+        if web_search_base_url.as_deref().unwrap_or("").is_empty() {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                "dawn.web_search: enabled but [dawn.web_search].yumc_search_base_url is empty, skipping registration"
+                "dawn.web_search: [dawn.web_search].base_url is empty, skipping registration"
             );
         } else {
+            // Resolve: [dawn.web_search].token → [dawn].token
+            let boot_token = root_config
+                .dawn
+                .web_search
+                .token
+                .as_deref()
+                .filter(|t| !t.is_empty())
+                .or_else(|| root_config.dawn.token.as_deref().filter(|t| !t.is_empty()))
+                .map(str::to_owned);
             tool_arcs.push(Arc::new(DawnWebSearchTool::new(
-                root_config.dawn.web_search.yumc_search_api_key.clone(),
-                base_url,
+                boot_token,
+                web_search_base_url,
                 root_config.dawn.web_search.max_results,
                 root_config.dawn.web_search.timeout_secs,
                 root_config.config_path.clone(),
@@ -773,6 +796,42 @@ pub fn all_tools_with_runtime(
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Register)
                     .with_outcome(::zeroclaw_log::EventOutcome::Success),
                 "dawn.web_search: tool registered"
+            );
+        }
+    }
+
+    #[cfg(feature = "dawn-tools")]
+    {
+        let crawl_base_url = root_config.dawn.crawl.base_url.clone();
+        if crawl_base_url.as_deref().unwrap_or("").is_empty() {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
+                "dawn.crawl: [dawn.crawl].base_url is empty, skipping registration"
+            );
+        } else {
+            // Resolve: [dawn.crawl].token → [dawn].token
+            let boot_token = root_config
+                .dawn
+                .crawl
+                .token
+                .as_deref()
+                .filter(|t| !t.is_empty())
+                .or_else(|| root_config.dawn.token.as_deref().filter(|t| !t.is_empty()))
+                .map(str::to_owned);
+            tool_arcs.push(Arc::new(DawnCrawlTool::new(
+                boot_token,
+                crawl_base_url,
+                root_config.dawn.crawl.timeout_secs,
+                root_config.config_path.clone(),
+                root_config.secrets.encrypt,
+            )));
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Register)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success),
+                "dawn.crawl: tool registered"
             );
         }
     }

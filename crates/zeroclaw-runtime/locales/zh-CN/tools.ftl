@@ -28,7 +28,13 @@ tool-cron-update = 更新现有 cron 任务（调度、命令、prompt、enabled
 
 tool-data-management = 工作区数据保留、清理与存储统计管理
 
-tool-delegate = 将子任务委托给专用 Agent。当任务适合其他模型处理时使用（例如快速摘要、深度推理、代码生成）。默认情况下子 Agent 只运行单次 prompt；若设置 agentic=true，则可通过受限工具循环进行多轮迭代。
+tool-dawn-crawl = 通过 Dawn 抓取服务获取内部 URL 的完整页面内容。适用于需要认证访问的企业内网页面或内部资源，返回页面正文文本，无法提取时返回原始 JSON。
+
+tool-dawn-s3 = 将本地文件上传至 Dawn S3 兼容存储。远程路径自动生成为 `assistant/<uuid>.<ext>`，返回完整下载 URL。适用场景：用户需要对生成文件（报告、演示文稿、PDF 等）获取可分享链接时。
+
+tool-dawn-web-search =通过内部 Yumc-Search API 搜索企业知识库。返回来自内部资源的相关结果，包含标题、URL 和摘要。适用于搜索内部文档、企业资源或私有知识库。
+
+tool-delegate =将子任务委托给专用 Agent。当任务适合其他模型处理时使用（例如快速摘要、深度推理、代码生成）。默认情况下子 Agent 只运行单次 prompt；若设置 agentic=true，则可通过受限工具循环进行多轮迭代。
 
 tool-file-edit = 通过精确字符串匹配替换的方式编辑文件内容
 

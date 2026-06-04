@@ -7,8 +7,8 @@ use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_api::tool_attribution;
 
 pub struct DawnWebSearchTool {
-    boot_yumc_search_api_key: Option<String>,
-    yumc_search_base_url: Option<String>,
+    boot_token: Option<String>,
+    base_url: Option<String>,
     max_results: usize,
     timeout_secs: u64,
     config_path: PathBuf,
@@ -17,7 +17,7 @@ pub struct DawnWebSearchTool {
 
 impl DawnWebSearchTool {
     pub fn new(
-        boot_key: Option<String>,
+        boot_token: Option<String>,
         base_url: Option<String>,
         max_results: usize,
         timeout_secs: u64,
@@ -25,8 +25,8 @@ impl DawnWebSearchTool {
         secrets_encrypt: bool,
     ) -> Self {
         Self {
-            boot_yumc_search_api_key: boot_key,
-            yumc_search_base_url: base_url,
+            boot_token,
+            base_url,
             max_results: max_results.clamp(1, 10),
             timeout_secs: timeout_secs.max(1),
             config_path,
@@ -34,21 +34,19 @@ impl DawnWebSearchTool {
         }
     }
 
-    fn resolve_api_key(&self) -> anyhow::Result<String> {
-        if let Some(ref key) = self.boot_yumc_search_api_key {
-            if !key.is_empty()
-                && !zeroclaw_config::secrets::SecretStore::is_encrypted(key)
-            {
+    fn resolve_token(&self) -> anyhow::Result<String> {
+        if let Some(ref key) = self.boot_token {
+            if !key.is_empty() && !zeroclaw_config::secrets::SecretStore::is_encrypted(key) {
                 return Ok(key.clone());
             }
         }
-        self.reload_api_key()
+        self.reload_token()
     }
 
-    fn reload_api_key(&self) -> anyhow::Result<String> {
+    fn reload_token(&self) -> anyhow::Result<String> {
         let contents = std::fs::read_to_string(&self.config_path).map_err(|e| {
             anyhow::anyhow!(
-                "Failed to read config file {} for Dawn web search API key: {e}",
+                "Failed to read config file {} for Dawn web search token: {e}",
                 self.config_path.display()
             )
         })?;
@@ -56,24 +54,28 @@ impl DawnWebSearchTool {
         let config: zeroclaw_config::schema::Config =
             toml::from_str(&contents).map_err(|e| {
                 anyhow::anyhow!(
-                    "Failed to parse config file {} for Dawn web search API key: {e}",
+                    "Failed to parse config file {} for Dawn web search token: {e}",
                     self.config_path.display()
                 )
             })?;
 
+        // Resolve: [dawn.web_search].token → [dawn].token
         let raw_key = config
             .dawn
             .web_search
-            .yumc_search_api_key
+            .token
+            .as_deref()
             .filter(|k| !k.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Yumc-Search API key not configured"))?;
+            .or_else(|| config.dawn.token.as_deref().filter(|k| !k.is_empty()))
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("Dawn web search token not configured (neither [dawn.web_search].token nor [dawn].token set)"))?;
 
         if zeroclaw_config::secrets::SecretStore::is_encrypted(&raw_key) {
             let dir = self.config_path.parent().unwrap_or_else(|| Path::new("."));
             let store = zeroclaw_config::secrets::SecretStore::new(dir, self.secrets_encrypt);
             let plaintext = store.decrypt(&raw_key)?;
             if plaintext.is_empty() {
-                anyhow::bail!("Yumc-Search API key not configured (decrypted value is empty)");
+                anyhow::bail!("Dawn web search token not configured (decrypted value is empty)");
             }
             Ok(plaintext)
         } else {
@@ -120,12 +122,12 @@ impl DawnWebSearchTool {
     }
 
     async fn search(&self, query: &str) -> anyhow::Result<String> {
-        let api_key = self.resolve_api_key()?;
+        let api_key = self.resolve_token()?;
         let url = self
-            .yumc_search_base_url
+            .base_url
             .as_deref()
             .filter(|s| !s.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("Yumc-Search base URL not configured"))?;
+            .ok_or_else(|| anyhow::anyhow!("Dawn web search base URL not configured"))?;
 
         let body = json!({
             "queries": [query],
@@ -160,7 +162,7 @@ tool_attribution!(DawnWebSearchTool, ::zeroclaw_api::attribution::ToolKind::Sear
 #[async_trait]
 impl Tool for DawnWebSearchTool {
     fn name(&self) -> &str {
-        "dawn_web_search_tool"
+        "dawn_web_search"
     }
 
     fn description(&self) -> &str {
@@ -225,8 +227,8 @@ mod tests {
     }
 
     #[test]
-    fn tool_name_is_dawn_web_search_tool() {
-        assert_eq!(make_tool().name(), "dawn_web_search_tool");
+    fn tool_name_is_dawn_web_search() {
+        assert_eq!(make_tool().name(), "dawn_web_search");
     }
 
     #[test]
@@ -265,23 +267,23 @@ mod tests {
     }
 
     #[test]
-    fn resolve_api_key_uses_plaintext_boot_key() {
+    fn resolve_token_uses_plaintext_boot_token() {
         let tool = DawnWebSearchTool::new(
             Some("plain-key".into()),
             Some("http://example.com/search".into()),
             3, 10, PathBuf::new(), false,
         );
-        assert_eq!(tool.resolve_api_key().unwrap(), "plain-key");
+        assert_eq!(tool.resolve_token().unwrap(), "plain-key");
     }
 
     #[test]
-    fn resolve_api_key_missing_returns_error() {
+    fn resolve_token_missing_returns_error() {
         let tool = DawnWebSearchTool::new(
             None,
             Some("http://example.com/search".into()),
             3, 10, PathBuf::new(), false,
         );
-        assert!(tool.resolve_api_key().is_err());
+        assert!(tool.resolve_token().is_err());
     }
 
     #[test]

@@ -3625,12 +3625,15 @@ pub async fn run(
         ));
         }
         #[cfg(feature = "dawn-tools")]
-        if config.dawn.s3.enabled {
-            tool_descs.push((
-                "dawn_s3",
-                "Upload a local file to Dawn S3 compatible storage. Returns a download URL. Use when: user needs a shareable link for generated files (reports, presentations, PDFs). Don't use for temporary or intermediate files.",
-            ));
-        }
+        tool_descs.push((
+            "dawn_s3",
+            "Upload a local file to Dawn S3 compatible storage. Returns a download URL. Use when: user needs a shareable link for generated files (reports, presentations, PDFs). Don't use for temporary or intermediate files.",
+        ));
+        #[cfg(feature = "dawn-tools")]
+        tool_descs.push((
+            "dawn_crawl",
+            "Fetch full page content from an internal URL via the Dawn crawl service. Use for intranet pages or enterprise resources that require authenticated access.",
+        ));
         tool_descs.push((
         "schedule",
         "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
@@ -4903,12 +4906,9 @@ pub async fn process_message(
             tool_descs.push(("composio", "Execute actions on 1000+ apps via Composio."));
         }
         #[cfg(feature = "dawn-tools")]
-        if config.dawn.s3.enabled {
-            tool_descs.push((
-                "dawn_s3",
-                "Upload a local file to Dawn S3 and return a shareable URL.",
-            ));
-        }
+        tool_descs.push(("dawn_s3", "Upload a local file to Dawn S3 and return a shareable URL."));
+        #[cfg(feature = "dawn-tools")]
+        tool_descs.push(("dawn_crawl", "Fetch full page content from an internal URL via the Dawn crawl service."));
         if config.peripherals.enabled && !config.peripherals.boards.is_empty() {
             tool_descs.push(("gpio_read", "Read GPIO pin value on connected hardware."));
             tool_descs.push((
