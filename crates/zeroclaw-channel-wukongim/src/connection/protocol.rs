@@ -14,6 +14,7 @@ impl WkMessageType {
     pub const INTERACTIVE_RESPONSE: u32 = 21;
     pub const STATUS_UPDATE: u32 = 23;
     pub const CMD: u32 = 99;
+    pub const CMD_V2: u32 = 2000;
 }
 
 pub struct WkChannelType;
@@ -189,6 +190,7 @@ mod tests {
         assert_eq!(WkMessageType::INTERACTIVE_RESPONSE, 21);
         assert_eq!(WkMessageType::STATUS_UPDATE, 23);
         assert_eq!(WkMessageType::CMD, 99);
+        assert_eq!(WkMessageType::CMD_V2, 2000);
     }
 
     #[test]
