@@ -111,8 +111,12 @@ impl Tool for XuanjiCreateTaskTool {
 
         let user_text = args["user_text"].as_str().unwrap_or_default();
         let files = &args["files"];
-        let user_id = CURRENT_FROM_UID.with(|c| c.borrow().clone()).unwrap_or_default();
-        let reply_target = CURRENT_REPLY_TARGET.with(|c| c.borrow().clone()).unwrap_or_default();
+        let user_id = CURRENT_FROM_UID
+            .with(|c| c.borrow().clone())
+            .unwrap_or_default();
+        let reply_target = CURRENT_REPLY_TARGET
+            .with(|c| c.borrow().clone())
+            .unwrap_or_default();
 
         // reply_target 为空时用 user_id 构造备选
         let reply_target = if reply_target.is_empty() || reply_target.ends_with(':') {
@@ -130,7 +134,7 @@ impl Tool for XuanjiCreateTaskTool {
         }
 
         let payload = json!({
-            "type": 99,
+            "type": 2000,
             "cmd": "xuanji.create_extraction_task",
             "param": {
                 "user_id": user_id,
@@ -166,7 +170,10 @@ pub struct XuanjiQueryTaskTool {
 
 impl XuanjiQueryTaskTool {
     pub fn new(xuanji_wk_uid: String, la_id: String) -> Self {
-        Self { xuanji_wk_uid, la_id }
+        Self {
+            xuanji_wk_uid,
+            la_id,
+        }
     }
 }
 
@@ -200,10 +207,12 @@ impl Tool for XuanjiQueryTaskTool {
             .ok_or_else(|| anyhow::anyhow!("璇玑Agent 桥接未配置（XUANJI_BRIDGE 未设置）"))?;
 
         let task_id = args["task_id"].as_str().unwrap_or_default();
-        let user_id = CURRENT_FROM_UID.with(|c| c.borrow().clone()).unwrap_or_default();
+        let user_id = CURRENT_FROM_UID
+            .with(|c| c.borrow().clone())
+            .unwrap_or_default();
 
         let payload = json!({
-            "type": 99,
+            "type": 2000,
             "cmd": "xuanji.query_extraction_task",
             "param": {
                 "user_id": user_id,
