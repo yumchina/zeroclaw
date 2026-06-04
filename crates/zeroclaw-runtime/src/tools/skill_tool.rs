@@ -215,6 +215,9 @@ impl Tool for SkillShellTool {
             }
         }
 
+        // Force UTF-8 for Python subprocesses on Windows
+        cmd.env("PYTHONIOENCODING", "utf-8");
+
         let child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {

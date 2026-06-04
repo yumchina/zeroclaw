@@ -19,6 +19,7 @@ const MAX_OUTPUT_BYTES: usize = 1_048_576;
 #[cfg(not(target_os = "windows"))]
 const SAFE_ENV_VARS: &[&str] = &[
     "PATH", "HOME", "TERM", "LANG", "LC_ALL", "LC_CTYPE", "USER", "SHELL", "TMPDIR",
+    "PYTHONIOENCODING",
 ];
 
 /// Environment variables safe to pass to shell commands on Windows.
@@ -42,6 +43,7 @@ const SAFE_ENV_VARS: &[&str] = &[
     "LANG",
     "USERNAME",
     "PSModulePath",
+    "PYTHONIOENCODING",
 ];
 
 /// Shell command execution tool with sandboxing
@@ -229,6 +231,9 @@ impl Tool for ShellTool {
                 cmd.env(&var, val);
             }
         }
+
+        // Force UTF-8 for Python subprocesses on Windows
+        cmd.env("PYTHONIOENCODING", "utf-8");
 
         let timeout_secs = self.timeout_secs;
         let result = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await;
