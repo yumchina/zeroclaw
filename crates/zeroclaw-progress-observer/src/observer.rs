@@ -85,8 +85,14 @@ impl Observer for ProgressReportingObserver {
             let ch = Arc::clone(&self.target_channel);
             let recip = self.recipient.clone();
             let thread = self.thread_ts.clone();
-            let tool_call_id = zeroclaw_api::CURRENT_TOOL_CALL_ID.with(|id| id.clone());
-            let tool_name = zeroclaw_api::CURRENT_TOOL_NAME.with(|name| name.clone());
+            let tool_call_id = zeroclaw_api::CURRENT_TOOL_CALL_ID
+                .try_with(Clone::clone)
+                .ok()
+                .flatten();
+            let tool_name = zeroclaw_api::CURRENT_TOOL_NAME
+                .try_with(Clone::clone)
+                .ok()
+                .flatten();
             tokio::spawn(async move {
                 zeroclaw_api::CURRENT_TOOL_CALL_ID
                     .scope(tool_call_id, async move {
