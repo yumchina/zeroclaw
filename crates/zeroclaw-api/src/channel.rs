@@ -33,6 +33,29 @@ pub enum ChannelApprovalResponse {
     DenyWithEdit { replacement: String },
 }
 
+// ── Progress reporting types ─────────────────────────────────────
+
+/// A localized + structured progress update for draft/status reporting.
+/// `text` is pre-localized fallback text; `phase` carries structured data
+/// for rich clients (e.g. updating a tool bubble in place by `tool_call_id`).
+#[derive(Debug, Clone)]
+pub struct ProgressUpdate {
+    pub text: String,
+    pub phase: ProgressPhase,
+}
+
+/// Structured progress phase data, mirrors the relevant `ObserverEvent`
+/// variants the progress observer translates.
+#[derive(Debug, Clone)]
+pub enum ProgressPhase {
+    AgentStart { provider: String, model: String },
+    LlmRequest { messages_count: usize },
+    ToolStart { tool: String, tool_call_id: Option<String> },
+    ToolDone { tool: String, tool_call_id: Option<String>, success: bool, elapsed_ms: u64 },
+    AgentEnd,
+    Error { component: String },
+}
+
 /// A message received from or sent to a channel
 #[derive(Debug, Clone, Default)]
 pub struct ChannelMessage {
@@ -573,5 +596,33 @@ mod tests {
         assert!(
             matches!(back, ChannelApprovalResponse::DenyWithEdit { replacement } if replacement == "new content")
         );
+    }
+}
+
+#[cfg(test)]
+mod progress_update_tests {
+    use super::{ProgressPhase, ProgressUpdate};
+
+    #[test]
+    fn progress_update_holds_text_and_phase() {
+        let u = ProgressUpdate {
+            text: "shell completed (5ms)".to_string(),
+            phase: ProgressPhase::ToolDone {
+                tool: "shell".to_string(),
+                tool_call_id: Some("call_1".to_string()),
+                success: true,
+                elapsed_ms: 5,
+            },
+        };
+        assert_eq!(u.text, "shell completed (5ms)");
+        match u.clone().phase {
+            ProgressPhase::ToolDone { tool, success, elapsed_ms, tool_call_id } => {
+                assert_eq!(tool, "shell");
+                assert!(success);
+                assert_eq!(elapsed_ms, 5);
+                assert_eq!(tool_call_id.as_deref(), Some("call_1"));
+            }
+            _ => panic!("expected ToolDone phase"),
+        }
     }
 }
