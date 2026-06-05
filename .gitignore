@@ -8,8 +8,6 @@
 /docs/book/src/reference/config.md
 /docs/book/theme/lang-switcher.js
 /docs/book/theme/pc-themes.css
-/docs/superpowers/plans
-/docs/superpowers/specs
 .secrets
 firmware/*/target
 web/dist/*
