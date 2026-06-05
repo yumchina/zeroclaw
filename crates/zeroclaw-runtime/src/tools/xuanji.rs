@@ -1,6 +1,6 @@
 //! Built-in tools for 璇玑Agent (Xuanji) document extraction.
 //!
-//! Two tools: `xuanji_doc_create_task` and `xuanji_doc_query_task`.
+//! Two tools: `dawn_xuanji_create_task` and `dawn_xuanji_query_task`.
 //! Both send CMD messages (type=2000) through a global mpsc bridge to the
 //! WuKongIM channel supervisor, which forwards them to 璇玑Agent.
 
@@ -65,7 +65,7 @@ impl DawnXuanjiCreateTask {
 #[async_trait]
 impl Tool for DawnXuanjiCreateTask {
     fn name(&self) -> &str {
-        "xuanji_doc_create_task"
+        "dawn_xuanji_create_task"
     }
 
     fn description(&self) -> &str {
@@ -88,7 +88,7 @@ impl Tool for DawnXuanjiCreateTask {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "file_url": {"type": "string", "description": "文件的下载链接（从消息中的 (文件链接: ...) 标记获取）"},
+                            "file_url": {"type": "string", "description": "文件的下载链接（从消息中的 <!-- file-url: ... --> 注释获取）"},
                             "file_name": {"type": "string", "description": "原始文件名"},
                             "file_type": {"type": "string", "description": "文件类型：pdf/docx/pptx/xlsx"}
                         }
@@ -169,7 +169,7 @@ impl DawnXuanjiQueryTask {
 #[async_trait]
 impl Tool for DawnXuanjiQueryTask {
     fn name(&self) -> &str {
-        "xuanji_doc_query_task"
+        "dawn_xuanji_query_task"
     }
 
     fn description(&self) -> &str {

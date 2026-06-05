@@ -15,11 +15,11 @@ enabled: true
 
 当用户消息中包含 PPT、Word、Excel、PDF 文件时：
 
-→ **第一步就直接调** `xuanji_doc_create_task` 提交给璇玑Agent 处理，**不要先尝试任何其他工具**
+→ **第一步就直接调** `dawn_xuanji_create_task` 提交给璇玑Agent 处理，**不要先尝试任何其他工具**
 → **调用一次后立即停止，不要再调用第二次，无论是否收到结果通知**
 
 收到 `[璇玑文档提取完成]` 或 `[璇玑文档提取失败]` 时：
-→ 直接处理结果（读文件/告知失败），**不要再调用 xuanji_doc_create_task**
+→ 直接处理结果（读文件/告知失败），**不要再调用 dawn_xuanji_create_task**
 
 ## ❌ 绝对禁止
 
@@ -31,9 +31,9 @@ enabled: true
 
 ## ✅ 正确流程
 
-1. **只调用一次** `xuanji_doc_create_task`（`file_url` 用消息中的 `(文件链接: ...)` 标记里的 URL）
+1. **只调用一次** `dawn_xuanji_create_task`（`file_url` 用消息中 `<!-- file-url: ... -->` 注释里的 URL）
 2. 告诉用户 "文件正在提取中，完成后主动通知您"
-3. **等待 `extraction_complete` 通知，不要再重复调用 `xuanji_doc_create_task`**
-4. 用户询问进度时，调用 `xuanji_doc_query_task`
+3. **等待 `extraction_complete` 通知，不要再重复调用 `dawn_xuanji_create_task`**
+4. 用户询问进度时，调用 `dawn_xuanji_query_task`
 
 支持：.pdf .docx .pptx .xlsx，多文件一次提交。
