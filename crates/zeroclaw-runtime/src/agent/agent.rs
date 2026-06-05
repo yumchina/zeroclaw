@@ -6601,6 +6601,7 @@ mod tests {
                 locked_args: std::collections::HashMap::new(),
             }],
             prompts: vec![],
+            enabled: true,
             location: None,
         };
         tools::register_skill_tools_with_context(
