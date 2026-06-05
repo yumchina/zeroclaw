@@ -1,4 +1,4 @@
-//! Fluent-based i18n for tool descriptions.
+//! Fluent-based i18n for tool descriptions, CLI strings, and event messages.
 //!
 //! English descriptions are embedded via `include_str!` at compile time.
 //! Non-English locales are loaded from disk and override English per-key.
@@ -9,7 +9,9 @@ use std::sync::OnceLock;
 
 static DESCRIPTIONS: OnceLock<HashMap<String, String>> = OnceLock::new();
 static CLI_STRINGS: OnceLock<HashMap<String, String>> = OnceLock::new();
-static CLI_FTL_SOURCES: OnceLock<CliFtlSources> = OnceLock::new();
+static CLI_FTL_SOURCES: OnceLock<FtlSources> = OnceLock::new();
+static EVENT_STRINGS: OnceLock<HashMap<String, String>> = OnceLock::new();
+static EVENT_FTL_SOURCES: OnceLock<FtlSources> = OnceLock::new();
 static LOCALE: OnceLock<String> = OnceLock::new();
 
 /// The canonical locale registry, embedded from repo-root `locales.toml` at
@@ -54,7 +56,7 @@ pub fn available_locales() -> &'static [LocaleOption] {
         .as_slice()
 }
 
-struct CliFtlSources {
+struct FtlSources {
     locale: String,
     disk: Option<String>,
     builtin: Option<&'static str>,
@@ -66,6 +68,8 @@ pub fn init(locale: &str) {
     DESCRIPTIONS.get_or_init(|| load_descriptions(locale));
     CLI_STRINGS.get_or_init(|| load_cli_strings(locale));
     CLI_FTL_SOURCES.get_or_init(|| load_cli_ftl_sources(locale));
+    EVENT_STRINGS.get_or_init(|| load_event_strings(locale));
+    EVENT_FTL_SOURCES.get_or_init(|| load_event_ftl_sources(locale));
 }
 
 /// Get a tool description by tool name (e.g. "shell", "file_read").
@@ -96,11 +100,30 @@ pub fn get_required_cli_string_with_args(key: &str, args: &[(&str, &str)]) -> St
     get_cli_string_with_args(key, args).unwrap_or_else(|| missing_cli_string(key))
 }
 
+/// Get an event string by key (e.g. "event-agent-end").
+pub fn get_event_string(key: &str) -> Option<String> {
+    let map = EVENT_STRINGS.get_or_init(|| load_event_strings(active_locale()));
+    map.get(key).cloned()
+}
+
+/// Get an event string by key, formatted with Fluent external arguments.
+/// Falls back to the raw `{key}` marker (logged) when the key is missing.
+pub fn get_event_string_with_args(key: &str, args: &[(&str, &str)]) -> String {
+    let sources = EVENT_FTL_SOURCES.get_or_init(|| load_event_ftl_sources(active_locale()));
+    format_string_with_args(
+        sources,
+        include_str!("../locales/en/events.ftl"),
+        key,
+        args,
+    )
+    .unwrap_or_else(|| missing_cli_string(key))
+}
+
 fn active_locale() -> &'static str {
     LOCALE.get_or_init(detect_locale).as_str()
 }
 
-fn cli_ftl_sources() -> &'static CliFtlSources {
+fn cli_ftl_sources() -> &'static FtlSources {
     CLI_FTL_SOURCES.get_or_init(|| load_cli_ftl_sources(active_locale()))
 }
 
@@ -110,7 +133,7 @@ fn cli_ftl_sources() -> &'static CliFtlSources {
 /// locale (the global `LOCALE` OnceLock would otherwise make them flaky).
 #[cfg(test)]
 pub(crate) fn get_english_cli_string_with_args(key: &str, args: &[(&str, &str)]) -> String {
-    let english = CliFtlSources {
+    let english = FtlSources {
         locale: "en".to_string(),
         disk: None,
         builtin: None,
@@ -129,24 +152,33 @@ fn missing_cli_string(key: &str) -> String {
     format!("{{{key}}}")
 }
 
-fn load_descriptions(locale: &str) -> HashMap<String, String> {
-    let mut map = format_ftl_messages(include_str!("../locales/en/tools.ftl"), "en");
+/// Generic FTL catalogue loader: English embedded fallback, then builtin
+/// locale overrides, then disk overrides. Shared by tools / cli / events.
+fn load_strings(
+    locale: &str,
+    en_ftl: &str,
+    builtin: Option<&'static str>,
+    filename: &str,
+) -> HashMap<String, String> {
+    let mut map = format_ftl_messages(en_ftl, "en");
     if locale != "en" {
-        // Built-in (compile-time) translations override English first, so
-        // the binary ships a usable non-English description set without
-        // requiring the user to copy a file into their workspace. Mirrors
-        // the `builtin_cli_ftl_source` pattern used for CLI strings.
-        if let Some(locale_ftl) = builtin_tools_ftl_source(locale) {
-            map.extend(format_ftl_messages(locale_ftl, locale));
+        if let Some(b) = builtin {
+            map.extend(format_ftl_messages(b, locale));
         }
-        // Disk-loaded translations (from the user's workspace locale dir)
-        // win over the built-ins so operators can patch wording without
-        // rebuilding.
-        if let Some(locale_ftl) = load_ftl_from_disk(locale, "tools.ftl") {
-            map.extend(format_ftl_messages(&locale_ftl, locale));
+        if let Some(disk) = load_ftl_from_disk(locale, filename) {
+            map.extend(format_ftl_messages(&disk, locale));
         }
     }
     map
+}
+
+fn load_descriptions(locale: &str) -> HashMap<String, String> {
+    load_strings(
+        locale,
+        include_str!("../locales/en/tools.ftl"),
+        builtin_tools_ftl_source(locale),
+        "tools.ftl",
+    )
 }
 
 fn builtin_tools_ftl_source(locale: &str) -> Option<&'static str> {
@@ -157,26 +189,50 @@ fn builtin_tools_ftl_source(locale: &str) -> Option<&'static str> {
 }
 
 fn load_cli_strings(locale: &str) -> HashMap<String, String> {
-    let mut map = format_ftl_messages(include_str!("../locales/en/cli.ftl"), "en");
-    if locale != "en" {
-        if let Some(locale_ftl) = builtin_cli_ftl_source(locale) {
-            map.extend(format_ftl_messages(locale_ftl, locale));
-        }
-        if let Some(locale_ftl) = load_ftl_from_disk(locale, "cli.ftl") {
-            map.extend(format_ftl_messages(&locale_ftl, locale));
-        }
-    }
-    map
+    load_strings(
+        locale,
+        include_str!("../locales/en/cli.ftl"),
+        builtin_cli_ftl_source(locale),
+        "cli.ftl",
+    )
 }
 
-fn load_cli_ftl_sources(locale: &str) -> CliFtlSources {
-    CliFtlSources {
+fn load_event_strings(locale: &str) -> HashMap<String, String> {
+    load_strings(
+        locale,
+        include_str!("../locales/en/events.ftl"),
+        builtin_events_ftl_source(locale),
+        "events.ftl",
+    )
+}
+
+fn builtin_events_ftl_source(locale: &str) -> Option<&'static str> {
+    match locale {
+        "zh-CN" => Some(include_str!("../locales/zh-CN/events.ftl")),
+        _ => None,
+    }
+}
+
+fn load_cli_ftl_sources(locale: &str) -> FtlSources {
+    FtlSources {
         locale: locale.to_string(),
         disk: (locale != "en")
             .then(|| load_ftl_from_disk(locale, "cli.ftl"))
             .flatten(),
         builtin: (locale != "en")
             .then(|| builtin_cli_ftl_source(locale))
+            .flatten(),
+    }
+}
+
+fn load_event_ftl_sources(locale: &str) -> FtlSources {
+    FtlSources {
+        locale: locale.to_string(),
+        disk: (locale != "en")
+            .then(|| load_ftl_from_disk(locale, "events.ftl"))
+            .flatten(),
+        builtin: (locale != "en")
+            .then(|| builtin_events_ftl_source(locale))
             .flatten(),
     }
 }
@@ -188,8 +244,10 @@ fn builtin_cli_ftl_source(locale: &str) -> Option<&'static str> {
     }
 }
 
-fn format_cli_string_with_args(
-    sources: &CliFtlSources,
+/// Generic argumented FTL resolution: disk → builtin → English fallback.
+fn format_string_with_args(
+    sources: &FtlSources,
+    en_ftl: &str,
     key: &str,
     args: &[(&str, &str)],
 ) -> Option<String> {
@@ -203,7 +261,15 @@ fn format_cli_string_with_args(
     {
         return Some(value);
     }
-    format_ftl_message(include_str!("../locales/en/cli.ftl"), "en", key, args)
+    format_ftl_message(en_ftl, "en", key, args)
+}
+
+fn format_cli_string_with_args(
+    sources: &FtlSources,
+    key: &str,
+    args: &[(&str, &str)],
+) -> Option<String> {
+    format_string_with_args(sources, include_str!("../locales/en/cli.ftl"), key, args)
 }
 
 fn format_ftl_messages(ftl_source: &str, locale: &str) -> HashMap<String, String> {
@@ -455,7 +521,7 @@ mod tests {
 
     #[test]
     fn argumented_cli_strings_fall_back_from_disk_to_builtin_locale() {
-        let sources = CliFtlSources {
+        let sources = FtlSources {
             locale: "zh-CN".to_string(),
             disk: Some("cli-wechat-connected = stale workspace override".to_string()),
             builtin: builtin_cli_ftl_source("zh-CN"),
@@ -690,5 +756,42 @@ mod tests {
         let p = paths[0].to_string_lossy();
         assert!(p.contains("xx"), "path must carry the locale: {p}");
         assert!(p.ends_with("cli.ftl"), "path must target the file: {p}");
+    }
+
+    #[test]
+    fn events_ftl_formats_en_and_zh() {
+        // English (embedded fallback)
+        let en = include_str!("../locales/en/events.ftl");
+        let shell = format_ftl_message(en, "en", "event-tool-start-shell", &[("snippet", "ls -la")])
+            .expect("en event-tool-start-shell should format");
+        assert_eq!(shell, "Running command: ls -la");
+        let done = format_ftl_message(en, "en", "event-tool-done-success",
+            &[("tool", "shell"), ("elapsed", "456")])
+            .expect("en event-tool-done-success should format");
+        assert_eq!(done, "shell completed (456ms)");
+
+        // Chinese (builtin)
+        let zh = include_str!("../locales/zh-CN/events.ftl");
+        let shell_zh = format_ftl_message(zh, "zh-CN", "event-tool-start-shell", &[("snippet", "ls -la")])
+            .expect("zh event-tool-start-shell should format");
+        assert_eq!(shell_zh, "执行命令:ls -la");
+        let agent_zh = format_ftl_message(zh, "zh-CN", "event-agent-start",
+            &[("provider", "openai"), ("model", "gpt-5")])
+            .expect("zh event-agent-start should format");
+        assert_eq!(agent_zh, "Agent 启动(openai/gpt-5)");
+    }
+
+    #[test]
+    fn get_event_string_with_args_falls_back_to_en() {
+        // Unknown locale → English events.ftl fallback.
+        let sources = load_event_ftl_sources("xx-FAKE");
+        let value = format_string_with_args(
+            &sources,
+            include_str!("../locales/en/events.ftl"),
+            "event-tool-done-failure",
+            &[("tool", "shell")],
+        )
+        .expect("fallback to en should format");
+        assert_eq!(value, "shell failed");
     }
 }
