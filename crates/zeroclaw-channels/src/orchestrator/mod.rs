@@ -3955,7 +3955,7 @@ async fn process_channel_message_body(
                             // New code should use ProgressObserver which provides structured updates.
                             let update = zeroclaw_api::channel::ProgressUpdate {
                                 text: visible,
-                                phase: zeroclaw_api::channel::ProgressPhase::AgentEnd,
+                                phase: zeroclaw_api::channel::ProgressPhase::Generic,
                             };
                             if let Err(e) = channel
                                 .update_draft_progress(&reply_target, &draft_id, &update)

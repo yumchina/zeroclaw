@@ -54,6 +54,8 @@ pub enum ProgressPhase {
     ToolDone { tool: String, tool_call_id: Option<String>, success: bool, elapsed_ms: u64 },
     AgentEnd,
     Error { component: String },
+    /// Unstructured text with no specific phase (e.g. legacy streaming status).
+    Generic,
 }
 
 /// A message received from or sent to a channel

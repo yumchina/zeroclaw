@@ -21,15 +21,7 @@ const SUPPORTED_IMAGE_MIMES: &[&str] = &[
 
 /// Encode a text content string as a DawnIM type-14 Markdown Base64 payload.
 pub fn encode_text_payload(content: &str) -> anyhow::Result<String> {
-    let obj = serde_json::json!({
-        "type": 14,
-        "content": {
-            "type": "markdown",
-            "text": content
-        }
-    });
-    let json = serde_json::to_string(&obj)?;
-    Ok(base64::engine::general_purpose::STANDARD.encode(json))
+    encode_progress_payload(content, &zeroclaw_api::channel::ProgressPhase::Generic)
 }
 
 /// Encode a progress update payload: markdown `text` for fallback display,
@@ -70,6 +62,9 @@ pub fn encode_progress_payload(content: &str, phase: &zeroclaw_api::channel::Pro
             zeroclaw_api::channel::ProgressPhase::Error { component } => {
                 obj.insert("phase".into(), serde_json::json!("error"));
                 obj.insert("component".into(), serde_json::json!(component));
+            }
+            zeroclaw_api::channel::ProgressPhase::Generic => {
+                obj.insert("phase".into(), serde_json::json!("generic"));
             }
         }
     }

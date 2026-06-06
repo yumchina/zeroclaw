@@ -774,11 +774,11 @@ mod tests {
         let zh = include_str!("../locales/zh-CN/events.ftl");
         let shell_zh = format_ftl_message(zh, "zh-CN", "event-tool-start-shell", &[("snippet", "ls -la")])
             .expect("zh event-tool-start-shell should format");
-        assert_eq!(shell_zh, "执行命令:ls -la");
+        assert_eq!(shell_zh, "执行命令：ls -la");
         let agent_zh = format_ftl_message(zh, "zh-CN", "event-agent-start",
             &[("provider", "openai"), ("model", "gpt-5")])
             .expect("zh event-agent-start should format");
-        assert_eq!(agent_zh, "Agent 启动(openai/gpt-5)");
+        assert_eq!(agent_zh, "Agent 启动（openai/gpt-5）");
     }
 
     #[test]
