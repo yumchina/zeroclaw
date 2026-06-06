@@ -3527,12 +3527,12 @@ impl Channel for MatrixChannel {
         &self,
         recipient: &str,
         message_id: &str,
-        text: &str,
+        update: &zeroclaw_api::channel::ProgressUpdate,
     ) -> Result<()> {
         // Tool-status updates only show in Partial (edit-in-place) mode.
         // MultiMessage doesn't have an in-flight draft to update.
         if matches!(self.config.stream_mode, StreamMode::Partial) {
-            return self.update_draft(recipient, message_id, text).await;
+            return self.update_draft(recipient, message_id, &update.text).await;
         }
         Ok(())
     }

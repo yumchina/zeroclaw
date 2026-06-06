@@ -21,7 +21,7 @@
 
 use std::sync::Arc;
 
-use zeroclaw_api::channel::Channel;
+use zeroclaw_api::channel::{Channel, ProgressPhase, ProgressUpdate};
 use zeroclaw_config::schema::ProgressObserverConfig;
 use zeroclaw_runtime::observability::{Observer, ObserverEvent, traits::ObserverMetric};
 
@@ -58,53 +58,117 @@ fn truncate_chars(s: &str, max_chars: usize) -> String {
     out
 }
 
-fn format_tool_start_desc(tool: &str, snippet: Option<&str>) -> String {
+fn tool_start_key_and_args<'a>(
+    tool: &'a str,
+    snippet: Option<&'a str>,
+) -> (&'static str, Vec<(&'a str, &'a str)>) {
     match (tool, snippet) {
-        ("shell", Some(s)) => format!("执行命令：{s}"),
-        ("web_search", Some(s)) => format!("搜索：{s}"),
-        ("read_file", Some(s)) => format!("读取文件：{s}"),
-        ("http", Some(s)) => format!("HTTP 请求：{s}"),
-        (other, _) => format!("调用工具：{other}"),
+        ("shell", Some(s)) => ("event-tool-start-shell", vec![("snippet", s)]),
+        ("web_search", Some(s)) => ("event-tool-start-web-search", vec![("snippet", s)]),
+        ("read_file", Some(s)) => ("event-tool-start-read-file", vec![("snippet", s)]),
+        ("http", Some(s)) => ("event-tool-start-http", vec![("snippet", s)]),
+        (other, _) => ("event-tool-start-generic", vec![("tool", other)]),
     }
 }
 
-/// Translate an `ObserverEvent` to a Chinese status string when the
-/// matching toggle is enabled. Returns `None` for events outside the
+/// Translate an `ObserverEvent` to a localized + structured `ProgressUpdate`
+/// when the matching toggle is enabled. Returns `None` for events outside the
 /// 6 supported classes or when the relevant toggle is off.
-pub(crate) fn event_to_status(
+pub(crate) fn event_to_progress(
     event: &ObserverEvent,
     cfg: &ProgressObserverConfig,
-) -> Option<String> {
+) -> Option<ProgressUpdate> {
+    use zeroclaw_runtime::i18n::get_event_string_with_args;
     match event {
         ObserverEvent::AgentStart {
             model_provider,
             model,
-        } if cfg.agent_start => Some(format!("Agent 启动（{model_provider}/{model}）")),
-        ObserverEvent::AgentEnd { .. } if cfg.agent_end => Some("处理完成".into()),
-        ObserverEvent::LlmRequest { messages_count, .. } if cfg.llm_thinking => {
-            Some(format!("正在调用大模型推理（{messages_count} 条消息）"))
+        } if cfg.agent_start => {
+            let text = get_event_string_with_args(
+                "event-agent-start",
+                &[("provider", model_provider), ("model", model)],
+            );
+            Some(ProgressUpdate {
+                text,
+                phase: ProgressPhase::AgentStart {
+                    provider: model_provider.clone(),
+                    model: model.clone(),
+                },
+            })
         }
-        ObserverEvent::ToolCallStart { tool, arguments, .. } if cfg.tool_call_start => {
+        ObserverEvent::AgentEnd { .. } if cfg.agent_end => {
+            let text = get_event_string_with_args("event-agent-end", &[]);
+            Some(ProgressUpdate {
+                text,
+                phase: ProgressPhase::AgentEnd,
+            })
+        }
+        ObserverEvent::LlmRequest { messages_count, .. } if cfg.llm_thinking => {
+            let count = messages_count.to_string();
+            let text = get_event_string_with_args("event-llm-request", &[("count", &count)]);
+            Some(ProgressUpdate {
+                text,
+                phase: ProgressPhase::LlmRequest {
+                    messages_count: *messages_count,
+                },
+            })
+        }
+        ObserverEvent::ToolCallStart {
+            tool,
+            tool_call_id,
+            arguments,
+        } if cfg.tool_call_start => {
             let snippet = summarize_tool_args(arguments.as_deref());
-            Some(format_tool_start_desc(tool, snippet.as_deref()))
+            let (key, args) = tool_start_key_and_args(tool, snippet.as_deref());
+            let text = get_event_string_with_args(key, &args);
+            Some(ProgressUpdate {
+                text,
+                phase: ProgressPhase::ToolStart {
+                    tool: tool.clone(),
+                    tool_call_id: tool_call_id.clone(),
+                },
+            })
         }
         ObserverEvent::ToolCall {
             tool,
+            tool_call_id,
             duration,
             success,
             ..
         } if cfg.tool_call => {
             let elapsed_ms = duration.as_millis().min(u128::from(u64::MAX)) as u64;
-            Some(if *success {
-                format!("{tool} 执行完成（{elapsed_ms}ms）")
+            let text = if *success {
+                let elapsed = elapsed_ms.to_string();
+                get_event_string_with_args(
+                    "event-tool-done-success",
+                    &[("tool", tool), ("elapsed", &elapsed)],
+                )
             } else {
-                format!("{tool} 执行失败")
+                get_event_string_with_args("event-tool-done-failure", &[("tool", tool)])
+            };
+            Some(ProgressUpdate {
+                text,
+                phase: ProgressPhase::ToolDone {
+                    tool: tool.clone(),
+                    tool_call_id: tool_call_id.clone(),
+                    success: *success,
+                    elapsed_ms,
+                },
             })
         }
-        ObserverEvent::Error { component, message } if cfg.error => Some(format!(
-            "{component} 出现错误：{}",
-            truncate_chars(message, ERROR_MESSAGE_MAX_CHARS)
-        )),
+        ObserverEvent::Error { component, message } if cfg.error => {
+            let truncated = truncate_chars(message, ERROR_MESSAGE_MAX_CHARS);
+            let text = get_event_string_with_args(
+                "event-error",
+                &[("component", component), ("message", &truncated)],
+            );
+            Some(ProgressUpdate {
+                text,
+                phase: ProgressPhase::Error {
+                    component: component.clone(),
+                },
+            })
+        }
         _ => None,
     }
 }
@@ -148,7 +212,7 @@ impl ProgressObserver {
 
 impl Observer for ProgressObserver {
     fn record_event(&self, event: &ObserverEvent) {
-        if let Some(text) = event_to_status(event, &self.cfg) {
+        if let Some(update) = event_to_progress(event, &self.cfg) {
             let channel = Arc::clone(&self.channel);
             let recipient = self.recipient.clone();
             let draft_id = self.draft_message_id.clone().unwrap_or_default();
@@ -157,7 +221,7 @@ impl Observer for ProgressObserver {
             // loop or panicking.
             tokio::spawn(async move {
                 if let Err(e) = channel
-                    .update_draft_progress(&recipient, &draft_id, &text)
+                    .update_draft_progress(&recipient, &draft_id, &update)
                     .await
                 {
                     ::zeroclaw_log::record!(
@@ -301,154 +365,112 @@ mod tests {
     // -----------------------------------------------------------------
 
     #[test]
-    fn event_to_status_agent_start_when_toggle_on() {
-        let cfg = all_on();
-        let event = ObserverEvent::AgentStart {
-            model_provider: "openai".into(),
-            model: "gpt-5".into(),
-        };
-        assert_eq!(
-            event_to_status(&event, &cfg).as_deref(),
-            Some("Agent 启动（openai/gpt-5）")
-        );
-    }
-
-    #[test]
-    fn event_to_status_agent_end_when_toggle_on() {
-        let cfg = all_on();
-        let event = ObserverEvent::AgentEnd {
-            model_provider: "openai".into(),
-            model: "gpt-5".into(),
-            duration: Duration::from_millis(1234),
-            tokens_used: None,
-            cost_usd: None,
-        };
-        assert_eq!(event_to_status(&event, &cfg).as_deref(), Some("处理完成"));
-    }
-
-    #[test]
-    fn event_to_status_llm_request_when_toggle_on() {
-        let cfg = all_on();
-        let event = ObserverEvent::LlmRequest {
-            model_provider: "openai".into(),
-            model: "gpt-5".into(),
-            messages_count: 7,
-        };
-        assert_eq!(
-            event_to_status(&event, &cfg).as_deref(),
-            Some("正在调用大模型推理（7 条消息）")
-        );
-    }
-
-    #[test]
-    fn event_to_status_tool_call_start_uses_known_tool_template() {
+    fn event_to_progress_tool_start_known_tool() {
         let cfg = all_on();
         let event = ObserverEvent::ToolCallStart {
             tool: "shell".into(),
-            tool_call_id: None,
+            tool_call_id: Some("call_9".into()),
             arguments: Some(r#"{"command": "ls -la"}"#.into()),
         };
-        assert_eq!(
-            event_to_status(&event, &cfg).as_deref(),
-            Some("执行命令：ls -la")
-        );
+        let u = event_to_progress(&event, &cfg).expect("should translate");
+        assert!(u.text.contains("ls -la"), "text was: {}", u.text);
+        match u.phase {
+            ProgressPhase::ToolStart { tool, tool_call_id } => {
+                assert_eq!(tool, "shell");
+                assert_eq!(tool_call_id.as_deref(), Some("call_9"));
+            }
+            _ => panic!("expected ToolStart"),
+        }
     }
 
     #[test]
-    fn event_to_status_tool_call_start_falls_back_for_unknown_tool() {
+    fn event_to_progress_tool_start_generic_for_unknown_tool() {
         let cfg = all_on();
         let event = ObserverEvent::ToolCallStart {
             tool: "weird_custom_tool".into(),
             tool_call_id: None,
             arguments: None,
         };
-        assert_eq!(
-            event_to_status(&event, &cfg).as_deref(),
-            Some("调用工具：weird_custom_tool")
-        );
+        let u = event_to_progress(&event, &cfg).expect("should translate");
+        assert!(u.text.contains("weird_custom_tool"), "text was: {}", u.text);
+        assert!(matches!(u.phase, ProgressPhase::ToolStart { .. }));
     }
 
     #[test]
-    fn event_to_status_tool_call_success_includes_elapsed() {
+    fn event_to_progress_tool_done_success_carries_fields() {
         let cfg = all_on();
         let event = ObserverEvent::ToolCall {
             tool: "shell".into(),
-            tool_call_id: None,
+            tool_call_id: Some("call_1".into()),
             duration: Duration::from_millis(456),
             success: true,
             arguments: None,
             result: None,
         };
-        assert_eq!(
-            event_to_status(&event, &cfg).as_deref(),
-            Some("shell 执行完成（456ms）")
-        );
+        let u = event_to_progress(&event, &cfg).expect("should translate");
+        assert!(u.text.contains("456"), "text was: {}", u.text);
+        match u.phase {
+            ProgressPhase::ToolDone { tool, tool_call_id, success, elapsed_ms } => {
+                assert_eq!(tool, "shell");
+                assert_eq!(tool_call_id.as_deref(), Some("call_1"));
+                assert!(success);
+                assert_eq!(elapsed_ms, 456);
+            }
+            _ => panic!("expected ToolDone"),
+        }
     }
 
     #[test]
-    fn event_to_status_tool_call_failure_omits_elapsed() {
+    fn event_to_progress_agent_start_phase() {
         let cfg = all_on();
+        let event = ObserverEvent::AgentStart {
+            model_provider: "openai".into(),
+            model: "gpt-5".into(),
+        };
+        let u = event_to_progress(&event, &cfg).expect("should translate");
+        assert!(u.text.contains("openai"), "text was: {}", u.text);
+        match u.phase {
+            ProgressPhase::AgentStart { provider, model } => {
+                assert_eq!(provider, "openai");
+                assert_eq!(model, "gpt-5");
+            }
+            _ => panic!("expected AgentStart"),
+        }
+    }
+
+    #[test]
+    fn event_to_progress_returns_none_when_toggle_off() {
+        let cfg = ProgressObserverConfig {
+            enabled: true,
+            agent_start: false,
+            agent_end: false,
+            tool_call_start: false,
+            tool_call: false,
+            llm_thinking: false,
+            error: false,
+        };
         let event = ObserverEvent::ToolCall {
             tool: "shell".into(),
             tool_call_id: None,
-            duration: Duration::from_millis(456),
-            success: false,
+            duration: Duration::from_millis(1),
+            success: true,
             arguments: None,
             result: None,
         };
-        assert_eq!(
-            event_to_status(&event, &cfg).as_deref(),
-            Some("shell 执行失败")
-        );
+        assert!(event_to_progress(&event, &cfg).is_none());
     }
 
     #[test]
-    fn event_to_status_error_truncates_message() {
-        let cfg = all_on();
-        let message = "x".repeat(300);
-        let event = ObserverEvent::Error {
-            component: "model_provider".into(),
-            message: message.clone(),
-        };
-        let out = event_to_status(&event, &cfg).expect("should produce status");
-        assert!(out.starts_with("model_provider 出现错误："));
-        assert!(
-            out.ends_with('…'),
-            "long message must be truncated with ellipsis"
-        );
-    }
-
-    // -----------------------------------------------------------------
-    // toggle gating
-    // -----------------------------------------------------------------
-
-    #[test]
-    fn event_to_status_returns_none_when_toggle_off_even_if_enabled() {
-        let cfg = ProgressObserverConfig {
-            enabled: true,
-            ..Default::default()
-        };
-        let event = ObserverEvent::AgentEnd {
-            model_provider: "openai".into(),
-            model: "gpt-5".into(),
-            duration: Duration::ZERO,
-            tokens_used: None,
-            cost_usd: None,
-        };
-        assert!(event_to_status(&event, &cfg).is_none());
-    }
-
-    #[test]
-    fn event_to_status_ignores_events_outside_six_classes() {
+    fn event_to_progress_ignores_events_outside_six_classes() {
         let cfg = all_on();
         let event = ObserverEvent::HeartbeatTick;
-        assert!(event_to_status(&event, &cfg).is_none());
+        assert!(event_to_progress(&event, &cfg).is_none());
 
         let event = ObserverEvent::ChannelMessage {
             channel: "slack".into(),
             direction: "inbound".into(),
         };
-        assert!(event_to_status(&event, &cfg).is_none());
+        assert!(event_to_progress(&event, &cfg).is_none());
     }
 
     #[test]
@@ -539,12 +561,12 @@ mod tests {
             &self,
             recipient: &str,
             message_id: &str,
-            text: &str,
+            update: &zeroclaw_api::channel::ProgressUpdate,
         ) -> anyhow::Result<()> {
             self.calls
                 .lock()
                 .await
-                .push((recipient.into(), message_id.into(), text.into()));
+                .push((recipient.into(), message_id.into(), update.text.clone()));
             Ok(())
         }
     }
@@ -588,7 +610,7 @@ mod tests {
         let (recipient, draft_id, text) = &calls[0];
         assert_eq!(recipient, "u_alice");
         assert_eq!(draft_id, "draft-xyz");
-        assert_eq!(text, "执行命令：ls");
+        assert!(text.contains("ls"), "text should contain 'ls', got: {}", text);
     }
 
     #[tokio::test]

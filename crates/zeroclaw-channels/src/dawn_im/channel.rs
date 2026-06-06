@@ -28,7 +28,7 @@ use super::connection::{
 use super::filter::{is_mentioned, is_user_allowed, parse_recipient};
 use super::messaging::{
     download_file_to_workspace, download_image_as_base64, encode_text_payload,
-    process_markdown_resources,
+    encode_progress_payload, process_markdown_resources,
 };
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -1130,14 +1130,14 @@ impl Channel for DawnIMChannel {
         &self,
         recipient: &str,
         _message_id: &str,
-        text: &str,
+        update: &zeroclaw_api::channel::ProgressUpdate,
     ) -> anyhow::Result<()> {
-        let trimmed = text.trim();
+        let trimmed = update.text.trim();
         if trimmed.is_empty() {
             return Ok(());
         }
         let content = format!("💭 {trimmed}");
-        let payload_b64 = encode_text_payload(&content)?;
+        let payload_b64 = encode_progress_payload(&content, &update.phase)?;
         let (channel_id, channel_type) = parse_recipient(recipient);
         let params = SendParams {
             from_uid: Some(self.uid.clone()),

@@ -341,7 +341,7 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         &self,
         _recipient: &str,
         _message_id: &str,
-        _text: &str,
+        _update: &ProgressUpdate,
     ) -> anyhow::Result<()> {
         Ok(())
     }

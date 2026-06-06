@@ -4005,9 +4005,9 @@ impl Channel for SlackChannel {
         &self,
         recipient: &str,
         _message_id: &str,
-        text: &str,
+        update: &zeroclaw_api::channel::ProgressUpdate,
     ) -> anyhow::Result<()> {
-        let status_line = text.trim().lines().last().unwrap_or("").trim();
+        let status_line = update.text.trim().lines().last().unwrap_or("").trim();
         // Skip "Thinking..." — the typing indicator already conveys that.
         // Only show tool-related progress in the status bar.
         if status_line.is_empty() || status_line.starts_with("\u{1f914}") {

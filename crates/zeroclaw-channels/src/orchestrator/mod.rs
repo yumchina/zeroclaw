@@ -3951,8 +3951,14 @@ async fn process_channel_message_body(
                     match event {
                         StreamDelta::Status(text) => {
                             let visible = strip_think_tags_inline(&text);
+                            // Legacy StreamDelta::Status path - wrap in ProgressUpdate with generic phase.
+                            // New code should use ProgressObserver which provides structured updates.
+                            let update = zeroclaw_api::channel::ProgressUpdate {
+                                text: visible,
+                                phase: zeroclaw_api::channel::ProgressPhase::AgentEnd,
+                            };
                             if let Err(e) = channel
-                                .update_draft_progress(&reply_target, &draft_id, &visible)
+                                .update_draft_progress(&reply_target, &draft_id, &update)
                                 .await
                             {
                                 ::zeroclaw_log::record!(
@@ -10605,6 +10611,7 @@ mod tests {
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
             agent_transcription_provider: String::new(),
+            progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             hooks: None,
             non_cli_excluded_tools: Arc::new(Vec::new()),
             autonomy_level: AutonomyLevel::default(),

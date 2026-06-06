@@ -32,6 +32,52 @@ pub fn encode_text_payload(content: &str) -> anyhow::Result<String> {
     Ok(base64::engine::general_purpose::STANDARD.encode(json))
 }
 
+/// Encode a progress update payload: markdown `text` for fallback display,
+/// plus structured fields from `phase` so rich clients can render in place
+/// (e.g. update a tool bubble by `tool_call_id`).
+pub fn encode_progress_payload(content: &str, phase: &zeroclaw_api::channel::ProgressPhase) -> anyhow::Result<String> {
+    let mut inner = serde_json::json!({ "type": "markdown", "text": content });
+    if let Some(obj) = inner.as_object_mut() {
+        match phase {
+            zeroclaw_api::channel::ProgressPhase::AgentStart { provider, model } => {
+                obj.insert("phase".into(), serde_json::json!("agent_start"));
+                obj.insert("provider".into(), serde_json::json!(provider));
+                obj.insert("model".into(), serde_json::json!(model));
+            }
+            zeroclaw_api::channel::ProgressPhase::LlmRequest { messages_count } => {
+                obj.insert("phase".into(), serde_json::json!("llm_request"));
+                obj.insert("messages_count".into(), serde_json::json!(messages_count));
+            }
+            zeroclaw_api::channel::ProgressPhase::ToolStart { tool, tool_call_id } => {
+                obj.insert("phase".into(), serde_json::json!("tool_start"));
+                obj.insert("tool_name".into(), serde_json::json!(tool));
+                if let Some(id) = tool_call_id {
+                    obj.insert("tool_call_id".into(), serde_json::json!(id));
+                }
+            }
+            zeroclaw_api::channel::ProgressPhase::ToolDone { tool, tool_call_id, success, elapsed_ms } => {
+                obj.insert("phase".into(), serde_json::json!("tool_done"));
+                obj.insert("tool_name".into(), serde_json::json!(tool));
+                if let Some(id) = tool_call_id {
+                    obj.insert("tool_call_id".into(), serde_json::json!(id));
+                }
+                obj.insert("success".into(), serde_json::json!(success));
+                obj.insert("elapsed_ms".into(), serde_json::json!(elapsed_ms));
+            }
+            zeroclaw_api::channel::ProgressPhase::AgentEnd => {
+                obj.insert("phase".into(), serde_json::json!("agent_end"));
+            }
+            zeroclaw_api::channel::ProgressPhase::Error { component } => {
+                obj.insert("phase".into(), serde_json::json!("error"));
+                obj.insert("component".into(), serde_json::json!(component));
+            }
+        }
+    }
+    let payload = serde_json::json!({ "type": 14, "content": inner });
+    let json = serde_json::to_string(&payload)?;
+    Ok(base64::engine::general_purpose::STANDARD.encode(json))
+}
+
 pub fn detect_image_mime(content_type: Option<&str>, bytes: &[u8]) -> Option<String> {
     if bytes.len() >= 8 && bytes.starts_with(&[0x89, b'P', b'N', b'G', b'\r', b'\n', 0x1a, b'\n']) {
         return Some("image/png".to_string());
@@ -399,6 +445,30 @@ mod tests {
         assert_eq!(val["type"], 14);
         assert_eq!(val["content"]["type"], "markdown");
         assert_eq!(val["content"]["text"], "hello");
+    }
+
+    #[test]
+    fn encode_progress_payload_includes_tool_call_id_and_fields() {
+        use base64::Engine;
+        use zeroclaw_api::channel::ProgressPhase;
+        let b64 = encode_progress_payload(
+            "💭 shell completed (5ms)",
+            &ProgressPhase::ToolDone {
+                tool: "shell".into(),
+                tool_call_id: Some("call_42".into()),
+                success: true,
+                elapsed_ms: 5,
+            },
+        )
+        .expect("encode should succeed");
+        let raw = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(v["type"], 14);
+        assert_eq!(v["content"]["tool_name"], "shell");
+        assert_eq!(v["content"]["tool_call_id"], "call_42");
+        assert_eq!(v["content"]["success"], true);
+        assert_eq!(v["content"]["elapsed_ms"], 5);
+        assert_eq!(v["content"]["phase"], "tool_done");
     }
 
     #[test]
