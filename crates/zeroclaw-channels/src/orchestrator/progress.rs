@@ -219,7 +219,7 @@ impl Observer for ProgressObserver {
             // Fire-and-forget. Network errors are advisory; losing a single
             // progress update is preferable to back-pressuring the agent
             // loop or panicking.
-            tokio::spawn(async move {
+            zeroclaw_spawn::spawn!(async move {
                 if let Err(e) = channel
                     .update_draft_progress(&recipient, &draft_id, &update)
                     .await
