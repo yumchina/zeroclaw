@@ -269,9 +269,11 @@ impl DawnIMChannel {
                 })
                 .collect();
             *self.pending_outbound.lock().await = pending_send;
-            tracing::info!(
-                "DawnIM: loaded {} pending outbound messages from disk",
-                count
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Load)
+                    .with_attrs(::serde_json::json!({"count": count})),
+                "DawnIM: loaded pending outbound messages from disk"
             );
         }
     }
@@ -365,7 +367,13 @@ impl DawnIMChannel {
                 )
                 .await
             {
-                tracing::error!("DawnIM: failed to update sequence in memory: {}", e);
+                ::zeroclaw_log::record!(
+                    ERROR,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                    "DawnIM: failed to update sequence in memory"
+                );
             }
         }
 
@@ -1024,7 +1032,7 @@ impl DawnIMChannel {
 
 impl Attributable for DawnIMChannel {
     fn role(&self) -> Role {
-        Role::Channel(ChannelKind::WuKongIm)
+        Role::Channel(ChannelKind::DawnIm)
     }
     fn alias(&self) -> &str {
         &self.alias
@@ -1079,20 +1087,34 @@ impl Channel for DawnIMChannel {
                     Ok(_) => {
                         drop(g);
                         if let Err(e) = self.remove_from_pending_outbound(message).await {
-                            tracing::debug!("DawnIM: remove_from_pending_outbound: {}", e);
+                            ::zeroclaw_log::record!(
+                                DEBUG,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                "DawnIM: remove_from_pending_outbound"
+                            );
                         }
                         Ok(())
                     }
                     Err(err) => {
-                        tracing::warn!(
-                            "DawnIM: WebSocket send failed: {}. Clearing sink and buffering message.",
-                            err
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                            "DawnIM: WebSocket send failed. Clearing sink and buffering message."
                         );
                         *g = None;
                         drop(g);
                         self.pending_outbound.lock().await.push(message.clone());
                         if let Err(e) = self.save_pending_outbound().await {
-                            tracing::warn!("DawnIM: failed to persist pending outbound: {}", e);
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Save)
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                "DawnIM: failed to persist pending outbound"
+                            );
                         }
                         Ok(())
                     }
@@ -1102,11 +1124,19 @@ impl Channel for DawnIMChannel {
                 drop(g);
                 self.pending_outbound.lock().await.push(message.clone());
                 if let Err(e) = self.save_pending_outbound().await {
-                    tracing::warn!("DawnIM: failed to persist pending outbound: {}", e);
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Save)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "DawnIM: failed to persist pending outbound"
+                    );
                 }
-                tracing::warn!(
-                    "DawnIM: not connected, buffered message ({} pending)",
-                    self.pending_outbound.lock().await.len()
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                        .with_attrs(::serde_json::json!({"pending": self.pending_outbound.lock().await.len()})),
+                    "DawnIM: not connected, buffered message"
                 );
                 Ok(())
             }
@@ -1261,10 +1291,21 @@ impl Channel for DawnIMChannel {
         self.load_pending_outbound().await;
         let pending = self.pending_outbound.lock().await.clone();
         if !pending.is_empty() {
-            tracing::info!("DawnIM: retrying {} buffered messages", pending.len());
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Retry)
+                    .with_attrs(::serde_json::json!({"count": pending.len()})),
+                "DawnIM: retrying buffered messages"
+            );
             for msg in pending {
                 if let Err(e) = self.send(&msg).await {
-                    tracing::warn!("DawnIM: retry failed for buffered message: {}", e);
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Retry)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "DawnIM: retry failed for buffered message"
+                    );
                 }
             }
         }
