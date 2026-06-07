@@ -112,11 +112,17 @@ impl RuntimeAdapter for NativeRuntime {
             let mut process = tokio::process::Command::new(self.shell.exe());
             match self.shell {
                 WindowsShell::Pwsh | WindowsShell::PowerShell => {
+                    // Force UTF-8 output so that non-ASCII characters
+                    // (e.g. Chinese directory names) survive the
+                    // UTF-8 decode on the Rust side.
+                    let effective_command = format!(
+                        "$OutputEncoding=[Console]::OutputEncoding=[Text.Encoding]::UTF8;{command}"
+                    );
                     process
                         .arg("-NoProfile")
                         .arg("-NonInteractive")
                         .arg("-Command")
-                        .arg(command);
+                        .arg(effective_command);
                 }
                 WindowsShell::Cmd => {
                     process.arg("/C").arg(command);
