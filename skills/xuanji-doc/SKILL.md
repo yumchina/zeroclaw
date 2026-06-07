@@ -7,9 +7,18 @@ tags:
   - extraction
   - xuanji
 enabled: true
+xuanji_uid: 1878_xuanji_agent
 ---
 
 # 璇玑文档提取
+
+## 配置
+
+调用 `dawn_xuanji_create_task` 或 `dawn_xuanji_query_task` 时，必须传入 `xuanji_uid` 参数：
+
+```
+xuanji_uid: "1878_xuanji_agent"  # 璇玑机器人在 WuKongIM 中的 UID
+```
 
 ## 🚨 核心规则
 

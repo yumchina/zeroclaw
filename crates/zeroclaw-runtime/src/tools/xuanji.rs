@@ -49,16 +49,12 @@ pub fn set_xuanji_bridge(tx: XuanjiBridgeTx) {
 // ── DawnXuanjiCreateTask ────────────────────────────────────────
 
 pub struct DawnXuanjiCreateTask {
-    xuanji_wk_uid: String,
     la_id: String,
 }
 
 impl DawnXuanjiCreateTask {
-    pub fn new(xuanji_wk_uid: String, la_id: String) -> Self {
-        Self {
-            xuanji_wk_uid,
-            la_id,
-        }
+    pub fn new(la_id: String) -> Self {
+        Self { la_id }
     }
 }
 
@@ -78,6 +74,10 @@ impl Tool for DawnXuanjiCreateTask {
         json!({
             "type": "object",
             "properties": {
+                "xuanji_uid": {
+                    "type": "string",
+                    "description": "璇玑机器人在 WuKongIM 中的 UID"
+                },
                 "user_text": {
                     "type": "string",
                     "description": "用户发送文件时的原始文字消息"
@@ -95,7 +95,7 @@ impl Tool for DawnXuanjiCreateTask {
                     }
                 }
             },
-            "required": ["user_text", "files"]
+            "required": ["xuanji_uid", "user_text", "files"]
         })
     }
 
@@ -104,6 +104,8 @@ impl Tool for DawnXuanjiCreateTask {
             .get()
             .ok_or_else(|| anyhow::anyhow!("璇玑Agent 桥接未配置（XUANJI_BRIDGE 未设置）"))?;
 
+        let xuanji_uid = args["xuanji_uid"].as_str()
+            .ok_or_else(|| anyhow::anyhow!("缺少 xuanji_uid 参数"))?;
         let user_text = args["user_text"].as_str().unwrap_or_default();
         let files = &args["files"];
         let ctx = read_context();
@@ -135,7 +137,7 @@ impl Tool for DawnXuanjiCreateTask {
         });
 
         bridge
-            .send((self.xuanji_wk_uid.clone(), 1, payload))
+            .send((xuanji_uid.to_string(), 1, payload))
             .map_err(|e| anyhow::anyhow!("发送消息到璇玑Agent 失败: {e}"))?;
 
         let file_count = files.as_array().map(|a| a.len()).unwrap_or(0);
@@ -153,16 +155,12 @@ impl Tool for DawnXuanjiCreateTask {
 // ── DawnXuanjiQueryTask ─────────────────────────────────────────
 
 pub struct DawnXuanjiQueryTask {
-    xuanji_wk_uid: String,
     la_id: String,
 }
 
 impl DawnXuanjiQueryTask {
-    pub fn new(xuanji_wk_uid: String, la_id: String) -> Self {
-        Self {
-            xuanji_wk_uid,
-            la_id,
-        }
+    pub fn new(la_id: String) -> Self {
+        Self { la_id }
     }
 }
 
@@ -181,12 +179,16 @@ impl Tool for DawnXuanjiQueryTask {
         json!({
             "type": "object",
             "properties": {
+                "xuanji_uid": {
+                    "type": "string",
+                    "description": "璇玑机器人在 WuKongIM 中的 UID"
+                },
                 "task_id": {
                     "type": "string",
                     "description": "创建任务时返回的 task_id"
                 }
             },
-            "required": ["task_id"]
+            "required": ["xuanji_uid", "task_id"]
         })
     }
 
@@ -195,6 +197,8 @@ impl Tool for DawnXuanjiQueryTask {
             .get()
             .ok_or_else(|| anyhow::anyhow!("璇玑Agent 桥接未配置（XUANJI_BRIDGE 未设置）"))?;
 
+        let xuanji_uid = args["xuanji_uid"].as_str()
+            .ok_or_else(|| anyhow::anyhow!("缺少 xuanji_uid 参数"))?;
         let task_id = args["task_id"].as_str().unwrap_or_default();
         let ctx = read_context();
         let user_id = ctx.from_uid;
@@ -210,7 +214,7 @@ impl Tool for DawnXuanjiQueryTask {
         });
 
         bridge
-            .send((self.xuanji_wk_uid.clone(), 1, payload))
+            .send((xuanji_uid.to_string(), 1, payload))
             .map_err(|e| anyhow::anyhow!("发送查询到璇玑Agent 失败: {e}"))?;
 
         Ok(ToolResult {

@@ -1095,22 +1095,14 @@ pub fn all_tools_with_runtime(
     }
 
     // ── Xuanji (璇玑Agent) document extraction tools ──
-    let xuanji_wk_uid = std::env::var("XUANJI_WK_UID")
-        .unwrap_or_else(|_| "xuanji".to_string());
     let la_id = config
         .channels
         .wukongim
         .as_ref()
         .map(|w| w.uid.clone())
         .unwrap_or_default();
-    tool_arcs.push(Arc::new(xuanji::XuanjiCreateTaskTool::new(
-        xuanji_wk_uid.clone(),
-        la_id.clone(),
-    )));
-    tool_arcs.push(Arc::new(xuanji::XuanjiQueryTaskTool::new(
-        xuanji_wk_uid.clone(),
-        la_id,
-    )));
+    tool_arcs.push(Arc::new(xuanji::DawnXuanjiCreateTask::new(la_id.clone())));
+    tool_arcs.push(Arc::new(xuanji::DawnXuanjiQueryTask::new(la_id)));
 
     (
         boxed_registry_from_arcs(tool_arcs),
