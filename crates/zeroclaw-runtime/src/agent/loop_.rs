@@ -882,9 +882,6 @@ pub async fn run_tool_call_loop(
     receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
     collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
 ) -> Result<String> {
-    // Xuanji user context is set by orchestrator before agent turn.
-    // (set_current_from_uid / set_current_reply_target handle _la_ suffix parsing)
-
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {

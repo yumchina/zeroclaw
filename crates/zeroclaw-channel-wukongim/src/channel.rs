@@ -568,7 +568,7 @@ impl WuKongIMChannel {
             .unwrap_or(0);
 
         // System command — handle la_init_helloworld CMD
-        if msg_type == WkMessageType::CMD as u64 || msg_type == WkMessageType::CMD_V2 as u64 || payload_json.get("cmd").is_some() {
+        if msg_type == WkMessageType::CMD as u64 || msg_type == WkMessageType::CMD_AGENT as u64 || payload_json.get("cmd").is_some() {
             let _ = self
                 .send_ack(params.message_id.clone(), params.message_seq)
                 .await;
