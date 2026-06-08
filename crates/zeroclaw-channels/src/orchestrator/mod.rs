@@ -546,6 +546,19 @@ fn is_stop_command(content: &str) -> bool {
     base.eq_ignore_ascii_case("/stop")
 }
 
+/// Map an agent-loop error to a structured `ERR:` code for the failure card.
+/// Loop-detector aborts (circuit breaker) → loop_detected; everything else →
+/// step_error. (Context-window overflow is classified by its own branch before
+/// this is reached.)
+fn classify_failure_code(e: &anyhow::Error) -> &'static str {
+    let s = e.to_string();
+    if s.contains("loop detector") || s.contains("circuit breaker") {
+        "ERR:loop_detected"
+    } else {
+        "ERR:step_error"
+    }
+}
+
 /// Strip tool-call XML tags from outgoing messages.
 ///
 /// LLM responses may contain `<function_calls>`, `<function_call>`,
@@ -4748,14 +4761,15 @@ async fn process_channel_message_body(
                     );
                 }
                 if let Some(channel) = target_channel.as_ref() {
+                    let err_code = classify_failure_code(&e);
                     if let Some(ref draft_id) = draft_message_id {
                         let _ = channel
-                            .finalize_draft(&msg.reply_target, draft_id, &format!("⚠️ Error: {e}"))
+                            .finalize_draft(&msg.reply_target, draft_id, err_code)
                             .await;
                     } else {
                         let _ = channel
                             .send(
-                                &SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target)
+                                &SendMessage::new(err_code, &msg.reply_target)
                                     .in_thread(msg.thread_ts.clone()),
                             )
                             .await;
@@ -4796,8 +4810,7 @@ async fn process_channel_message_body(
                 ChatMessage::assistant("[Task timed out — not continuing this request]"),
             );
             if let Some(channel) = target_channel.as_ref() {
-                let error_text =
-                    "⚠️ Request timed out while waiting for the model. Please try again.";
+                let error_text = "ERR:step_timeout";
                 if let Some(ref draft_id) = draft_message_id {
                     let _ = channel
                         .finalize_draft(&msg.reply_target, draft_id, error_text)
@@ -4869,6 +4882,18 @@ async fn dispatch_worker(
             );
             previous.cancellation.cancel();
             previous.completion.wait().await;
+            if let Some(channel) = find_channel_for_message(&ctx.channels_by_name, &msg).cloned() {
+                let reply_target = msg.reply_target.clone();
+                let thread_ts = msg.thread_ts.clone();
+                zeroclaw_spawn::spawn!(async move {
+                    let _ = channel
+                        .send(
+                            &SendMessage::new("ERR:interrupted", &reply_target)
+                                .in_thread(thread_ts),
+                        )
+                        .await;
+                });
+            }
         }
     }
 
@@ -4973,7 +4998,7 @@ async fn run_message_dispatch_loop(
             };
             let reply = if let Some(state) = previous {
                 state.cancellation.cancel();
-                "Stop signal sent.".to_string()
+                "ERR:cancelled".to_string()
             } else {
                 "No in-flight task for this sender scope.".to_string()
             };
@@ -18423,6 +18448,21 @@ Done."#;
         let sm = SendMessage::reply_to(&msg, "Here is the answer");
         assert_eq!(sm.in_reply_to.as_deref(), Some("<abc123@mail.example>"));
         assert!(sm.subject.is_none());
+    }
+}
+
+#[cfg(test)]
+mod error_code_tests {
+    use super::*;
+
+    #[test]
+    fn classify_failure_code_maps_loop_and_error() {
+        let loop_err = anyhow::anyhow!("Agent loop aborted by loop detector: ping-pong");
+        assert_eq!(classify_failure_code(&loop_err), "ERR:loop_detected");
+        let cb = anyhow::anyhow!("circuit breaker tripped");
+        assert_eq!(classify_failure_code(&cb), "ERR:loop_detected");
+        let other = anyhow::anyhow!("some provider 500");
+        assert_eq!(classify_failure_code(&other), "ERR:step_error");
     }
 }
 
