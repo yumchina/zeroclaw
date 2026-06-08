@@ -60,6 +60,41 @@ impl NativeRuntime {
             shell: WindowsShell::detect(),
         }
     }
+
+    /// Build a Windows shell command, preferring PowerShell when available
+    /// and falling back to `cmd.exe` with `raw_arg` to avoid
+    /// `CommandLineToArgvW` mangling of embedded double quotes (see #7083).
+    #[cfg(target_os = "windows")]
+    fn build_windows_command(
+        &self,
+        command: &str,
+        workspace_dir: &Path,
+    ) -> tokio::process::Command {
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+        let mut process = tokio::process::Command::new(self.shell.exe());
+        match self.shell {
+            WindowsShell::Pwsh | WindowsShell::PowerShell => {
+                process
+                    .arg("-NoProfile")
+                    .arg("-NonInteractive")
+                    .arg("-Command")
+                    .arg(command);
+            }
+            WindowsShell::Cmd => {
+                // Use raw_arg so the command string is passed verbatim to cmd.exe,
+                // bypassing Rust's CommandLineToArgvW escaping which mangles
+                // embedded double quotes (see #7083).
+                process
+                    .raw_arg("/C")
+                    .raw_arg(format!("\"{command}\""));
+            }
+        }
+        process
+            .current_dir(workspace_dir)
+            .creation_flags(CREATE_NO_WINDOW);
+        process
+    }
 }
 
 impl RuntimeAdapter for NativeRuntime {
@@ -100,32 +135,7 @@ impl RuntimeAdapter for NativeRuntime {
 
         #[cfg(target_os = "windows")]
         {
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-
-            // PowerShell is preferred on Windows so that cmdlets in the
-            // operator's `allowed_commands` (Get-ChildItem, Format-Table, …)
-            // can actually execute — cmd.exe cannot run cmdlets, which would
-            // make any PowerShell-style allowlist useless. The shell is
-            // detected once at construction (see WindowsShell::detect) and
-            // only falls back to cmd.exe if neither pwsh.exe nor
-            // powershell.exe is on PATH.
-            let mut process = tokio::process::Command::new(self.shell.exe());
-            match self.shell {
-                WindowsShell::Pwsh | WindowsShell::PowerShell => {
-                    process
-                        .arg("-NoProfile")
-                        .arg("-NonInteractive")
-                        .arg("-Command")
-                        .arg(command);
-                }
-                WindowsShell::Cmd => {
-                    process.arg("/C").arg(command);
-                }
-            }
-            process
-                .current_dir(workspace_dir)
-                .creation_flags(CREATE_NO_WINDOW);
-            Ok(process)
+            Ok(self.build_windows_command(command, workspace_dir))
         }
     }
 }
@@ -222,5 +232,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The command string must be present in the debug output regardless of shell.
+    #[test]
+    fn shell_command_preserves_double_quotes() {
+        let cwd = std::env::temp_dir();
+        let command = NativeRuntime::new()
+            .build_shell_command(r#"dir "C:\Users\test\Desktop" /b"#, &cwd)
+            .unwrap();
+        let debug = format!("{command:?}");
+        assert!(
+            debug.contains("dir"),
+            "debug output must contain the command, got: {debug}"
+        );
+        assert!(
+            debug.contains("Desktop"),
+            "debug output must contain the path, got: {debug}"
+        );
+    }
+
+    /// A command with mixed quoted and unquoted segments must pass through intact.
+    #[test]
+    fn shell_command_preserves_mixed_quoted_unquoted() {
+        let cwd = std::env::temp_dir();
+        let command = NativeRuntime::new()
+            .build_shell_command(
+                r#"dir "C:\path with spaces" /b 2>nul || echo "directory missing""#,
+                &cwd,
+            )
+            .unwrap();
+        let debug = format!("{command:?}");
+        assert!(debug.contains("dir"), "missing dir command, got: {debug}");
+        assert!(
+            debug.contains("path with spaces"),
+            "missing path, got: {debug}"
+        );
+        assert!(
+            debug.contains("directory missing"),
+            "missing echo message, got: {debug}"
+        );
+    }
+
+    /// Verify a command with entirely unquoted arguments still works
+    /// (regression check for the raw_arg conversion).
+    #[test]
+    fn shell_command_no_quotes_still_works() {
+        let cwd = std::env::temp_dir();
+        let command = NativeRuntime::new()
+            .build_shell_command("echo hello_world", &cwd)
+            .unwrap();
+        let debug = format!("{command:?}");
+        assert!(debug.contains("echo hello_world"));
     }
 }

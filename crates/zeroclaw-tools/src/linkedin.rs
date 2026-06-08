@@ -240,17 +240,13 @@ impl Tool for LinkedInTool {
                         .and_then(|v| v.as_str())
                         .map(String::from)
                         .unwrap_or_else(|| {
-                            let text_preview = if text.len() > 200 {
-                                let end = (0..=200)
-                                    .rev()
-                                    .find(|&i| text.is_char_boundary(i))
-                                    .unwrap_or(0);
-                                &text[..end]
-                            } else {
-                                &text
-                            };
                             format!(
-                                "Professional, modern illustration for a LinkedIn post about: {text_preview}"
+                                "Professional, modern illustration for a LinkedIn post about: {}",
+                                if text.chars().count() > 200 {
+                                    text.chars().take(200).collect::<String>()
+                                } else {
+                                    text.to_string()
+                                }
                             )
                         });
 
