@@ -68,16 +68,6 @@ use zeroclaw_runtime::tools;
 use zeroclaw_runtime::tools::CanvasStore;
 use zeroclaw_runtime::util::truncate_with_ellipsis;
 
-/// Message routed from Gateway HTTP endpoint to WuKongIM channel supervisor.
-/// Fields: (recipient_uid, channel_type, json_payload)
-pub type ChannelMsg = (String, u8, serde_json::Value);
-
-/// Sender half of the Gateway → WuKongIM bridge.
-pub type ChannelMsgTx = tokio::sync::mpsc::UnboundedSender<ChannelMsg>;
-
-/// Receiver half of the Gateway → WuKongIM bridge.
-pub type ChannelMsgRx = tokio::sync::mpsc::UnboundedReceiver<ChannelMsg>;
-
 /// Maximum request body size (64KB) — prevents memory exhaustion
 pub const MAX_BODY_SIZE: usize = 65_536;
 /// Default request timeout (30s) — prevents slow-loris attacks.
@@ -442,9 +432,6 @@ pub struct AppState {
     pub cancel_tokens: Arc<
         std::sync::Mutex<std::collections::HashMap<String, tokio_util::sync::CancellationToken>>,
     >,
-    /// Gateway → WuKongIM channel bridge: HTTP endpoints write here,
-    /// the WuKongIM channel supervisor reads and forwards via send_status_message.
-    pub channel_msg_tx: Option<ChannelMsgTx>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -459,7 +446,6 @@ pub async fn run_gateway(
     // re-init. Cross-platform replacement for the SIGUSR1 hack.
     reload_tx: Option<tokio::sync::watch::Sender<bool>>,
     canvas_store: Option<CanvasStore>,
-    channel_msg_tx: Option<ChannelMsgTx>,
 ) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
@@ -1080,7 +1066,6 @@ pub async fn run_gateway(
         web_dist_dir,
         canvas_store,
         cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        channel_msg_tx,
         #[cfg(feature = "webauthn")]
         webauthn: if config.security.webauthn.enabled {
             let secret_store = Arc::new(zeroclaw_runtime::security::SecretStore::new(
@@ -1204,7 +1189,6 @@ pub async fn run_gateway(
         .route("/api/cost", get(api::handle_api_cost))
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/channels", get(api::handle_api_channels))
-        .route("/v1/channels/{channel_name}/send", post(api::handle_channel_send))
         .route("/api/health", get(api::handle_api_health))
         .route("/api/sessions", get(api::handle_api_sessions_list))
         .route("/api/sessions/running", get(api::handle_api_sessions_running))
@@ -2909,8 +2893,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        channel_msg_tx: None,
-            #[cfg(feature = "webauthn")]
+#[cfg(feature = "webauthn")]
             webauthn: None,
         };
 
@@ -2979,8 +2962,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        channel_msg_tx: None,
-            #[cfg(feature = "webauthn")]
+#[cfg(feature = "webauthn")]
             webauthn: None,
         };
 
@@ -3439,8 +3421,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        channel_msg_tx: None,
-            #[cfg(feature = "webauthn")]
+#[cfg(feature = "webauthn")]
             webauthn: None,
         };
 
@@ -3522,8 +3503,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        channel_msg_tx: None,
-            #[cfg(feature = "webauthn")]
+#[cfg(feature = "webauthn")]
             webauthn: None,
         };
 
@@ -3617,8 +3597,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        channel_msg_tx: None,
-            #[cfg(feature = "webauthn")]
+#[cfg(feature = "webauthn")]
             webauthn: None,
         };
 
@@ -3684,8 +3663,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        channel_msg_tx: None,
-            #[cfg(feature = "webauthn")]
+#[cfg(feature = "webauthn")]
             webauthn: None,
         };
 
@@ -3756,8 +3734,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        channel_msg_tx: None,
-            #[cfg(feature = "webauthn")]
+#[cfg(feature = "webauthn")]
             webauthn: None,
         };
 
@@ -3833,8 +3810,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        channel_msg_tx: None,
-            #[cfg(feature = "webauthn")]
+#[cfg(feature = "webauthn")]
             webauthn: None,
         };
 
@@ -3907,8 +3883,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        channel_msg_tx: None,
-            #[cfg(feature = "webauthn")]
+#[cfg(feature = "webauthn")]
             webauthn: None,
         };
 
@@ -4018,8 +3993,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        channel_msg_tx: None,
-            #[cfg(feature = "webauthn")]
+#[cfg(feature = "webauthn")]
             webauthn: None,
         };
 

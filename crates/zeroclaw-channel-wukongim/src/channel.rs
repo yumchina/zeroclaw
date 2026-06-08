@@ -1090,10 +1090,20 @@ impl WuKongIMChannel {
     ) -> anyhow::Result<()> {
         let json = serde_json::to_string(&cmd_payload)?;
         let payload_b64 = base64::engine::general_purpose::STANDARD.encode(json);
+
+        // WuKongIM PERSONAL 通道需要 "{uid_a}@{uid_b}" 格式才能正确路由到目标用户
+        let wk_channel_id = if channel_type == WkChannelType::PERSONAL {
+            let mut ids = [self.uid.as_str(), channel_id];
+            ids.sort();
+            format!("{}@{}", ids[0], ids[1])
+        } else {
+            channel_id.to_string()
+        };
+
         let params = SendParams {
             from_uid: Some(self.uid.clone()),
             client_msg_no: Uuid::new_v4().to_string(),
-            channel_id: channel_id.to_string(),
+            channel_id: wk_channel_id,
             channel_type,
             payload: serde_json::Value::String(payload_b64),
             header: None,

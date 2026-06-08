@@ -6390,14 +6390,14 @@ pub async fn start_channels(
         }
     }
 
-    // Gateway → WuKongIM bridge: spawn a listener that consumes messages from
-    // the gateway's HTTP /v1/channels/{name}/send endpoint and forwards them
-    // through the WuKongIM channel's send_status_message.
+    // Xuanji → WuKongIM bridge: spawn a listener that consumes messages from
+    // the xuanji tools' mpsc sender and forwards them through the WuKongIM
+    // channel's send_status_message.
     #[cfg(feature = "channel-wukongim")]
     let has_rx = channel_msg_rx.is_some();
     let has_wk = wukongim_channel.is_some();
     if let (Some(mut rx), Some(wk)) = (channel_msg_rx, wukongim_channel) {
-        tracing::info!("Bridge listener started (Gateway → WuKongIM)");
+        tracing::info!("Bridge listener started (Xuanji → WuKongIM)");
         tokio::spawn(async move {
             while let Some((recipient, channel_type, payload)) = rx.recv().await {
                 tracing::info!(
@@ -6413,11 +6413,11 @@ pub async fn start_channels(
                     tracing::error!(
                         ?e,
                         recipient,
-                        "Failed to forward gateway message to WuKongIM"
+                        "Failed to forward xuanji message to WuKongIM"
                     );
                 }
             }
-            tracing::info!("Gateway → WuKongIM bridge closed");
+            tracing::info!("Xuanji → WuKongIM bridge closed");
         });
     } else {
         tracing::warn!(has_rx, has_wk, "Bridge listener NOT started");

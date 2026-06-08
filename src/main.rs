@@ -1939,7 +1939,7 @@ async fn main() -> Result<()> {
                 let subsystems = daemon::DaemonSubsystems {
                     #[cfg(feature = "gateway")]
                     gateway_start: Some(Box::new(
-                        move |host, port, config, tx, reload_tx, channel_msg_tx| {
+                        move |host, port, config, tx, reload_tx| {
                             let canvas_store = canvas_store_for_gateway.clone();
                             Box::pin(async move {
                                 Box::pin(zeroclaw_gateway::run_gateway(
@@ -1949,7 +1949,6 @@ async fn main() -> Result<()> {
                                     tx,
                                     reload_tx,
                                     Some(canvas_store),
-                                    channel_msg_tx,
                                 ))
                                 .await
                             })
@@ -4220,7 +4219,7 @@ async fn run_gateway_if_enabled(
     // /admin/reload returns 503 with a clear "no supervisor; restart
     // manually" message, and None for canvas_store so the gateway falls
     // back to its own default.
-    Box::pin(gateway::run_gateway(host, port, config, tx, None, None, None)).await
+    Box::pin(gateway::run_gateway(host, port, config, tx, None, None)).await
 }
 
 #[cfg(not(feature = "gateway"))]

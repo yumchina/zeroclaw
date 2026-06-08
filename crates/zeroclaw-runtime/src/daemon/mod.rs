@@ -99,7 +99,6 @@ async fn wait_for_exit_signal(
 #[allow(clippy::type_complexity)]
 pub struct DaemonSubsystems {
     /// Start the gateway HTTP server. Injected by the binary when `gateway` feature is on.
-    /// The sixth argument is the Gateway → WuKongIM bridge sender.
     pub gateway_start: Option<
         Box<
             dyn Fn(
@@ -108,7 +107,6 @@ pub struct DaemonSubsystems {
                     Config,
                     Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
                     Option<tokio::sync::watch::Sender<bool>>,
-                    Option<tokio::sync::mpsc::UnboundedSender<(String, u8, serde_json::Value)>>,
                 ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>
                 + Send
                 + Sync,
@@ -156,12 +154,11 @@ pub async fn run(
     // heartbeat) can publish real-time events to dashboard clients.
     let (event_tx, _rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
 
-    // Gateway → WuKongIM channel bridge: HTTP endpoint writes the sender,
+    // WuKongIM channel bridge: xuanji tools write the sender,
     // the WuKongIM channel supervisor reads the receiver.
-    let (channel_msg_tx, channel_msg_rx) =
+    let (_channel_msg_tx, channel_msg_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, u8, serde_json::Value)>();
-    crate::tools::xuanji::set_xuanji_bridge(channel_msg_tx.clone());
-    let channel_msg_tx = Some(channel_msg_tx);
+    crate::tools::xuanji::set_xuanji_bridge(_channel_msg_tx.clone());
     let mut channel_msg_rx = Some(channel_msg_rx);
 
     if config.heartbeat.enabled {
@@ -181,7 +178,6 @@ pub async fn run(
         let gateway_host = host.clone();
         let gateway_event_tx = event_tx.clone();
         let gateway_reload_tx = reload_tx.clone();
-        let gateway_channel_msg_tx = channel_msg_tx.clone();
         let gateway_start = std::sync::Arc::new(gateway_start);
         handles.push(spawn_component_supervisor(
             "gateway",
@@ -193,9 +189,8 @@ pub async fn run(
                 let host = gateway_host.clone();
                 let tx = gateway_event_tx.clone();
                 let reload = gateway_reload_tx.clone();
-                let channel_msg_tx = gateway_channel_msg_tx.clone();
                 let start = gateway_start.clone();
-                async move { start(host, port, cfg, Some(tx), Some(reload), channel_msg_tx).await }
+                async move { start(host, port, cfg, Some(tx), Some(reload)).await }
             },
         ));
     }

@@ -157,14 +157,6 @@ pub struct SessionMessagePostBody {
     pub content: String,
 }
 
-/// Request body for POST /v1/channels/{name}/send
-#[derive(Deserialize)]
-pub struct ChannelSendRequest {
-    pub recipient: String,
-    pub channel_type: u8,
-    pub message: serde_json::Value,
-}
-
 // ── Handlers ────────────────────────────────────────────────────
 
 /// GET /api/status — system status overview
@@ -1408,53 +1400,6 @@ pub async fn handle_claude_code_hook(
     Json(serde_json::json!({ "ok": true }))
 }
 
-/// POST /v1/channels/{channel_name}/send — send message through a channel
-pub async fn handle_channel_send(
-    State(state): State<AppState>,
-    Path(channel_name): Path<String>,
-    headers: HeaderMap,
-    Json(body): Json<ChannelSendRequest>,
-) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
-        return e.into_response();
-    }
-
-    let tx = match &state.channel_msg_tx {
-        Some(tx) => tx,
-        None => {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({
-                    "success": false,
-                    "error": "Channel bridge not configured — no channel supervisor is running"
-                })),
-            )
-                .into_response();
-        }
-    };
-
-    let msg: super::ChannelMsg = (body.recipient, body.channel_type, body.message);
-
-    match tx.send(msg) {
-        Ok(()) => (
-            StatusCode::OK,
-            Json(serde_json::json!({
-                "success": true,
-                "channel": channel_name,
-            })),
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "success": false,
-                "error": "Channel receiver dropped"
-            })),
-        )
-            .into_response(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1577,7 +1522,6 @@ mod tests {
             web_dist_dir: None,
             canvas_store: zeroclaw_runtime::tools::CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            channel_msg_tx: None,
             reload_tx: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
