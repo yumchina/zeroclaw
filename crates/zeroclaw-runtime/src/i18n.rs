@@ -12,6 +12,7 @@ static CLI_STRINGS: OnceLock<HashMap<String, String>> = OnceLock::new();
 static CLI_FTL_SOURCES: OnceLock<FtlSources> = OnceLock::new();
 static EVENT_STRINGS: OnceLock<HashMap<String, String>> = OnceLock::new();
 static EVENT_FTL_SOURCES: OnceLock<FtlSources> = OnceLock::new();
+static ERROR_STRINGS: OnceLock<HashMap<String, String>> = OnceLock::new();
 static LOCALE: OnceLock<String> = OnceLock::new();
 
 /// The canonical locale registry, embedded from repo-root `locales.toml` at
@@ -70,6 +71,7 @@ pub fn init(locale: &str) {
     CLI_FTL_SOURCES.get_or_init(|| load_cli_ftl_sources(locale));
     EVENT_STRINGS.get_or_init(|| load_event_strings(locale));
     EVENT_FTL_SOURCES.get_or_init(|| load_event_ftl_sources(locale));
+    ERROR_STRINGS.get_or_init(|| load_error_strings(locale));
 }
 
 /// Get a tool description by tool name (e.g. "shell", "file_read").
@@ -103,6 +105,12 @@ pub fn get_required_cli_string_with_args(key: &str, args: &[(&str, &str)]) -> St
 /// Get an event string by key (e.g. "event-agent-end").
 pub fn get_event_string(key: &str) -> Option<String> {
     let map = EVENT_STRINGS.get_or_init(|| load_event_strings(active_locale()));
+    map.get(key).cloned()
+}
+
+/// Get an error-card string by key (e.g. "error-step-timeout-reason").
+pub fn get_error_string(key: &str) -> Option<String> {
+    let map = ERROR_STRINGS.get_or_init(|| load_error_strings(active_locale()));
     map.get(key).cloned()
 }
 
@@ -209,6 +217,22 @@ fn load_event_strings(locale: &str) -> HashMap<String, String> {
 fn builtin_events_ftl_source(locale: &str) -> Option<&'static str> {
     match locale {
         "zh-CN" => Some(include_str!("../locales/zh-CN/events.ftl")),
+        _ => None,
+    }
+}
+
+fn load_error_strings(locale: &str) -> HashMap<String, String> {
+    load_strings(
+        locale,
+        include_str!("../locales/en/errors.ftl"),
+        builtin_errors_ftl_source(locale),
+        "errors.ftl",
+    )
+}
+
+fn builtin_errors_ftl_source(locale: &str) -> Option<&'static str> {
+    match locale {
+        "zh-CN" => Some(include_str!("../locales/zh-CN/errors.ftl")),
         _ => None,
     }
 }
@@ -793,5 +817,37 @@ mod tests {
         )
         .expect("fallback to en should format");
         assert_eq!(value, "shell failed");
+    }
+
+    #[test]
+    fn errors_ftl_formats_en_and_zh() {
+        let en = include_str!("../locales/en/errors.ftl");
+        assert_eq!(
+            format_ftl_message(en, "en", "error-step-timeout-reason", &[]).as_deref(),
+            Some("Step Timeout")
+        );
+        let zh = include_str!("../locales/zh-CN/errors.ftl");
+        assert_eq!(
+            format_ftl_message(zh, "zh-CN", "error-step-timeout-reason", &[]).as_deref(),
+            Some("步骤超时 (Step Timeout)")
+        );
+        assert_eq!(
+            format_ftl_message(zh, "zh-CN", "error-heading-error", &[]).as_deref(),
+            Some("⚠️ 智能体任务异常")
+        );
+        assert_eq!(
+            format_ftl_message(zh, "zh-CN", "error-cancelled-detail", &[]).as_deref(),
+            Some("您已停止当前任务。")
+        );
+    }
+
+    #[test]
+    fn get_error_string_loads_from_catalogue() {
+        // load_error_strings builds the catalogue; English fallback for unknown locale.
+        let map = load_error_strings("xx-FAKE");
+        assert_eq!(
+            map.get("error-step-error-reason").map(String::as_str),
+            Some("Step Error")
+        );
     }
 }
