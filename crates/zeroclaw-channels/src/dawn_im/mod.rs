@@ -10,6 +10,7 @@
 pub mod approval;
 pub mod channel;
 pub mod connection;
+pub mod exception_card;
 pub mod filter;
 pub mod messaging;
 
