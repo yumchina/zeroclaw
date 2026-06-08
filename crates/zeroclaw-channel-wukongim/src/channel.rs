@@ -1091,19 +1091,12 @@ impl WuKongIMChannel {
         let json = serde_json::to_string(&cmd_payload)?;
         let payload_b64 = base64::engine::general_purpose::STANDARD.encode(json);
 
-        // WuKongIM PERSONAL 通道需要 "{uid_a}@{uid_b}" 格式才能正确路由到目标用户
-        let wk_channel_id = if channel_type == WkChannelType::PERSONAL {
-            let mut ids = [self.uid.as_str(), channel_id];
-            ids.sort();
-            format!("{}@{}", ids[0], ids[1])
-        } else {
-            channel_id.to_string()
-        };
-
+        // WK 服务端会根据 from_uid 自动规范化 channel_id 为 "{from_uid}@{to_uid}"，
+        // 这里直接使用调用方传入的原始 channel_id，不要自行拼接。
         let params = SendParams {
             from_uid: Some(self.uid.clone()),
             client_msg_no: Uuid::new_v4().to_string(),
-            channel_id: wk_channel_id,
+            channel_id: channel_id.to_string(),
             channel_type,
             payload: serde_json::Value::String(payload_b64),
             header: None,
@@ -1114,6 +1107,12 @@ impl WuKongIMChannel {
             topic: None,
         };
         let _: serde_json::Value = self.send_rpc("send", params).await?;
+        tracing::info!(
+            channel_id = %channel_id,
+            channel_type,
+            from_uid = %self.uid,
+            "send_status_message: sent to WK"
+        );
         Ok(())
     }
 
