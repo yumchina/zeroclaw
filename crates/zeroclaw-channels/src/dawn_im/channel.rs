@@ -25,6 +25,7 @@ use super::connection::{
     SendParams, SyncRequest, SyncResponse, DAWN_IM_RPC_VERSION, WkChannelType, WkMessageType,
     WsSink,
 };
+use super::exception_card::build_exception_card;
 use super::filter::{is_mentioned, is_user_allowed, parse_recipient};
 use super::messaging::{
     download_file_to_workspace, download_image_as_base64, encode_text_payload,
@@ -1054,11 +1055,12 @@ impl Channel for DawnIMChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let content = match message.content.as_str() {
-            "ERR:context_window_exceeded" => "⚠️ 模型服务暂时遇到问题，请稍后重试。",
-            other => other,
+        let payload_b64 = if let Some(code) = message.content.strip_prefix("ERR:") {
+            let card = build_exception_card(code);
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(&card)?)
+        } else {
+            encode_text_payload(&message.content)?
         };
-        let payload_b64 = encode_text_payload(content)?;
         let (channel_id, channel_type) = parse_recipient(&message.recipient);
         let params = SendParams {
             from_uid: Some(self.uid.clone()),

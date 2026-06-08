@@ -94,4 +94,18 @@ mod tests {
         assert_eq!(card.kind, "step_error");
         assert_eq!(card.level, "error");
     }
+
+    #[test]
+    fn card_serializes_with_type_and_fields() {
+        let card = build_exception_card("cancelled");
+        let v = serde_json::to_value(&card).expect("serialize");
+        assert_eq!(v["type"], 20); // INTERACTIVE_CARD
+        assert_eq!(v["kind"], "cancelled");
+        assert_eq!(v["level"], "cancelled");
+        assert!(v.get("heading").is_some());
+        assert!(v.get("reason").is_some());
+        assert!(v.get("detail").is_some());
+        // actions=None must be omitted (skip_serializing_if)
+        assert!(v.get("actions").is_none());
+    }
 }
