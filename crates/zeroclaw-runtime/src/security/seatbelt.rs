@@ -154,6 +154,26 @@ fn seatbelt_string_literal(value: &str) -> String {
 /// - Restricts process spawning to essential operations
 fn generate_policy(workspace: &Path) -> String {
     let workspace_str = seatbelt_string_literal(&workspace.to_string_lossy());
+
+    // Generate parent rules to support getcwd traversal
+    let mut parent_rules_list = String::new();
+    let mut current = workspace.parent();
+    while let Some(p) = current {
+        let p_str = seatbelt_string_literal(&p.to_string_lossy());
+        if !p_str.is_empty() && p_str != "/" {
+            parent_rules_list.push_str(&format!("    (literal \"{}\")\n", p_str));
+        }
+        current = p.parent();
+    }
+    let parent_rules = if parent_rules_list.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "\n;; Allow reading parent directories of workspace (needed for getcwd traversal)\n(allow file-read*\n{})",
+            parent_rules_list
+        )
+    };
+
     format!(
         r#"(version 1)
 
@@ -185,6 +205,7 @@ fn generate_policy(workspace: &Path) -> String {
 
 ;; Allow reading the workspace
 (allow file-read* (subpath "{workspace}"))
+{parent_rules}
 
 ;; Allow reading temp directories (needed for policy file itself)
 (allow file-read* (subpath "/tmp"))
@@ -195,6 +216,10 @@ fn generate_policy(workspace: &Path) -> String {
 ;; Allow reading user home for tool configs
 (allow file-read*
     (regex #"^/Users/[^/]+/\\."))
+
+;; Allow traversing /Users for path resolution (needed for realpath resolution)
+(allow file-read-metadata
+    (subpath "/Users"))
 
 ;; ── Filesystem writes ──────────────────────────────────────
 ;; Only allow writes to workspace and temp directories
