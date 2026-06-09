@@ -1522,7 +1522,7 @@ pub async fn run_tool_call_loop(
                 }),
             );
             // No tool calls — this is the final response.
-            accumulated_display_text.push_str(&display_text);
+            accumulated_display_text = display_text.clone();
 
             // If text wasn't streamed live, send it now via post-hoc chunking.
             // When streamed live, the channel already received the deltas.
