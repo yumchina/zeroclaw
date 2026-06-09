@@ -10905,10 +10905,10 @@ pub struct ChannelsConfig {
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
     pub mqtt: HashMap<String, MqttConfig>,
-    /// DawnIM channel instances (`[channels.dawnIM.<alias>]`).
+    /// DawnIM channel instances (`[channels.dawnim.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
-    pub dawn_im: HashMap<String, DawnIMConfig>,
+    pub dawnim: HashMap<String, DawnIMConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -11216,10 +11216,10 @@ impl ChannelsConfig {
                 configured: !self.webhook.is_empty(),
             },
             ChannelInfo {
-                kind: "dawnIM",
+                kind: "dawnim",
                 name: "DawnIM",
                 desc: "DawnIM messaging platform",
-                configured: !self.dawn_im.is_empty(),
+                configured: !self.dawnim.is_empty(),
             },
         ]
     }
@@ -11311,7 +11311,7 @@ impl Default for ChannelsConfig {
             voice_wake: HashMap::new(),
             voice_duplex: HashMap::new(),
             mqtt: HashMap::new(),
-            dawn_im: HashMap::new(),
+            dawnim: HashMap::new(),
             message_timeout_secs: default_channel_message_timeout_secs(),
             ack_reactions: true,
             show_tool_calls: false,
@@ -11864,7 +11864,7 @@ impl ChannelConfig for WebhookConfig {
 /// Bot communicates with the DawnIM server over WebSocket using JSON-RPC 2.0.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, Configurable)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
-#[prefix = "channels.dawnIM"]
+#[prefix = "channels.dawnim"]
 pub struct DawnIMConfig {
     /// Whether this channel is active. The runtime only loads channels whose
     /// `enabled = true`. Default: `false`.
@@ -18299,7 +18299,7 @@ auto_save = true
                 voice_duplex: HashMap::new(),
                 voice_wake: HashMap::new(),
                 mqtt: HashMap::new(),
-                dawn_im: HashMap::new(),
+                dawnim: HashMap::new(),
                 message_timeout_secs: 300,
                 ack_reactions: true,
                 show_tool_calls: true,
@@ -19760,7 +19760,7 @@ allowed_users = ["@u:matrix.org"]
             voice_duplex: HashMap::new(),
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
-            dawn_im: HashMap::new(),
+            dawnim: HashMap::new(),
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,
@@ -20203,7 +20203,7 @@ allowed_numbers = ["+1", "+2"]
             voice_duplex: HashMap::new(),
             voice_wake: HashMap::new(),
             mqtt: HashMap::new(),
-            dawn_im: HashMap::new(),
+            dawnim: HashMap::new(),
             message_timeout_secs: 300,
             ack_reactions: true,
             show_tool_calls: true,

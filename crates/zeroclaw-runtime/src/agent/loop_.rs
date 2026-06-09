@@ -1288,7 +1288,7 @@ fn maybe_inject_channel_delivery_defaults(
 
     if !matches!(
         channel_name,
-        "telegram" | "discord" | "slack" | "mattermost" | "matrix" | "dawnIM"
+        "telegram" | "discord" | "slack" | "mattermost" | "matrix" | "dawnim"
     ) {
         return;
     }

@@ -654,7 +654,7 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
             MODEL_PROVIDER_ESSENTIALS,
         ),
         FieldSection::Channel => (format!("channels.{type_key}"), CHANNEL_ESSENTIALS),
-        FieldSection::PeerGroup => (format!("peer-groups.{type_key}"), PEER_GROUP_ESSENTIALS),
+        FieldSection::PeerGroup => (format!("peer_groups.{type_key}"), PEER_GROUP_ESSENTIALS),
     };
 
     // A throwaway Config we can mutate freely. Inject one default
@@ -701,19 +701,17 @@ pub fn field_shape(section: FieldSection, type_key: &str) -> Vec<FieldDescriptor
             kind: info.kind,
             is_secret: info.is_secret,
             enum_variants: info.enum_variants.map(|f| f()),
-            // `uri` is an override-only field — operators set it only
-            // when pointing at a self-hosted gateway. `requires_openai_auth`
-            // and `wire_api` are OpenAI Codex subscription fields — optional
-            // for all providers, meaningful only for OpenAI. `api_key` is
-            // left non-required because local providers (Ollama) and Codex
-            // subscription auth don't need one — the runtime surfaces a
-            // clear error at request time if a remote provider is missing
-            // its key. Everything else in the essentials list is required
-            // to actually issue a request.
-            required: !matches!(
-                field_path,
-                "uri" | "api_key" | "requires_openai_auth" | "wire_api"
-            ),
+            // `uri` is required for the `custom` provider (no default endpoint)
+            // but optional for all others (override-only). `api_key` is left
+            // non-required because local providers (Ollama) and Codex
+            // subscription auth don't need one. `requires_openai_auth` and
+            // `wire_api` are OpenAI Codex subscription fields — optional
+            // for all providers.
+            required: match field_path {
+                "api_key" | "requires_openai_auth" | "wire_api" => false,
+                "uri" => type_key == "custom",
+                _ => true,
+            },
             default,
         });
     }
@@ -958,18 +956,19 @@ fn apply_model_provider(
                     return None;
                 }
             };
-            if section_has_alias(config, "providers.models", &provider_type, &choice.alias) {
+            let provider_alias = choice.alias.trim().to_ascii_lowercase();
+            if section_has_alias(config, "providers.models", &provider_type, &provider_alias) {
                 errors.push(QuickstartError::new(
                     QuickstartStep::ModelProvider,
                     "alias",
-                    format!("alias `{}.{}` already exists", provider_type, choice.alias),
+                    format!("alias `{provider_type}.{provider_alias}` already exists"),
                 ));
                 return None;
             }
-            let prefix = format!("providers.models.{}.{}", provider_type, choice.alias);
+            let prefix = format!("providers.models.{provider_type}.{provider_alias}");
             if let Err(err) = config.create_map_key(
-                &format!("providers.models.{}", provider_type),
-                &choice.alias,
+                &format!("providers.models.{provider_type}"),
+                &provider_alias,
             ) {
                 errors.push(QuickstartError::new(
                     QuickstartStep::ModelProvider,
@@ -1005,7 +1004,7 @@ fn apply_model_provider(
                     return None;
                 }
             }
-            Some(format!("{}.{}", provider_type, choice.alias))
+            Some(format!("{provider_type}.{provider_alias}"))
         }
     }
 }
@@ -1213,7 +1212,8 @@ fn apply_channels(
                 }
             }
             SelectorChoice::Fresh(entry) => {
-                if entry.channel_type.trim().is_empty() || entry.alias.trim().is_empty() {
+                let ch_alias = entry.alias.trim().to_ascii_lowercase();
+                if entry.channel_type.trim().is_empty() || ch_alias.is_empty() {
                     errors.push(QuickstartError::new(
                         QuickstartStep::Channels,
                         format!("channels[{idx}]"),
@@ -1221,19 +1221,16 @@ fn apply_channels(
                     ));
                     continue;
                 }
-                if channel_exists(config, &entry.channel_type, &entry.alias) {
+                if channel_exists(config, &entry.channel_type, &ch_alias) {
                     errors.push(QuickstartError::new(
                         QuickstartStep::Channels,
                         format!("channels[{idx}].alias"),
-                        format!(
-                            "alias `{}.{}` already exists",
-                            entry.channel_type, entry.alias
-                        ),
+                        format!("alias `{}.{ch_alias}` already exists", entry.channel_type),
                     ));
                     continue;
                 }
                 if let Err(err) =
-                    config.create_map_key(&format!("channels.{}", entry.channel_type), &entry.alias)
+                    config.create_map_key(&format!("channels.{}", entry.channel_type), &ch_alias)
                 {
                     errors.push(QuickstartError::new(
                         QuickstartStep::Channels,
@@ -1242,8 +1239,16 @@ fn apply_channels(
                     ));
                     continue;
                 }
+                // Find the actual credential field for this channel type (e.g.
+                // `bot_token` for Telegram/Discord, `token` for DawnIM). Fall
+                // back to `bot_token` for unknown channel types.
+                let cred_field = field_shape(FieldSection::Channel, &entry.channel_type)
+                    .into_iter()
+                    .find(|f| f.is_secret)
+                    .map(|f| f.key)
+                    .unwrap_or_else(|| "bot_token".to_string());
                 let token_path =
-                    format!("channels.{}.{}.bot_token", entry.channel_type, entry.alias);
+                    format!("channels.{}.{ch_alias}.{cred_field}", entry.channel_type);
                 if let Some(tok) = &entry.token {
                     if let Err(err) = config.set_prop_persistent(&token_path, tok) {
                         errors.push(QuickstartError::new(
@@ -1259,7 +1264,7 @@ fn apply_channels(
                     // schema-recognised field; channels without creds will fail
                     // their own bootstrap loudly, which is the desired behaviour.
                     let enabled_path =
-                        format!("channels.{}.{}.enabled", entry.channel_type, entry.alias);
+                        format!("channels.{}.{ch_alias}.enabled", entry.channel_type);
                     if let Err(err) = config.set_prop_persistent(&enabled_path, "true") {
                         errors.push(QuickstartError::new(
                             QuickstartStep::Channels,
@@ -1269,7 +1274,7 @@ fn apply_channels(
                         continue;
                     }
                 }
-                refs.push(format!("{}.{}", entry.channel_type, entry.alias));
+                refs.push(format!("{}.{ch_alias}", entry.channel_type));
             }
         }
     }
@@ -1291,7 +1296,8 @@ fn apply_peer_groups(
 ) -> Vec<String> {
     let mut refs = Vec::with_capacity(peer_groups.len());
     for (idx, pg) in peer_groups.iter().enumerate() {
-        if pg.name.trim().is_empty() {
+        let pg_name = pg.name.trim().to_ascii_lowercase();
+        if pg_name.is_empty() {
             errors.push(QuickstartError::new(
                 QuickstartStep::Channels,
                 format!("peer_groups[{idx}].name"),
@@ -1319,23 +1325,23 @@ fn apply_peer_groups(
                 QuickstartStep::Channels,
                 format!("peer_groups[{idx}].channel"),
                 format!(
-                    "peer-group `{}` references unknown channel `{}`",
-                    pg.name, pg.channel
+                    "peer-group `{pg_name}` references unknown channel `{}`",
+                    pg.channel
                 ),
             ));
             continue;
         }
         // Collision: existing peer-group block wins. Surface the conflict
         // so the operator sees what they need to rename.
-        if config.peer_groups.contains_key(&pg.name) {
+        if config.peer_groups.contains_key(&pg_name) {
             errors.push(QuickstartError::new(
                 QuickstartStep::Channels,
                 format!("peer_groups[{idx}].name"),
-                format!("peer-group `{}` already exists", pg.name),
+                format!("peer-group `{pg_name}` already exists"),
             ));
             continue;
         }
-        if let Err(err) = config.create_map_key("peer-groups", &pg.name) {
+        if let Err(err) = config.create_map_key("peer_groups", &pg_name) {
             errors.push(QuickstartError::new(
                 QuickstartStep::Channels,
                 format!("peer_groups[{idx}]"),
@@ -1343,7 +1349,7 @@ fn apply_peer_groups(
             ));
             continue;
         }
-        let prefix = format!("peer-groups.{}", pg.name);
+        let prefix = format!("peer_groups.{pg_name}");
         if let Err(err) = config.set_prop_persistent(&format!("{prefix}.channel"), &pg.channel) {
             errors.push(QuickstartError::new(
                 QuickstartStep::Channels,
@@ -1386,7 +1392,7 @@ fn apply_peer_groups(
                 continue;
             }
         }
-        refs.push(pg.name.clone());
+        refs.push(pg_name);
     }
     refs
 }
@@ -1519,7 +1525,8 @@ fn apply_agent(
     channel_refs: &[String],
     errors: &mut Vec<QuickstartError>,
 ) -> Option<String> {
-    if identity.name.trim().is_empty() {
+    let alias = identity.name.trim().to_ascii_lowercase();
+    if alias.is_empty() {
         errors.push(QuickstartError::new(
             QuickstartStep::Agent,
             "name",
@@ -1527,17 +1534,17 @@ fn apply_agent(
         ));
         return None;
     }
-    if config.agents.contains_key(&identity.name) {
+    if config.agents.contains_key(&alias) {
         errors.push(QuickstartError::new(
             QuickstartStep::Agent,
             "name",
-            format!("agent `{}` already exists", identity.name),
+            format!("agent `{alias}` already exists"),
         ));
         return None;
     }
 
-    let prefix = format!("agents.{}", identity.name);
-    if let Err(err) = config.create_map_key("agents", &identity.name) {
+    let prefix = format!("agents.{alias}");
+    if let Err(err) = config.create_map_key("agents", &alias) {
         errors.push(QuickstartError::new(
             QuickstartStep::Agent,
             "name",
@@ -1573,7 +1580,7 @@ fn apply_agent(
             return None;
         }
     }
-    Some(identity.name.clone())
+    Some(alias)
 }
 
 // ── Shared helpers ─────────────────────────────────────────────────

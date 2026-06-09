@@ -651,7 +651,7 @@ impl DawnIMChannel {
                     sender: target_id.clone(),
                     reply_target: format!("{}:{}", params.channel_type, target_id),
                     content: content.to_string(),
-                    channel: "dawnIM".to_string(),
+                    channel: "dawnim".to_string(),
                     channel_alias: Some(self.alias.clone()),
                     timestamp: u64::try_from(params.timestamp.max(0)).unwrap_or(0),
                     thread_ts: None,
@@ -787,7 +787,7 @@ impl DawnIMChannel {
             } else {
                 content
             },
-            channel: "dawnIM".to_string(),
+            channel: "dawnim".to_string(),
             channel_alias: Some(self.alias.clone()),
             timestamp: u64::try_from(params.timestamp.max(0)).unwrap_or(0),
             thread_ts: None,
@@ -997,7 +997,7 @@ impl DawnIMChannel {
             } else {
                 combined_content
             },
-            channel: "dawnIM".to_string(),
+            channel: "dawnim".to_string(),
             channel_alias: Some(self.alias.clone()),
             timestamp: u64::try_from(last.timestamp.max(0)).unwrap_or(0),
             thread_ts: None,
@@ -1043,7 +1043,7 @@ impl Attributable for DawnIMChannel {
 #[async_trait]
 impl Channel for DawnIMChannel {
     fn name(&self) -> &str {
-        "dawnIM"
+        "dawnim"
     }
 
     fn self_handle(&self) -> Option<String> {

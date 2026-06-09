@@ -111,7 +111,7 @@ pub enum ChannelKind {
     Wechat,
     WhatsappBusiness,
     WhatsappWeb,
-    #[strum(serialize = "dawnIM")]
+    #[strum(serialize = "dawnim")]
     DawnIm,
 }
 

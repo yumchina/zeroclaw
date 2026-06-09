@@ -6556,8 +6556,8 @@ fn collect_configured_channels(
     }
 
     #[cfg(feature = "channel-dawnIM")]
-    for (alias, wk) in &config.channels.dawn_im {
-        if !active_channel_aliases.contains(&format!("dawnIM.{alias}")) {
+    for (alias, wk) in &config.channels.dawnim {
+        if !active_channel_aliases.contains(&format!("dawnim.{alias}")) {
             continue;
         }
         if !wk.enabled {
@@ -9053,13 +9053,13 @@ pub async fn deliver_announcement(
             anyhow::bail!("WeChat channel requires the `channel-wechat` feature");
         }
         #[cfg(feature = "channel-dawnIM")]
-        "dawnIM" => {
+        "dawnim" => {
             let wk = config
                 .channels
-                .dawn_im
+                .dawnim
                 .get(alias)
                 .ok_or_else(not_configured)?;
-            let peers = config.channel_external_peers("dawnIM", alias);
+            let peers = config.channel_external_peers("dawnim", alias);
             let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
                 Arc::new(move || peers.clone());
             let _ = peer_resolver;
@@ -9074,7 +9074,7 @@ pub async fn deliver_announcement(
             zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
         }
         #[cfg(not(feature = "channel-dawnIM"))]
-        "dawnIM" => {
+        "dawnim" => {
             anyhow::bail!("DawnIM channel requires the `channel-dawnIM` feature");
         }
         #[cfg(feature = "channel-lark")]

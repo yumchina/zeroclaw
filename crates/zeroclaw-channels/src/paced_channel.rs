@@ -29,7 +29,8 @@ use async_trait::async_trait;
 use tokio::sync::{Mutex, oneshot};
 use zeroclaw_api::attribution::{Attributable, Role};
 use zeroclaw_api::channel::{
-    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, SendMessage,
+    Channel, ChannelApprovalRequest, ChannelApprovalResponse, ChannelMessage, ProgressUpdate,
+    SendMessage,
 };
 use zeroclaw_config::schema::{DEFAULT_REPLY_QUEUE_DEPTH, HasReplyPacing, PACING_RECIPIENT_CAP};
 
@@ -415,10 +416,10 @@ impl Channel for PacedChannel {
         &self,
         recipient: &str,
         message_id: &str,
-        text: &str,
+        update: &ProgressUpdate,
     ) -> Result<()> {
         self.inner
-            .update_draft_progress(recipient, message_id, text)
+            .update_draft_progress(recipient, message_id, update)
             .await
     }
 

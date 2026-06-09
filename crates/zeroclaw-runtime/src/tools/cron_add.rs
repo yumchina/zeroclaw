@@ -265,7 +265,7 @@ impl Tool for CronAddTool {
                         },
                         "channel": {
                             "type": "string",
-                            "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq", "webhook", "dawnIM", "lark", "feishu"],
+                            "enum": ["telegram", "discord", "slack", "mattermost", "matrix", "qq", "webhook", "dawnim", "lark", "feishu"],
                             "description": "Channel type to deliver output to"
                         },
                         "to": {

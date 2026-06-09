@@ -2083,6 +2083,12 @@ pub fn list_model_providers() -> Vec<ModelProviderInfo> {
             display_name: "Inception Labs (Mercury)",
             local: false,
         },
+        // ── Custom OpenAI-compatible endpoint ─────────────────────
+        ModelProviderInfo {
+            name: "custom",
+            display_name: "Custom (OpenAI-compatible)",
+            local: false,
+        },
     ]
 }
 
