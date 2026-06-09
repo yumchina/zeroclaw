@@ -2893,7 +2893,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            #[cfg(feature = "webauthn")]
+#[cfg(feature = "webauthn")]
             webauthn: None,
         };
 
@@ -2962,7 +2962,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            #[cfg(feature = "webauthn")]
+#[cfg(feature = "webauthn")]
             webauthn: None,
         };
 
@@ -3421,7 +3421,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            #[cfg(feature = "webauthn")]
+#[cfg(feature = "webauthn")]
             webauthn: None,
         };
 
@@ -3503,7 +3503,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            #[cfg(feature = "webauthn")]
+#[cfg(feature = "webauthn")]
             webauthn: None,
         };
 
@@ -3597,7 +3597,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            #[cfg(feature = "webauthn")]
+#[cfg(feature = "webauthn")]
             webauthn: None,
         };
 
@@ -3663,7 +3663,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            #[cfg(feature = "webauthn")]
+#[cfg(feature = "webauthn")]
             webauthn: None,
         };
 
@@ -3734,7 +3734,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            #[cfg(feature = "webauthn")]
+#[cfg(feature = "webauthn")]
             webauthn: None,
         };
 
@@ -3810,7 +3810,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            #[cfg(feature = "webauthn")]
+#[cfg(feature = "webauthn")]
             webauthn: None,
         };
 
@@ -3883,7 +3883,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            #[cfg(feature = "webauthn")]
+#[cfg(feature = "webauthn")]
             webauthn: None,
         };
 
@@ -3993,7 +3993,7 @@ mod tests {
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            #[cfg(feature = "webauthn")]
+#[cfg(feature = "webauthn")]
             webauthn: None,
         };
 

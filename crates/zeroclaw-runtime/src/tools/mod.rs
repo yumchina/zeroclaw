@@ -37,6 +37,7 @@ pub mod sop_execute;
 pub mod sop_list;
 pub mod sop_status;
 pub mod verifiable_intent;
+pub mod xuanji;
 
 // Tool types from zeroclaw-tools (direct imports, no shims)
 pub use zeroclaw_tools::ask_user::AskUserTool;
@@ -1092,6 +1093,16 @@ pub fn all_tools_with_runtime(
             pipeline_tools,
         )));
     }
+
+    // ── Xuanji (璇玑Agent) document extraction tools ──
+    let la_id = config
+        .channels
+        .wukongim
+        .as_ref()
+        .map(|w| w.uid.clone())
+        .unwrap_or_default();
+    tool_arcs.push(Arc::new(xuanji::DawnXuanjiCreateTask::new(la_id.clone())));
+    tool_arcs.push(Arc::new(xuanji::DawnXuanjiQueryTask::new(la_id)));
 
     (
         boxed_registry_from_arcs(tool_arcs),

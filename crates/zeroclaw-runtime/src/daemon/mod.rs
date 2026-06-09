@@ -99,8 +99,6 @@ async fn wait_for_exit_signal(
 #[allow(clippy::type_complexity)]
 pub struct DaemonSubsystems {
     /// Start the gateway HTTP server. Injected by the binary when `gateway` feature is on.
-    /// The fifth argument is the reload sender — the gateway hands it to its
-    /// AppState so /admin/reload can signal the daemon to re-init.
     pub gateway_start: Option<
         Box<
             dyn Fn(
@@ -115,9 +113,13 @@ pub struct DaemonSubsystems {
         >,
     >,
     /// Start supervised channels. Injected by the binary when channels crate is available.
+    /// The second argument is the Gateway → WuKongIM bridge receiver.
     pub channels_start: Option<
         Box<
-            dyn Fn(Config) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>
+            dyn Fn(
+                    Config,
+                    Option<tokio::sync::mpsc::UnboundedReceiver<(String, u8, serde_json::Value)>>,
+                ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>
                 + Send
                 + Sync,
         >,
@@ -151,6 +153,13 @@ pub async fn run(
     // Shared broadcast channel so all daemon components (gateway, cron,
     // heartbeat) can publish real-time events to dashboard clients.
     let (event_tx, _rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
+
+    // WuKongIM channel bridge: xuanji tools write the sender,
+    // the WuKongIM channel supervisor reads the receiver.
+    let (_channel_msg_tx, channel_msg_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(String, u8, serde_json::Value)>();
+    crate::tools::xuanji::set_xuanji_bridge(_channel_msg_tx.clone());
+    let mut channel_msg_rx = Some(channel_msg_rx);
 
     if config.heartbeat.enabled {
         let _ =
@@ -189,6 +198,7 @@ pub async fn run(
     if let Some(channels_start) = subsystems.channels_start {
         if has_supervised_channels(&config) {
             let channels_cfg = config.clone();
+            let mut channels_channel_msg_rx = channel_msg_rx.take();
             let channels_start = std::sync::Arc::new(channels_start);
             handles.push(spawn_component_supervisor(
                 "channels",
@@ -197,8 +207,9 @@ pub async fn run(
                 Some(event_tx.clone()),
                 move || {
                     let cfg = channels_cfg.clone();
+                    let channel_msg_rx = channels_channel_msg_rx.take();
                     let start = channels_start.clone();
-                    async move { start(cfg).await }
+                    async move { start(cfg, channel_msg_rx).await }
                 },
             ));
         } else {

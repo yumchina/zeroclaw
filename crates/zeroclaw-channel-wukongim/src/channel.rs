@@ -568,7 +568,7 @@ impl WuKongIMChannel {
             .unwrap_or(0);
 
         // System command — handle la_init_helloworld CMD
-        if msg_type == WkMessageType::CMD as u64 || payload_json.get("cmd").is_some() {
+        if msg_type == WkMessageType::CMD as u64 || msg_type == WkMessageType::AGENT_MSG as u64 || payload_json.get("cmd").is_some() {
             let _ = self
                 .send_ack(params.message_id.clone(), params.message_seq)
                 .await;
@@ -602,6 +602,255 @@ impl WuKongIMChannel {
                     )
                     .await?;
                 }
+            } else if payload_json.get("cmd").and_then(|c| c.as_str()) == Some("xuanji.extraction_complete") {
+                // Handle xuanji extraction completion notification
+                let param = payload_json.get("param");
+                let status = param.and_then(|p| p.get("status")).and_then(|s| s.as_str());
+
+                // Handle both completed and failed status
+                let task_id = param.and_then(|p| p.get("task_id")).and_then(|t| t.as_str());
+                let user_id = param.and_then(|p| p.get("user_id")).and_then(|u| u.as_str());
+                let reply_target = param.and_then(|p| p.get("reply_target")).and_then(|r| r.as_str());
+                let user_text = param.and_then(|p| p.get("user_text")).and_then(|t| t.as_str());
+
+                if status != Some("completed") {
+                    // Failed: notify Agent without downloading
+                    let error = param.and_then(|p| p.get("error")).and_then(|e| e.as_str());
+                    let content = format!(
+                        "[璇玑文档提取失败] task_id={}\n\n用户原始请求：{}\n\n失败原因：{}\n\n请告知用户处理失败，建议重试。",
+                        task_id.unwrap_or("unknown"),
+                        user_text.unwrap_or("无"),
+                        error.unwrap_or("未知错误"),
+                    );
+                    tracing::info!("Xuanji: extraction_complete failed, notifying agent");
+
+                    // Parse reply_target
+                    let (ct, tid) = if let Some(rt) = reply_target {
+                        if rt.contains(':') {
+                            let parts: Vec<&str> = rt.split(':').collect();
+                            (parts[0].parse::<u8>().unwrap_or(2), parts[1].to_string())
+                        } else {
+                            (1u8, rt.to_string())
+                        }
+                    } else {
+                        (params.channel_type as u8, params.from_uid.clone())
+                    };
+                    let ch_msg = ChannelMessage {
+                        id: format!("xuanji_{}", task_id.unwrap_or("unknown")),
+                        sender: tid.clone(),
+                        reply_target: format!("{}:{}", ct, tid),
+                        content,
+                        channel: "wukongim".to_string(),
+                        timestamp: params.timestamp.max(0) as u64,
+                        thread_ts: None,
+                        interruption_scope_id: None,
+                        attachments: vec![],
+                    };
+                    if tx.send(ch_msg).await.is_ok() {
+                        tracing::info!("Xuanji: sent failed ChannelMessage to orchestrator");
+                        self.update_sync_state(&params.channel_id, params.channel_type, params.message_seq, params.timestamp * 1_000_000_000).await?;
+                    }
+                    return Ok(());
+                }
+
+                // Completed: download files and notify Agent
+                let files = param.and_then(|p| p.get("files")).and_then(|f| f.as_array());
+
+                if let Some(files_arr) = files {
+                    // Download all result files
+                    let mut downloaded_files = Vec::new();
+                    let mut failed_files = Vec::new();
+                    for file in files_arr.as_slice() {
+                        let file_url = file.get("file_url").and_then(|u| u.as_str());
+                        let file_name = file.get("file_name").and_then(|n| n.as_str());
+
+                        if let (Some(url), Some(name)) = (file_url, file_name) {
+                            let result = download_file_to_workspace(url, &self.downloads_dir, Some(name)).await;
+                            match result {
+                                Ok(local_path) => {
+                                    tracing::info!("Xuanji: downloaded {} to {}", name, local_path);
+                                    downloaded_files.push((name.to_string(), local_path));
+                                }
+                                Err(e) => {
+                                    tracing::warn!("Xuanji: failed to download {}: {}", name, e);
+                                    failed_files.push((name.to_string(), url.to_string()));
+                                }
+                            }
+                        }
+                    }
+
+                    // Build message content
+                    let mut file_list = String::new();
+                    if !downloaded_files.is_empty() {
+                        file_list.push_str("已下载：\n");
+                        for (name, path) in &downloaded_files {
+                            file_list.push_str(&format!("- {} (本地: {})\n", name, path));
+                        }
+                    }
+                    if !failed_files.is_empty() {
+                        file_list.push_str("\n下载失败（可直接访问 URL）：\n");
+                        for (name, url) in &failed_files {
+                            file_list.push_str(&format!("- {} \n  URL: {}\n", name, url));
+                        }
+                    }
+
+                    // Extract summary from first result file (if any)
+                    let summary_text = files_arr.first()
+                        .and_then(|f| f.get("summary"))
+                        .and_then(|s| s.as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(|s| format!("\n文件内容摘要：\n{}", s))
+                        .unwrap_or_default();
+
+                    let content = format!(
+                        "[璇玑文档提取完成] task_id={}\n\n\
+                         用户原始请求：{}\n\n\
+                         ⚠️ 已下载文件为璇玑 OCR 提取的 Markdown 文本，直接用 read 读取，禁止 shell/pdf-parse。\n\
+                         ⚠️ 不要再调用 xuanji_doc_create_task，任务已经完成。\n\n\
+                         已下载文件：\n{}{}\n\n\
+                         请读取文件内容后直接回复用户。",
+                        task_id.unwrap_or("unknown"),
+                        user_text.unwrap_or("无"),
+                        file_list,
+                        summary_text,
+                    );
+
+                    // Parse reply_target
+                    let (channel_type, target_id) = if let Some(rt) = reply_target {
+                        if rt.contains(':') {
+                            let parts: Vec<&str> = rt.split(':').collect();
+                            (parts[0].parse::<u8>().unwrap_or(2), parts[1].to_string())
+                        } else {
+                            (1u8, rt.to_string())
+                        }
+                    } else {
+                        (params.channel_type as u8, params.from_uid.clone())
+                    };
+
+                    let ch_msg = ChannelMessage {
+                        id: format!("xuanji_{}", task_id.unwrap_or("unknown")),
+                        sender: target_id.clone(),
+                        reply_target: format!("{}:{}", channel_type, target_id),
+                        content,
+                        channel: "wukongim".to_string(),
+                        timestamp: params.timestamp.max(0) as u64,
+                        thread_ts: None,
+                        interruption_scope_id: None,
+                        attachments: vec![],  // TODO: if attachments needed, fill here
+                    };
+
+                    if tx.send(ch_msg).await.is_ok() {
+                        tracing::info!("Xuanji: sent ChannelMessage to orchestrator");
+                        self.update_sync_state(&params.channel_id, params.channel_type, params.message_seq, params.timestamp * 1_000_000_000).await?;
+                    }
+                }
+
+                return Ok(());
+            } else if payload_json.get("cmd").and_then(|c| c.as_str()) == Some("xuanji.task_ack") {
+                let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
+
+                let param = payload_json.get("param");
+                let task_id = param.and_then(|p| p.get("task_id")).and_then(|t| t.as_str());
+                let status = param.and_then(|p| p.get("status")).and_then(|s| s.as_str());
+
+                tracing::info!("Xuanji: task_ack received, task_id={}, status={}",
+                    task_id.unwrap_or("unknown"), status.unwrap_or("unknown"));
+
+                let target_id = if params.channel_type == WkChannelType::PERSONAL {
+                    &params.from_uid
+                } else {
+                    &params.channel_id
+                };
+
+                // 静默消息：agent 获取 task_id 但不回复用户
+                let content = format!(
+                    "<!-- zeroclaw:silent -->[璇玑任务确认] task_id={}，状态={}",
+                    task_id.unwrap_or("unknown"), status.unwrap_or("unknown")
+                );
+
+                let ch_msg = ChannelMessage {
+                    id: params.message_id.clone(),
+                    sender: target_id.clone(),
+                    reply_target: format!("{}:{}", params.channel_type, target_id),
+                    content,
+                    channel: "wukongim".to_string(),
+                    timestamp: params.timestamp.max(0) as u64,
+                    thread_ts: None,
+                    interruption_scope_id: None,
+                    attachments: vec![],
+                };
+
+                if tx.send(ch_msg).await.is_ok() {
+                    self.update_sync_state(&params.channel_id, params.channel_type, params.message_seq, params.timestamp * 1_000_000_000).await?;
+                }
+
+                return Ok(());
+            } else if payload_json.get("cmd").and_then(|c| c.as_str()) == Some("xuanji.task_status") {
+                let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
+
+                let param = payload_json.get("param");
+                let task_id = param.and_then(|p| p.get("task_id")).and_then(|t| t.as_str());
+                let status = param.and_then(|p| p.get("status")).and_then(|s| s.as_str());
+                let reply_target = param.and_then(|p| p.get("reply_target")).and_then(|r| r.as_str());
+                let user_text = param.and_then(|p| p.get("user_text")).and_then(|t| t.as_str());
+                let files = param.and_then(|p| p.get("files")).and_then(|f| f.as_array());
+
+                tracing::info!("Xuanji: task_status received, task_id={}, status={}",
+                    task_id.unwrap_or("unknown"), status.unwrap_or("unknown"));
+
+                // Parse reply_target from param (not from from_uid)
+                let (ct, tid) = if let Some(rt) = reply_target {
+                    if rt.contains(':') {
+                        let parts: Vec<&str> = rt.split(':').collect();
+                        (parts[0].parse::<u8>().unwrap_or(2), parts[1].to_string())
+                    } else {
+                        (1u8, rt.to_string())
+                    }
+                } else {
+                    (params.channel_type as u8, params.from_uid.clone())
+                };
+
+                let file_list = files.map(|arr| {
+                    arr.iter()
+                        .filter_map(|f| {
+                            let name = f.get("file_name").and_then(|n| n.as_str()).unwrap_or("?");
+                            f.get("file_url").and_then(|u| u.as_str())
+                                .map(|url| format!("- {} ({})", name, url))
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                }).unwrap_or_default();
+
+                let content = match status {
+                    Some("completed") => format!(
+                        "[璇玑任务状态] task_id={}\n状态：已完成\n用户请求：{}\n结果文件：\n{}",
+                        task_id.unwrap_or("unknown"),
+                        user_text.unwrap_or("无"),
+                        file_list,
+                    ),
+                    _ => format!(
+                        "[璇玑任务状态] task_id={}，状态：{}",
+                        task_id.unwrap_or("unknown"), status.unwrap_or("unknown")
+                    ),
+                };
+
+                let ch_msg = ChannelMessage {
+                    id: params.message_id.clone(),
+                    sender: tid.clone(),
+                    reply_target: format!("{}:{}", ct, tid),
+                    content,
+                    channel: "wukongim".to_string(),
+                    timestamp: params.timestamp.max(0) as u64,
+                    thread_ts: None,
+                    interruption_scope_id: None,
+                    attachments: vec![],
+                };
+
+                if tx.send(ch_msg).await.is_ok() {
+                    self.update_sync_state(&params.channel_id, params.channel_type, params.message_seq, params.timestamp * 1_000_000_000).await?;
+                }
+
+                return Ok(());
             }
             return Ok(());
         }
@@ -833,7 +1082,7 @@ impl WuKongIMChannel {
     ///
     /// WuKongIM's Go server expects `SendParams.payload` as `[]uint8`, which
     /// JSON-encodes as a base64 string — same contract as `send_text_message`.
-    async fn send_status_message(
+    pub async fn send_status_message(
         &self,
         channel_id: &str,
         channel_type: u8,
@@ -841,6 +1090,9 @@ impl WuKongIMChannel {
     ) -> anyhow::Result<()> {
         let json = serde_json::to_string(&cmd_payload)?;
         let payload_b64 = base64::engine::general_purpose::STANDARD.encode(json);
+
+        // WK 服务端会根据 from_uid 自动规范化 channel_id 为 "{from_uid}@{to_uid}"，
+        // 这里直接使用调用方传入的原始 channel_id，不要自行拼接。
         let params = SendParams {
             from_uid: Some(self.uid.clone()),
             client_msg_no: Uuid::new_v4().to_string(),
@@ -855,6 +1107,12 @@ impl WuKongIMChannel {
             topic: None,
         };
         let _: serde_json::Value = self.send_rpc("send", params).await?;
+        tracing::info!(
+            channel_id = %channel_id,
+            channel_type,
+            from_uid = %self.uid,
+            "send_status_message: sent to WK"
+        );
         Ok(())
     }
 
