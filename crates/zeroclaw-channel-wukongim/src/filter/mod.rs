@@ -25,7 +25,7 @@ pub fn parse_recipient(recipient: &str) -> (String, u8) {
 /// This version only relies on the structured `mention` object in the payload JSON:
 /// - `mention.all == 1` or `"1"` for @all/@everyone.
 /// - `mention.uids` containing the bot's UID.
-/// 
+///
 /// Text-based pattern matching (e.g., scanning the content for "@bot_uid") is disabled.
 pub fn is_mentioned(bot_uid: &str, payload_json: &serde_json::Value, _content: &str) -> bool {
     if let Some(mention) = payload_json.get("mention") {

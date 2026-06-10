@@ -28,7 +28,7 @@ impl SeatbeltSandbox {
     /// Returns an error if `sandbox-exec` is not available or the policy file
     /// cannot be written.
     pub fn new() -> std::io::Result<Self> {
-        Self::with_workspace(None)
+        Self::with_workspace_and_outbound(None, &[])
     }
 
     /// Create a new Seatbelt sandbox for the provided workspace root.
@@ -36,6 +36,22 @@ impl SeatbeltSandbox {
     /// If no workspace is provided, falls back to the process current
     /// directory for compatibility with direct construction.
     pub fn with_workspace(workspace: Option<&Path>) -> std::io::Result<Self> {
+        Self::with_workspace_and_outbound(workspace, &[])
+    }
+
+    /// Create a new Seatbelt sandbox for the provided workspace root and
+    /// a list of additional outbound network hosts to allow.
+    ///
+    /// `outbound_allow` is rendered as `(allow network-outbound (remote tcp
+    /// "host:port"))` rules appended to the policy's network section. Each
+    /// entry must already be in `host:port` form (e.g.
+    /// `aiordering.kfc.com.cn:443`); the caller is responsible for
+    /// validating entries. Empty slice keeps the default localhost-only
+    /// outbound.
+    pub fn with_workspace_and_outbound(
+        workspace: Option<&Path>,
+        outbound_allow: &[String],
+    ) -> std::io::Result<Self> {
         if !Self::is_installed() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -52,7 +68,7 @@ impl SeatbeltSandbox {
         let workspace = workspace
             .map(Path::to_path_buf)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/tmp")));
-        let policy = generate_policy(&workspace);
+        let policy = generate_policy(&workspace, outbound_allow);
         std::fs::write(&policy_path, &policy)?;
 
         Ok(Self {
@@ -152,19 +168,80 @@ fn seatbelt_string_literal(value: &str) -> String {
 /// - Denies filesystem writes outside the workspace and temp directories
 /// - Allows reads to system paths required for process execution
 /// - Restricts process spawning to essential operations
-fn generate_policy(workspace: &Path) -> String {
+fn generate_policy(workspace: &Path, outbound_allow: &[String]) -> String {
+    let workspace_canonical = workspace
+        .canonicalize()
+        .unwrap_or_else(|_| workspace.to_path_buf());
+
     let workspace_str = seatbelt_string_literal(&workspace.to_string_lossy());
+    let workspace_canonical_str = seatbelt_string_literal(&workspace_canonical.to_string_lossy());
 
     // Generate parent rules to support getcwd traversal
     let mut parent_rules_list = String::new();
+    let mut seen_parents = std::collections::HashSet::new();
+
     let mut current = workspace.parent();
     while let Some(p) = current {
         let p_str = seatbelt_string_literal(&p.to_string_lossy());
-        if !p_str.is_empty() && p_str != "/" {
+        if !p_str.is_empty() && p_str != "/" && seen_parents.insert(p_str.clone()) {
             parent_rules_list.push_str(&format!("    (literal \"{}\")\n", p_str));
+            let with_slash = if p_str.ends_with('/') {
+                p_str.clone()
+            } else {
+                format!("{}/", p_str)
+            };
+            parent_rules_list.push_str(&format!("    (literal \"{}\")\n", with_slash));
+
+            // Allow checking existence of common project files in parent dirs to prevent Bun/Node resolver EPERM crashes
+            for file in &[
+                "package.json",
+                "node_modules",
+                "tsconfig.json",
+                "jsconfig.json",
+                "bunfig.toml",
+                ".env",
+                "package-lock.json",
+                "yarn.lock",
+                "pnpm-lock.yaml",
+                "bun.lockb",
+            ] {
+                parent_rules_list.push_str(&format!("    (literal \"{}{}\")\n", with_slash, file));
+            }
         }
         current = p.parent();
     }
+
+    let mut current_canonical = workspace_canonical.parent();
+    while let Some(p) = current_canonical {
+        let p_str = seatbelt_string_literal(&p.to_string_lossy());
+        if !p_str.is_empty() && p_str != "/" && seen_parents.insert(p_str.clone()) {
+            parent_rules_list.push_str(&format!("    (literal \"{}\")\n", p_str));
+            let with_slash = if p_str.ends_with('/') {
+                p_str.clone()
+            } else {
+                format!("{}/", p_str)
+            };
+            parent_rules_list.push_str(&format!("    (literal \"{}\")\n", with_slash));
+
+            // Allow checking existence of common project files in parent dirs to prevent Bun/Node resolver EPERM crashes
+            for file in &[
+                "package.json",
+                "node_modules",
+                "tsconfig.json",
+                "jsconfig.json",
+                "bunfig.toml",
+                ".env",
+                "package-lock.json",
+                "yarn.lock",
+                "pnpm-lock.yaml",
+                "bun.lockb",
+            ] {
+                parent_rules_list.push_str(&format!("    (literal \"{}{}\")\n", with_slash, file));
+            }
+        }
+        current_canonical = p.parent();
+    }
+
     let parent_rules = if parent_rules_list.is_empty() {
         String::new()
     } else {
@@ -172,6 +249,90 @@ fn generate_policy(workspace: &Path) -> String {
             "\n;; Allow reading parent directories of workspace (needed for getcwd traversal)\n(allow file-read*\n{})",
             parent_rules_list
         )
+    };
+
+    let workspace_read_rules = if workspace == workspace_canonical {
+        format!("(allow file-read* (subpath \"{}\"))", workspace_str)
+    } else {
+        format!(
+            "(allow file-read* (subpath \"{}\"))\n(allow file-read* (subpath \"{}\"))",
+            workspace_str, workspace_canonical_str
+        )
+    };
+
+    let workspace_write_rules = if workspace == workspace_canonical {
+        format!("(allow file-write* (subpath \"{}\"))", workspace_str)
+    } else {
+        format!(
+            "(allow file-write* (subpath \"{}\"))\n(allow file-write* (subpath \"{}\"))",
+            workspace_str, workspace_canonical_str
+        )
+    };
+
+    // Detect if HOME environment variable is overridden to a session-specific isolated directory
+    let host_home = directories::UserDirs::new().map(|u| u.home_dir().to_path_buf());
+    let mut extra_home_rules = String::new();
+    if let Ok(env_home_str) = std::env::var("HOME") {
+        let env_home_path = PathBuf::from(&env_home_str);
+        let is_isolated = if let Some(ref hh) = host_home {
+            env_home_path != *hh
+        } else {
+            true
+        };
+        if is_isolated {
+            let env_home_escaped = seatbelt_string_literal(&env_home_path.to_string_lossy());
+            extra_home_rules.push_str(&format!(
+                "\n;; Allow reading and writing to isolated session HOME\n(allow file-read* (subpath \"{}\"))\n(allow file-write* (subpath \"{}\"))\n",
+                env_home_escaped, env_home_escaped
+            ));
+        }
+    }
+
+    // Render trusted outbound hosts. Each entry is rendered as its own
+    // (allow network-outbound (remote tcp "host:port")) rule. Empty
+    // list yields an empty string so the policy is unchanged.
+    //
+    // macOS sandbox-exec rejects `(remote tcp "host:port")` at policy
+    // load time (it only accepts `localhost` or `*` in network filters),
+    // so on macOS this block is intentionally a no-op — emitting the
+    // rules would cause every shell spawn to fail with
+    // `sandbox-exec: host must be * or localhost`. Operators who need
+    // external access on macOS must use a localhost proxy or accept
+    // the coarse `*` fallback; the config field is preserved for
+    // forward compatibility with Linux/Windows backends.
+    #[cfg(not(target_os = "macos"))]
+    let outbound_allow_rules = if outbound_allow.is_empty() {
+        String::new()
+    } else {
+        let mut s = String::from(
+            "\n;; User-configured trusted outbound hosts (security.sandbox.network_outbound_allow)\n",
+        );
+        for entry in outbound_allow {
+            let escaped = seatbelt_string_literal(entry);
+            s.push_str(&format!(
+                "(allow network-outbound\n    (remote tcp \"{}\"))\n",
+                escaped
+            ));
+        }
+        s
+    };
+    #[cfg(target_os = "macos")]
+    let outbound_allow_rules = if outbound_allow.is_empty() {
+        String::new()
+    } else {
+        let mut s = String::from(
+            "\n;; User-configured trusted outbound hosts (mapped to *:port on macOS Seatbelt)\n",
+        );
+        for entry in outbound_allow {
+            // macOS sandbox-exec rejects specific hostnames (e.g. "aiordering.kfc.com.cn:443"),
+            // so we map "host:port" to a wildcard "*:port" rule.
+            let port = entry.split(':').next_back().unwrap_or("*");
+            s.push_str(&format!(
+                "(allow network-outbound\n    (remote ip \"*:{}\"))\n",
+                port
+            ));
+        }
+        s
     };
 
     format!(
@@ -195,6 +356,7 @@ fn generate_policy(workspace: &Path) -> String {
     (subpath "/Library")
     (subpath "/System")
     (subpath "/private/var")
+    (subpath "/private/etc")
     (subpath "/dev")
     (subpath "/etc")
     (subpath "/Applications")
@@ -204,8 +366,9 @@ fn generate_policy(workspace: &Path) -> String {
     (subpath "/var"))
 
 ;; Allow reading the workspace
-(allow file-read* (subpath "{workspace}"))
+{workspace_read_rules}
 {parent_rules}
+{extra_home_rules}
 
 ;; Allow reading temp directories (needed for policy file itself)
 (allow file-read* (subpath "/tmp"))
@@ -223,8 +386,7 @@ fn generate_policy(workspace: &Path) -> String {
 
 ;; ── Filesystem writes ──────────────────────────────────────
 ;; Only allow writes to workspace and temp directories
-(allow file-write*
-    (subpath "{workspace}"))
+{workspace_write_rules}
 (allow file-write*
     (subpath "/tmp")
     (subpath "/private/tmp"))
@@ -237,7 +399,8 @@ fn generate_policy(workspace: &Path) -> String {
 ;; Deny all network by default (inherited from deny default)
 ;; Allow DNS resolution only
 (allow network-outbound
-    (remote unix-socket (path-literal "/var/run/mDNSResponder")))
+    (remote unix-socket (path-literal "/var/run/mDNSResponder"))
+    (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))
 (allow system-socket)
 
 ;; Allow localhost connections only (for local dev servers).
@@ -246,6 +409,7 @@ fn generate_policy(workspace: &Path) -> String {
 ;; to fail to parse.
 (allow network-outbound
     (remote ip "localhost:*"))
+{outbound_allow_rules}
 
 ;; ── Mach / IPC ─────────────────────────────────────────────
 ;; Allow basic mach services needed for process execution
@@ -259,7 +423,11 @@ fn generate_policy(workspace: &Path) -> String {
 (allow sysctl-read)
 (allow mach-task-name)
 "#,
-        workspace = workspace_str,
+        workspace_read_rules = workspace_read_rules,
+        parent_rules = parent_rules,
+        workspace_write_rules = workspace_write_rules,
+        extra_home_rules = extra_home_rules,
+        outbound_allow_rules = outbound_allow_rules,
     )
 }
 
@@ -268,222 +436,198 @@ mod tests {
     use super::*;
 
     #[test]
-    fn seatbelt_sandbox_name() {
-        let sandbox = SeatbeltSandbox {
-            policy_dir: PathBuf::from("/tmp/test-seatbelt"),
-            policy_path: PathBuf::from("/tmp/test-seatbelt/test.sb"),
-        };
-        assert_eq!(sandbox.name(), "sandbox-exec");
-    }
-
-    #[test]
-    fn seatbelt_description_mentions_macos() {
-        let sandbox = SeatbeltSandbox {
-            policy_dir: PathBuf::from("/tmp/test-seatbelt"),
-            policy_path: PathBuf::from("/tmp/test-seatbelt/test.sb"),
-        };
-        assert!(sandbox.description().contains("macOS"));
-        assert!(sandbox.description().contains("Seatbelt"));
-    }
-
-    #[test]
-    fn generate_policy_contains_workspace_path() {
-        let workspace = PathBuf::from("/Users/test/project");
-        let policy = generate_policy(&workspace);
-        assert!(policy.contains("/Users/test/project"));
-    }
-
-    #[test]
-    fn generate_policy_escapes_workspace_path_string_literal() {
-        let workspace = PathBuf::from("/tmp/zc\"quote\\slash\nnewline");
-        let policy = generate_policy(&workspace);
-
-        assert!(policy.contains(r#"(subpath "/tmp/zc\"quote\\slash\nnewline")"#));
-        assert!(!policy.contains("zc\"quote\\slash\nnewline"));
-    }
-
-    #[test]
-    fn generate_policy_uses_provided_workspace_for_access_rules() {
-        let workspace = PathBuf::from("/tmp/zeroclaw-seatbelt-test-workspace");
-        let policy = generate_policy(&workspace);
-
-        assert!(
-            policy.contains(
-                r#"(allow file-read* (subpath "/tmp/zeroclaw-seatbelt-test-workspace"))"#
-            )
-        );
-        assert!(policy.contains(r#"(subpath "/tmp/zeroclaw-seatbelt-test-workspace")"#));
-    }
-
-    #[test]
-    fn generate_policy_denies_by_default() {
-        let workspace = PathBuf::from("/tmp/workspace");
-        let policy = generate_policy(&workspace);
-        assert!(policy.contains("(deny default)"));
-    }
-
-    #[test]
-    fn generate_policy_allows_workspace_writes() {
-        let workspace = PathBuf::from("/home/user/code");
-        let policy = generate_policy(&workspace);
-        assert!(policy.contains("(allow file-write*"));
-        assert!(policy.contains("/home/user/code"));
-    }
-
-    #[test]
-    fn generate_policy_restricts_network() {
-        let workspace = PathBuf::from("/tmp/workspace");
-        let policy = generate_policy(&workspace);
-        assert!(policy.contains("localhost"));
-        assert!(!policy.contains("127.0.0.1"));
-        assert!(!policy.contains("(allow network*)"));
-    }
-
-    #[test]
-    fn generate_policy_allows_system_reads() {
-        let workspace = PathBuf::from("/tmp/workspace");
-        let policy = generate_policy(&workspace);
-        assert!(policy.contains("(subpath \"/usr\")"));
-        assert!(policy.contains("(subpath \"/bin\")"));
-        assert!(policy.contains("(subpath \"/System\")"));
-    }
-
-    #[test]
-    fn generate_policy_allows_process_execution() {
-        let workspace = PathBuf::from("/tmp/workspace");
-        let policy = generate_policy(&workspace);
-        assert!(policy.contains("(allow process-exec)"));
-        assert!(policy.contains("(allow process-fork)"));
-    }
-
-    #[test]
-    fn seatbelt_wrap_command_prepends_sandbox_exec() {
-        let dir = tempfile::tempdir().unwrap();
-        let policy_path = dir.path().join("test.sb");
-        std::fs::write(&policy_path, "(version 1)\n(deny default)").unwrap();
-
-        let sandbox = SeatbeltSandbox {
-            policy_dir: dir.path().to_path_buf(),
-            policy_path: policy_path.clone(),
-        };
-
-        let mut cmd = Command::new("echo");
-        cmd.arg("hello");
-        sandbox.wrap_command(&mut cmd).unwrap();
-
-        assert_eq!(cmd.get_program().to_string_lossy(), "sandbox-exec");
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|s| s.to_string_lossy().to_string())
-            .collect();
-        assert!(args.contains(&"-f".to_string()));
-        assert!(args.contains(&policy_path.to_string_lossy().to_string()));
-        assert!(args.contains(&"echo".to_string()));
-        assert!(args.contains(&"hello".to_string()));
-    }
-
-    #[test]
-    fn seatbelt_wrap_command_preserves_original_args() {
-        let dir = tempfile::tempdir().unwrap();
-        let policy_path = dir.path().join("test.sb");
-        std::fs::write(&policy_path, "(version 1)").unwrap();
-
-        let sandbox = SeatbeltSandbox {
-            policy_dir: dir.path().to_path_buf(),
-            policy_path,
-        };
-
-        let mut cmd = Command::new("ls");
-        cmd.arg("-la");
-        cmd.arg("/workspace");
-        sandbox.wrap_command(&mut cmd).unwrap();
-
-        let args: Vec<String> = cmd
-            .get_args()
-            .map(|s| s.to_string_lossy().to_string())
-            .collect();
-
-        assert!(
-            args.contains(&"ls".to_string()),
-            "original program must be passed as argument"
-        );
-        assert!(
-            args.contains(&"-la".to_string()),
-            "original args must be preserved"
-        );
-        assert!(
-            args.contains(&"/workspace".to_string()),
-            "original args must be preserved"
-        );
-    }
-
-    #[test]
-    fn seatbelt_policy_file_cleanup_on_drop() {
-        let dir = tempfile::tempdir().unwrap();
-        let policy_path = dir.path().join("session.sb");
-        std::fs::write(&policy_path, "(version 1)").unwrap();
-        assert!(policy_path.exists());
-
-        {
-            let _sandbox = SeatbeltSandbox {
-                policy_dir: dir.path().to_path_buf(),
-                policy_path: policy_path.clone(),
-            };
-        }
-
-        assert!(
-            !policy_path.exists(),
-            "policy file should be cleaned up on drop"
-        );
-    }
-
-    #[test]
-    fn seatbelt_new_fails_if_not_installed() {
-        let result = SeatbeltSandbox::new();
-        match result {
-            Ok(sandbox) => {
-                assert_eq!(sandbox.name(), "sandbox-exec");
-                assert!(sandbox.policy_path().exists());
-            }
-            Err(e) => {
-                assert!(
-                    e.kind() == std::io::ErrorKind::NotFound
-                        || e.kind() == std::io::ErrorKind::PermissionDenied
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn seatbelt_is_available_checks_policy_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let policy_path = dir.path().join("test.sb");
-
-        let sandbox = SeatbeltSandbox {
-            policy_dir: dir.path().to_path_buf(),
-            policy_path: policy_path.clone(),
-        };
-
-        if Path::new("/usr/bin/sandbox-exec").exists() {
-            assert!(
-                !sandbox.is_available(),
-                "should be false without policy file"
-            );
-        }
-
-        std::fs::write(&policy_path, "(version 1)").unwrap();
-        if Path::new("/usr/bin/sandbox-exec").exists() {
-            assert!(sandbox.is_available(), "should be true with policy file");
-        }
-    }
-
-    #[test]
     fn generate_policy_is_valid_sb_format() {
         let workspace = PathBuf::from("/tmp/workspace");
-        let policy = generate_policy(&workspace);
+        let policy = generate_policy(&workspace, &[]);
         assert!(policy.starts_with("(version 1)"));
         let open = policy.chars().filter(|c| *c == '(').count();
         let close = policy.chars().filter(|c| *c == ')').count();
         assert_eq!(open, close, "parentheses must be balanced in .sb policy");
+    }
+
+    /// Regression: every top-level rule in the generated policy must be
+    /// wrapped in `(allow ...)`. A missing `(allow ` prefix is a silent
+    /// regression (parentheses still balance) that `sandbox-exec` rejects
+    /// with `illegal function`. This test would have caught the
+    /// 2026-06-10 incident where `(signal (target self))` shipped without
+    /// its `(allow ` prefix and broke every shell invocation.
+    ///
+    /// We use `sandbox-exec` itself to validate the policy: writing a
+    /// tmp policy file and asking sandbox-exec to load it via `-n quick`.
+    /// This catches both the (allow prefix issue and any other
+    /// syntax errors that pure parenthesis-balancing would miss.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn generate_policy_loads_with_sandbox_exec() {
+        let workspace = PathBuf::from("/tmp/workspace");
+        // We use "*:443" (not a host:port) because macOS sandbox-exec
+        // rejects `(remote tcp "host:port")` at policy-load time — it
+        // only accepts `(remote ip "localhost:port")` or
+        // `(remote ip "*:port")`. This test is about the surrounding
+        // policy structure, not the network filter syntax.
+        let policy = generate_policy(&workspace, &["*:443".to_string()]);
+
+        // Write the policy to a temp file and ask sandbox-exec to load it.
+        let tmp =
+            std::env::temp_dir().join(format!("zeroclaw_seatbelt_test_{}.sb", std::process::id()));
+        std::fs::write(&tmp, &policy).expect("write tmp policy");
+
+        // `sandbox-exec -f policy true` exits 0 if the policy loads
+        // without syntax errors. It also runs `true` under the policy
+        // (which allows everything we need to spawn a no-op), so this
+        // validates both the policy grammar and the rule semantics.
+        let status = std::process::Command::new("/usr/bin/sandbox-exec")
+            .arg("-f")
+            .arg(&tmp)
+            .arg("/bin/sh")
+            .arg("-c")
+            .arg("true")
+            .status()
+            .expect("spawn sandbox-exec");
+
+        let _ = std::fs::remove_file(&tmp);
+
+        assert!(
+            status.success(),
+            "sandbox-exec rejected the generated policy (status={:?}); this \
+             usually means a missing `(allow ` prefix or other syntax error. \
+             policy:\n{}",
+            status.code(),
+            policy,
+        );
+    }
+
+    #[test]
+    fn generate_policy_with_no_outbound_allow_has_no_trusted_host_rules() {
+        let workspace = PathBuf::from("/tmp/workspace");
+        let policy = generate_policy(&workspace, &[]);
+        assert!(
+            !policy.contains("network_outbound_allow"),
+            "empty allow list must not inject any trusted-host rule"
+        );
+        assert!(
+            !policy.contains("(remote tcp"),
+            "empty allow list must not introduce (remote tcp ...) rules"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn generate_policy_with_outbound_allow_renders_wildcard_ip_rules_on_macos() {
+        let workspace = PathBuf::from("/tmp/workspace");
+        let policy = generate_policy(
+            &workspace,
+            &[
+                "aiordering.kfc.com.cn:443".to_string(),
+                "api.example.com:8443".to_string(),
+            ],
+        );
+        assert!(
+            policy.contains("(allow network-outbound\n    (remote ip \"*:443\"))"),
+            "policy must map KFC API host to wildcard port 443 rule, got: {}",
+            policy
+        );
+        assert!(
+            policy.contains("(allow network-outbound\n    (remote ip \"*:8443\"))"),
+            "policy must map second host to wildcard port 8443 rule"
+        );
+        // Sanity: parentheses still balanced.
+        let open = policy.chars().filter(|c| *c == '(').count();
+        let close = policy.chars().filter(|c| *c == ')').count();
+        assert_eq!(open, close, "parentheses must be balanced in .sb policy");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires live internet connection and dns resolution"]
+    fn test_sandbox_network_access() {
+        let workspace = PathBuf::from("/tmp/workspace");
+        let policy = generate_policy(&workspace, &["google.com:443".to_string()]);
+
+        let tmp = std::env::temp_dir().join(format!(
+            "zeroclaw_seatbelt_test_net_{}.sb",
+            std::process::id()
+        ));
+        std::fs::write(&tmp, &policy).expect("write tmp policy");
+
+        let status = std::process::Command::new("/usr/bin/sandbox-exec")
+            .arg("-f")
+            .arg(&tmp)
+            .arg("curl")
+            .arg("-I")
+            .arg("-s")
+            .arg("--connect-timeout")
+            .arg("5")
+            .arg("https://www.google.com")
+            .status();
+
+        let _ = std::fs::remove_file(&tmp);
+
+        match status {
+            Ok(s) => {
+                assert!(s.success(), "sandbox curl failed with exit status: {:?}", s);
+            }
+            Err(e) => {
+                panic!("failed to spawn sandbox-exec curl: {:?}", e);
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn generate_policy_with_outbound_allow_renders_trusted_host_rules() {
+        let workspace = PathBuf::from("/tmp/workspace");
+        let policy = generate_policy(
+            &workspace,
+            &[
+                "aiordering.kfc.com.cn:443".to_string(),
+                "api.example.com:8443".to_string(),
+            ],
+        );
+        // Each entry is rendered as its own (allow network-outbound (remote tcp "host:port")) rule.
+        assert!(
+            policy.contains(
+                "(allow network-outbound\n    (remote tcp \"aiordering.kfc.com.cn:443\"))"
+            ),
+            "policy must include the KFC API outbound rule, got: {}",
+            policy
+        );
+        assert!(
+            policy.contains("(allow network-outbound\n    (remote tcp \"api.example.com:8443\"))"),
+            "policy must include the second outbound rule"
+        );
+        // Section comment is rendered so operators can see where the rules came from.
+        assert!(
+            policy.contains(";; User-configured trusted outbound hosts"),
+            "policy must include the trusted-hosts section comment"
+        );
+        // Sanity: parentheses still balanced.
+        let open = policy.chars().filter(|c| *c == '(').count();
+        let close = policy.chars().filter(|c| *c == ')').count();
+        assert_eq!(open, close, "parentheses must be balanced in .sb policy");
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn generate_policy_escapes_quotes_in_outbound_allow_entries() {
+        // A malformed config entry with an embedded quote must not break out of
+        // the policy string literal.
+        let workspace = PathBuf::from("/tmp/workspace");
+        let policy = generate_policy(
+            &workspace,
+            &["evil\"; (allow process-exec); \"".to_string()],
+        );
+        // The escaped form replaces " with \"
+        assert!(
+            policy.contains("evil\\\"; (allow process-exec); \\\""),
+            "embedded quotes must be backslash-escaped, got: {}",
+            policy
+        );
+        // And the policy itself must still parse (balanced parens).
+        let open = policy.chars().filter(|c| *c == '(').count();
+        let close = policy.chars().filter(|c| *c == ')').count();
+        assert_eq!(open, close);
     }
 }

@@ -1,4 +1,9 @@
-#![allow(clippy::collapsible_if, clippy::bool_assert_comparison, clippy::nonminimal_bool, dead_code)]
+#![allow(
+    clippy::collapsible_if,
+    clippy::bool_assert_comparison,
+    clippy::nonminimal_bool,
+    dead_code
+)]
 
 //! WuKongIM channel implementation for ZeroClaw.
 //!

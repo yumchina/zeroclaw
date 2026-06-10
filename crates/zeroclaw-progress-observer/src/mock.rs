@@ -3,9 +3,7 @@
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use zeroclaw_api::channel::{
-    Channel, ChannelMessage, SendMessage, StatusUpdate,
-};
+use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage, StatusUpdate};
 
 pub(crate) struct MockChannel {
     pub recorded: Mutex<Vec<StatusUpdate>>,
@@ -13,7 +11,9 @@ pub(crate) struct MockChannel {
 
 impl MockChannel {
     pub fn new() -> Self {
-        Self { recorded: Mutex::new(Vec::new()) }
+        Self {
+            recorded: Mutex::new(Vec::new()),
+        }
     }
 
     pub fn count(&self) -> usize {
@@ -27,14 +27,15 @@ impl MockChannel {
 
 #[async_trait]
 impl Channel for MockChannel {
-    fn name(&self) -> &str { "mock" }
+    fn name(&self) -> &str {
+        "mock"
+    }
 
-    async fn send(&self, _: &SendMessage) -> anyhow::Result<()> { Ok(()) }
+    async fn send(&self, _: &SendMessage) -> anyhow::Result<()> {
+        Ok(())
+    }
 
-    async fn listen(
-        &self,
-        _: tokio::sync::mpsc::Sender<ChannelMessage>,
-    ) -> anyhow::Result<()> {
+    async fn listen(&self, _: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -63,7 +64,9 @@ mod tests {
             name: "agent".into(),
             desc: "x".into(),
         };
-        ch.send_status_update("r", None, update.clone()).await.unwrap();
+        ch.send_status_update("r", None, update.clone())
+            .await
+            .unwrap();
         assert_eq!(ch.count(), 1);
         assert_eq!(ch.last().unwrap().desc, "x");
     }

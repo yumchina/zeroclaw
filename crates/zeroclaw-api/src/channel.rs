@@ -31,9 +31,9 @@ pub enum ChannelApprovalResponse {
 /// Request for human takeover/intervention.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelInterventionRequest {
-    pub reason: String,              // Why are we halting (e.g. "Step Timeout", "Loop Detected")
-    pub last_tool: Option<String>,    // Last executed tool (if any)
-    pub error_detail: String,         // Specific error text/details
+    pub reason: String, // Why are we halting (e.g. "Step Timeout", "Loop Detected")
+    pub last_tool: Option<String>, // Last executed tool (if any)
+    pub error_detail: String, // Specific error text/details
 }
 
 /// Operator response to intervention request.
@@ -370,8 +370,12 @@ mod status_update_tests {
 
     #[async_trait]
     impl Channel for DummyChannel {
-        fn name(&self) -> &str { "dummy" }
-        async fn send(&self, _: &SendMessage) -> anyhow::Result<()> { Ok(()) }
+        fn name(&self) -> &str {
+            "dummy"
+        }
+        async fn send(&self, _: &SendMessage) -> anyhow::Result<()> {
+            Ok(())
+        }
         async fn listen(&self, _: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
             Ok(())
         }
@@ -386,15 +390,25 @@ mod status_update_tests {
             name: "agent".into(),
             desc: "Agent 启动".into(),
         };
-        assert!(ch.send_status_update("recipient", None, update).await.is_ok());
+        assert!(
+            ch.send_status_update("recipient", None, update)
+                .await
+                .is_ok()
+        );
     }
 
     #[test]
     fn status_phase_equality() {
         assert_eq!(StatusPhase::AgentStart, StatusPhase::AgentStart);
         assert_ne!(
-            StatusPhase::ToolDone { success: true, elapsed_ms: 10 },
-            StatusPhase::ToolDone { success: false, elapsed_ms: 10 },
+            StatusPhase::ToolDone {
+                success: true,
+                elapsed_ms: 10
+            },
+            StatusPhase::ToolDone {
+                success: false,
+                elapsed_ms: 10
+            },
         );
     }
 }

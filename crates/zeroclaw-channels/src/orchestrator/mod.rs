@@ -65,8 +65,7 @@ pub use crate::wechat::WeChatChannel;
 pub use crate::wecom::WeComChannel;
 pub use crate::whatsapp::WhatsAppChannel;
 pub use zeroclaw_api::channel::{
-    Channel, ChannelMessage, SendMessage,
-    ChannelInterventionRequest, ChannelInterventionResponse,
+    Channel, ChannelInterventionRequest, ChannelInterventionResponse, ChannelMessage, SendMessage,
 };
 // Local channel types (in misc, not zeroclaw-channels)
 pub use crate::cli::CliChannel;
@@ -101,9 +100,8 @@ use zeroclaw_progress_observer::{ProgressEventToggles, ProgressReportingObserver
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, Provider};
 use zeroclaw_runtime::agent::loop_::{
-    build_tool_instructions_for_names, get_model_switch_state,
-    run_tool_call_loop, scope_session_key, scope_thread_id,
-    scrub_credentials,
+    build_tool_instructions_for_names, get_model_switch_state, run_tool_call_loop,
+    scope_session_key, scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::i18n;
@@ -3647,20 +3645,16 @@ async fn process_channel_message(
 
 
             let mut is_error = false;
-            match &loop_result {
-                LlmExecutionResult::Completed(res) => {
-                    match res {
-                        Ok(Err(_)) => is_error = true,
-                        Err(_) => is_error = true, // timeout
-                        _ => {}
-                    }
+            if let LlmExecutionResult::Completed(res) = &loop_result {
+                match res {
+                    Ok(Err(_)) => is_error = true,
+                    Err(_) => is_error = true, // timeout
+                    _ => {}
                 }
-                _ => {}
             }
 
-            if is_error {
-                if let Some(channel) = target_channel.as_ref() {
-                    let reason = match &loop_result {
+            if is_error && let Some(channel) = target_channel.as_ref() {
+                let reason = match &loop_result {
                         LlmExecutionResult::Completed(res) => match res {
                             Ok(Err(e)) => {
                                 let err_str = e.to_string();
@@ -3743,7 +3737,6 @@ async fn process_channel_message(
                         }
                     }
                 }
-            }
 
 
 
@@ -5927,6 +5920,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 pub async fn start_channels(
     config: Config,
     canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
+    #[allow(unused)]
     channel_msg_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(String, u8, serde_json::Value)>>,
 ) -> Result<()> {
     // No model resolves yet — the user has channels configured but hasn't
@@ -6290,6 +6284,7 @@ pub async fn start_channels(
     }
 
     // Collect active channels from a shared builder to keep startup and doctor parity.
+    #[allow(unused_variables)]
     let (configured_channels, wukongim_channel) =
         collect_configured_channels(&config, "runtime startup", &tool_specs, mem.clone());
     #[allow(unused_mut)]
@@ -6394,33 +6389,35 @@ pub async fn start_channels(
     // the xuanji tools' mpsc sender and forwards them through the WuKongIM
     // channel's send_status_message.
     #[cfg(feature = "channel-wukongim")]
-    let has_rx = channel_msg_rx.is_some();
-    let has_wk = wukongim_channel.is_some();
-    if let (Some(mut rx), Some(wk)) = (channel_msg_rx, wukongim_channel) {
-        tracing::info!("Bridge listener started (Xuanji → WuKongIM)");
-        tokio::spawn(async move {
-            while let Some((recipient, channel_type, payload)) = rx.recv().await {
-                tracing::info!(
-                    recipient,
-                    channel_type,
-                    cmd = %payload.get("cmd").and_then(|v| v.as_str()).unwrap_or("?"),
-                    "Bridge: forwarding message to WuKongIM"
-                );
-                if let Err(e) = wk
-                    .send_status_message(&recipient, channel_type, payload)
-                    .await
-                {
-                    tracing::error!(
-                        ?e,
+    {
+        let has_rx = channel_msg_rx.is_some();
+        let has_wk = wukongim_channel.is_some();
+        if let (Some(mut rx), Some(wk)) = (channel_msg_rx, wukongim_channel) {
+            tracing::info!("Bridge listener started (Xuanji → WuKongIM)");
+            tokio::spawn(async move {
+                while let Some((recipient, channel_type, payload)) = rx.recv().await {
+                    tracing::info!(
                         recipient,
-                        "Failed to forward xuanji message to WuKongIM"
+                        channel_type,
+                        cmd = %payload.get("cmd").and_then(|v| v.as_str()).unwrap_or("?"),
+                        "Bridge: forwarding message to WuKongIM"
                     );
+                    if let Err(e) = wk
+                        .send_status_message(&recipient, channel_type, payload)
+                        .await
+                    {
+                        tracing::error!(
+                            ?e,
+                            recipient,
+                            "Failed to forward xuanji message to WuKongIM"
+                        );
+                    }
                 }
-            }
-            tracing::info!("Xuanji → WuKongIM bridge closed");
-        });
-    } else {
-        tracing::warn!(has_rx, has_wk, "Bridge listener NOT started");
+                tracing::info!("Xuanji → WuKongIM bridge closed");
+            });
+        } else {
+            tracing::warn!(has_rx, has_wk, "Bridge listener NOT started");
+        }
     }
 
     let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
@@ -6808,8 +6805,14 @@ pub async fn deliver_announcement(
     Ok(())
 }
 
-fn suspended_tasks() -> &'static StdMutex<HashMap<String, tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelMessage>>> {
-    static MAP: OnceLock<StdMutex<HashMap<String, tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelMessage>>>> = OnceLock::new();
+fn suspended_tasks() -> &'static StdMutex<
+    HashMap<String, tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelMessage>>,
+> {
+    static MAP: OnceLock<
+        StdMutex<
+            HashMap<String, tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelMessage>>,
+        >,
+    > = OnceLock::new();
     MAP.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
@@ -6823,16 +6826,15 @@ fn get_last_tool_from_history(history: &[ChatMessage]) -> Option<String> {
         }
         // Let's check assistant message function calls or tool calls. Since ChatMessage contains role and content,
         // we can check if content contains XML tags like <tool_call> or <function_call>!
-        if msg.role == "assistant" {
-            if let Some(start) = msg.content.find("<tool_call>") {
-                if let Some(end) = msg.content.find("</tool_call>") {
-                    let xml = &msg.content[start + 11..end];
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(xml.trim()) {
-                        if let Some(name) = val.get("name").and_then(|n| n.as_str()) {
-                            return Some(name.to_string());
-                        }
-                    }
-                }
+        if msg.role == "assistant"
+            && let Some(start) = msg.content.find("<tool_call>")
+            && let Some(end) = msg.content.find("</tool_call>")
+        {
+            let xml = &msg.content[start + 11..end];
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(xml.trim())
+                && let Some(name) = val.get("name").and_then(|n| n.as_str())
+            {
+                return Some(name.to_string());
             }
         }
     }
