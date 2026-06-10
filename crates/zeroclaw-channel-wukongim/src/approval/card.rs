@@ -124,9 +124,7 @@ pub fn build_intervention_card(
         approval_id: approval_id.to_string(),
         timeout_secs,
         title: "⚠️ 智能体任务异常挂起".to_string(),
-        body: WkApprovalBody {
-            content,
-        },
+        body: WkApprovalBody { content },
         actions: Some(vec![
             WkAction {
                 text: "重试当前步骤".to_string(),

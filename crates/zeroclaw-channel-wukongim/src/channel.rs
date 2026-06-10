@@ -1631,6 +1631,9 @@ impl Channel for WuKongIMChannel {
                     {
                         let _ = s.send(WsMsg::Text(msg.into())).await;
                     }
+                    if let Some(s) = self.ws_sink.write().await.as_mut() {
+                        let _ = s.send(WsMsg::Ping(Default::default())).await;
+                    }
                 }
                 frame = read.next() => {
                     let frame = frame.ok_or_else(|| anyhow::anyhow!("WuKongIM: stream closed"))??;
@@ -1726,6 +1729,14 @@ impl Channel for WuKongIMChannel {
             Ok(Ok(resp)) => Ok(Some(resp)),
             _ => {
                 self.pending_approvals.write().await.remove(&approval_id);
+                let (ch_id, ch_type) = parse_recipient(recipient);
+                let _ = self
+                    .send_text_message(
+                        &ch_id,
+                        ch_type,
+                        "⚠️ 审批卡片已超时，该任务已自动终止。如需继续，请重新发送消息触发智能体。",
+                    )
+                    .await;
                 Ok(Some(ChannelApprovalResponse::Deny))
             }
         }
@@ -1768,6 +1779,14 @@ impl Channel for WuKongIMChannel {
                     .write()
                     .await
                     .remove(&approval_id);
+                let (ch_id, ch_type) = parse_recipient(recipient);
+                let _ = self
+                    .send_text_message(
+                        &ch_id,
+                        ch_type,
+                        "⚠️ 接管卡片已超时，该任务已自动终止。如需继续，请重新发送消息触发智能体。",
+                    )
+                    .await;
                 Ok(Some(ChannelInterventionResponse::Cancel))
             }
         }

@@ -206,6 +206,9 @@ pub(crate) fn default_allowed_commands() -> Vec<String> {
         "python3".into(),
         "pip".into(),
         "node".into(),
+        "cd".into(),
+        "bash".into(),
+        "sh".into(),
     ];
     // `free` is Linux-only; it does not exist on macOS or other BSDs.
     #[cfg(target_os = "linux")]
@@ -2103,14 +2106,10 @@ mod tests {
         assert!(p.is_command_allowed(
             r#"pwsh -NoProfile -NonInteractive -Command "Get-ChildItem 'C:\Users\foo'""#
         ));
-        assert!(p.is_command_allowed(
-            r#"powershell -Command "Get-ChildItem""#
-        ));
+        assert!(p.is_command_allowed(r#"powershell -Command "Get-ChildItem""#));
 
         // Wrapper around a disallowed cmdlet must still be rejected.
-        assert!(!p.is_command_allowed(
-            r#"powershell -Command "Remove-Item 'C:\Users\foo'""#
-        ));
+        assert!(!p.is_command_allowed(r#"powershell -Command "Remove-Item 'C:\Users\foo'""#));
     }
 
     #[test]

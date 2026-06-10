@@ -38,16 +38,22 @@ mod tests {
 
     #[test]
     fn any_enabled_true_when_one_set() {
-        let t = ProgressEventToggles { tool_call_start: true, ..Default::default() };
+        let t = ProgressEventToggles {
+            tool_call_start: true,
+            ..Default::default()
+        };
         assert!(t.any_enabled());
     }
 
     #[test]
     fn any_enabled_true_when_all_set() {
         let t = ProgressEventToggles {
-            agent_start: true, agent_end: true,
-            tool_call_start: true, tool_call: true,
-            llm_thinking: true, error: true,
+            agent_start: true,
+            agent_end: true,
+            tool_call_start: true,
+            tool_call: true,
+            llm_thinking: true,
+            error: true,
         };
         assert!(t.any_enabled());
     }

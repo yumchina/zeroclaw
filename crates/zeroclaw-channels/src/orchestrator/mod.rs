@@ -65,8 +65,7 @@ pub use crate::wechat::WeChatChannel;
 pub use crate::wecom::WeComChannel;
 pub use crate::whatsapp::WhatsAppChannel;
 pub use zeroclaw_api::channel::{
-    Channel, ChannelMessage, SendMessage,
-    ChannelInterventionRequest, ChannelInterventionResponse,
+    Channel, ChannelInterventionRequest, ChannelInterventionResponse, ChannelMessage, SendMessage,
 };
 // Local channel types (in misc, not zeroclaw-channels)
 pub use crate::cli::CliChannel;
@@ -101,9 +100,8 @@ use zeroclaw_progress_observer::{ProgressEventToggles, ProgressReportingObserver
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, Provider};
 use zeroclaw_runtime::agent::loop_::{
-    build_tool_instructions_for_names, get_model_switch_state,
-    run_tool_call_loop, scope_session_key, scope_thread_id,
-    scrub_credentials,
+    build_tool_instructions_for_names, get_model_switch_state, run_tool_call_loop,
+    scope_session_key, scope_thread_id, scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::i18n;
@@ -3647,20 +3645,16 @@ async fn process_channel_message(
 
 
             let mut is_error = false;
-            match &loop_result {
-                LlmExecutionResult::Completed(res) => {
-                    match res {
-                        Ok(Err(_)) => is_error = true,
-                        Err(_) => is_error = true, // timeout
-                        _ => {}
-                    }
+            if let LlmExecutionResult::Completed(res) = &loop_result {
+                match res {
+                    Ok(Err(_)) => is_error = true,
+                    Err(_) => is_error = true, // timeout
+                    _ => {}
                 }
-                _ => {}
             }
 
-            if is_error {
-                if let Some(channel) = target_channel.as_ref() {
-                    let reason = match &loop_result {
+            if is_error && let Some(channel) = target_channel.as_ref() {
+                let reason = match &loop_result {
                         LlmExecutionResult::Completed(res) => match res {
                             Ok(Err(e)) => {
                                 let err_str = e.to_string();
@@ -3743,7 +3737,6 @@ async fn process_channel_message(
                         }
                     }
                 }
-            }
 
 
 
@@ -5841,6 +5834,11 @@ fn collect_configured_channels(
             wukongim_channel = Some(arc.clone());
             channels.push(ConfiguredChannel {
                 display_name: "WuKongIM",
+                channel: Arc::new(WuKongIMChannel::from_config(
+                    wk,
+                    &config.workspace_dir,
+                    _memory.clone(),
+                )),
                 channel: arc,
             });
         } else {
@@ -6808,8 +6806,14 @@ pub async fn deliver_announcement(
     Ok(())
 }
 
-fn suspended_tasks() -> &'static StdMutex<HashMap<String, tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelMessage>>> {
-    static MAP: OnceLock<StdMutex<HashMap<String, tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelMessage>>>> = OnceLock::new();
+fn suspended_tasks() -> &'static StdMutex<
+    HashMap<String, tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelMessage>>,
+> {
+    static MAP: OnceLock<
+        StdMutex<
+            HashMap<String, tokio::sync::oneshot::Sender<zeroclaw_api::channel::ChannelMessage>>,
+        >,
+    > = OnceLock::new();
     MAP.get_or_init(|| StdMutex::new(HashMap::new()))
 }
 
@@ -6823,16 +6827,15 @@ fn get_last_tool_from_history(history: &[ChatMessage]) -> Option<String> {
         }
         // Let's check assistant message function calls or tool calls. Since ChatMessage contains role and content,
         // we can check if content contains XML tags like <tool_call> or <function_call>!
-        if msg.role == "assistant" {
-            if let Some(start) = msg.content.find("<tool_call>") {
-                if let Some(end) = msg.content.find("</tool_call>") {
-                    let xml = &msg.content[start + 11..end];
-                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(xml.trim()) {
-                        if let Some(name) = val.get("name").and_then(|n| n.as_str()) {
-                            return Some(name.to_string());
-                        }
-                    }
-                }
+        if msg.role == "assistant"
+            && let Some(start) = msg.content.find("<tool_call>")
+            && let Some(end) = msg.content.find("</tool_call>")
+        {
+            let xml = &msg.content[start + 11..end];
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(xml.trim())
+                && let Some(name) = val.get("name").and_then(|n| n.as_str())
+            {
+                return Some(name.to_string());
             }
         }
     }
@@ -12813,7 +12816,7 @@ This is an example JSON object for profile settings."#;
         let memory = Arc::new(
             zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "test").unwrap(),
         );
-        let (channels, _wk) = collect_configured_channels(&config, "test", &[], memory);
+        let channels = collect_configured_channels(&config, "test", &[], memory);
         assert!(
             !channels
                 .iter()

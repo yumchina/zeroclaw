@@ -14,6 +14,49 @@ const DEFAULT_SHELL_TIMEOUT_SECS: u64 = 60;
 /// Maximum output size in bytes (1MB).
 const MAX_OUTPUT_BYTES: usize = 1_048_576;
 
+/// Synchronize the parent process's CWD to a known-good directory if the
+/// inherited CWD is no longer valid (e.g. a rotated sandbox dir).
+///
+/// On macOS `/bin/sh` (bash) reads the inherited CWD during its own
+/// initialization, even when the spawn specifies a new one via
+/// `Command::current_dir`. If the inherited CWD points at a path that was
+/// deleted or is no longer accessible, bash prints
+/// `shell-init: error retrieving current directory: getcwd: ...` to stderr
+/// before running the user's `-c` script, and downstream runtimes like
+/// `bun` may then bail out with misleading "max file descriptors" errors.
+///
+/// `Command::current_dir(&exec_dir)` only sets the child's CWD via
+/// `pre_exec` chdir — it does not repair the parent's. Fixing the parent
+/// here ensures the forked child inherits a valid CWD from the start.
+///
+/// The fallback target is `std::env::temp_dir()` rather than `exec_dir`,
+/// because `exec_dir` is itself a sandbox path that can be rotated away
+/// between calls — pinning the parent CWD to it would just move the
+/// failure forward in time. The system temp directory is a permanent,
+/// platform-stable location: `/var/folders/.../T/` on macOS, `/tmp` on
+/// Linux, `%TEMP%` on Windows. The shell tool never relies on the
+/// inherited CWD for anything other than bash's own init-time `set_pwd`,
+/// so chdir-ing to temp has no effect on child command behaviour — each
+/// spawned shell still uses the `current_dir(exec_dir)` flag for its
+/// actual working directory.
+fn ensure_valid_parent_cwd() {
+    let parent_cwd_ok = std::env::current_dir()
+        .ok()
+        .map(|p| p.exists())
+        .unwrap_or(false);
+    if parent_cwd_ok {
+        return;
+    }
+    let target = std::env::temp_dir();
+    if let Err(e) = std::env::set_current_dir(&target) {
+        tracing::warn!(
+            parent_cwd_recovery_failed = %e,
+            target = %target.display(),
+            "shell: failed to repair parent process CWD before spawn",
+        );
+    }
+}
+
 /// Environment variables safe to pass to shell commands.
 /// Only functional variables are included — never API keys or secrets.
 #[cfg(not(target_os = "windows"))]
@@ -234,6 +277,8 @@ impl Tool for ShellTool {
 
         // Force UTF-8 for Python subprocesses on Windows
         cmd.env("PYTHONIOENCODING", "utf-8");
+
+        ensure_valid_parent_cwd();
 
         let timeout_secs = self.timeout_secs;
         let result = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await;
@@ -757,6 +802,101 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
+    }
+
+    /// Regression: when the parent process's CWD has been deleted (e.g. a
+    /// rotated sandbox dir), the shell tool must still spawn successfully.
+    /// Without `ensure_valid_parent_cwd`, macOS `/bin/sh` (bash) prints
+    /// `shell-init: getcwd ...` to stderr and the user's `-c` script may
+    /// not run, even though the exit code is 0.
+    #[tokio::test]
+    async fn shell_recovers_when_parent_cwd_deleted() {
+        let security = test_security(AutonomyLevel::Supervised);
+        let tool = ShellTool::new(security.clone(), test_runtime());
+
+        // Create a transient CWD, then delete it before spawning.
+        let transient = std::env::temp_dir().join(format!(
+            "zeroclaw_cwd_recovery_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&transient).unwrap();
+        let original_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&transient).unwrap();
+        std::fs::remove_dir(&transient).unwrap();
+
+        // Sanity: the parent CWD should now be invalid.
+        let parent_cwd_invalid = std::env::current_dir()
+            .ok()
+            .map(|p| p.exists())
+            .unwrap_or(true);
+        assert!(
+            parent_cwd_invalid,
+            "test setup: parent CWD should be invalid before spawn"
+        );
+
+        let result = tool
+            .execute(json!({"command": "echo recovered"}))
+            .await
+            .expect("execute should return a result even with bad parent CWD");
+
+        // After the recovery, the parent CWD must be the system temp
+        // directory, not the (gone) transient dir. This guards against
+        // regressions where the helper pins the CWD to a sandbox path
+        // that may itself be rotated away in a future iteration. Compare
+        // canonicalized paths because macOS resolves /var/folders symlinks
+        // to /private/var/folders on read.
+        let recovered_cwd = std::env::current_dir().ok();
+        let expected = std::env::temp_dir()
+            .canonicalize()
+            .unwrap_or_else(|_| std::env::temp_dir());
+        let actual = recovered_cwd
+            .as_deref()
+            .and_then(|p| p.canonicalize().ok().or_else(|| Some(p.to_path_buf())));
+        assert_eq!(
+            actual.as_deref(),
+            Some(expected.as_path()),
+            "parent CWD after recovery must equal temp_dir, got {:?}",
+            recovered_cwd,
+        );
+
+        // Restore the original CWD for any later tests in this process.
+        let _ = std::env::set_current_dir(&original_cwd);
+
+        assert!(
+            result.success,
+            "shell tool should succeed after CWD recovery, got error: {:?}",
+            result.error
+        );
+        assert!(
+            result.output.contains("recovered"),
+            "expected 'recovered' in stdout, got: {:?}",
+            result.output
+        );
+    }
+
+    /// The CWD-recovery helper must not change the parent CWD when the
+    /// inherited CWD is still valid. This is the steady-state path and
+    /// the cost must be a single `getcwd` syscall, not a process-wide
+    /// chdir.
+    #[tokio::test]
+    async fn shell_does_not_chdir_when_parent_cwd_valid() {
+        let original_cwd = std::env::current_dir().unwrap();
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+
+        let _ = tool
+            .execute(json!({"command": "echo noop"}))
+            .await
+            .expect("noop command should succeed");
+
+        assert_eq!(
+            std::env::current_dir().ok(),
+            Some(original_cwd.clone()),
+            "parent CWD must not change when it is already valid"
+        );
     }
 
     #[tokio::test]

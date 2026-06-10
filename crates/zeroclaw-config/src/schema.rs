@@ -8998,6 +8998,34 @@ pub struct SandboxConfig {
     /// Custom Firejail arguments (when backend = firejail)
     #[serde(default)]
     pub firejail_args: Vec<String>,
+
+    /// Trusted outbound network hosts to allow from sandboxed child
+    /// processes, in `host:port` form. macOS Seatbelt denies all network
+    /// by default, so any skill that needs to talk to a real API (e.g.
+    /// KFC's `aiordering.kfc.com.cn:443`) must be allow-listed here.
+    /// Each entry is rendered as a `(allow network-outbound (remote tcp
+    /// "host:port"))` rule in the generated seatbelt policy. Leave empty
+    /// to keep the default localhost-only outbound.
+    ///
+    /// **Platform caveats**:
+    /// - **macOS Seatbelt**: the `(remote tcp "host:port")` filter form
+    ///   is rejected by `sandbox-exec` at policy-load time. macOS only
+    ///   accepts `(remote ip "localhost:port")` or `(remote ip "*:port")`
+    ///   in network-outbound filters. As a result this field is parsed
+    ///   and rendered on every platform, but on macOS the resulting rule
+    ///   is a no-op (`sandbox-exec: host must be * or localhost`) and
+    ///   the child process will continue to be denied all non-localhost
+    ///   outbound. Operators who need to allow a specific external host
+    ///   on macOS must either (a) use a localhost proxy, or (b) accept
+    ///   `(remote ip "*:port")` as a coarse-grained fallback. There is
+    ///   no per-host allow list on macOS.
+    /// - **Linux Landlock**: Landlock has no network-outbound filter
+    ///   concept; the field is ignored.
+    /// - **Linux Firejail / Bubblewrap / Docker**: the host:port entries
+    ///   are passed through to the backend's network filter, where
+    ///   supported.
+    #[serde(default)]
+    pub network_outbound_allow: Vec<String>,
 }
 
 impl Default for SandboxConfig {
@@ -9006,6 +9034,7 @@ impl Default for SandboxConfig {
             enabled: None, // Auto-detect
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            network_outbound_allow: Vec::new(),
         }
     }
 }

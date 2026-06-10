@@ -45,9 +45,11 @@ use std::io::Write;
 use std::path::PathBuf;
 use tracing::{info, warn};
 use tracing_appender::non_blocking::WorkerGuard;
-use tracing_subscriber::{EnvFilter, filter::LevelFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 #[allow(unused_imports)]
 use tracing_subscriber::Layer as _;
+use tracing_subscriber::{
+    EnvFilter, filter::LevelFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt,
+};
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 
 /// Decorate the value at `path` in `config.toml` with a leading `# {comment}`
@@ -1250,7 +1252,11 @@ async fn load_logging_config_early() -> zeroclaw_config::schema::LoggingConfig {
     use zeroclaw_config::schema::LoggingConfig;
 
     let config_dir = config_dir_from_args()
-        .or_else(|| std::env::var("ZEROCLAW_CONFIG_DIR").ok().map(std::path::PathBuf::from))
+        .or_else(|| {
+            std::env::var("ZEROCLAW_CONFIG_DIR")
+                .ok()
+                .map(std::path::PathBuf::from)
+        })
         .or_else(|| {
             std::env::var("HOME")
                 .ok()
@@ -1309,8 +1315,7 @@ fn init_logging(
             cfg.level
         )
     };
-    let mut filter =
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&base));
+    let mut filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&base));
     if log_llm {
         zeroclaw_providers::reliable::set_llm_payload_tracing_enabled(true);
         filter = filter.add_directive(
@@ -1323,38 +1328,46 @@ fn init_logging(
     let stderr_layer = fmt::layer().with_writer(std::io::stderr);
     let mut guards: Vec<WorkerGuard> = Vec::new();
 
-    let out_layer = cfg.dir.as_deref().zip(cfg.out_file.as_deref()).and_then(|(dir, file)| {
-        match logging::DailyRotatingFile::new(dir, file) {
-            Ok(w) => {
-                let (nb, guard) = tracing_appender::non_blocking(w);
-                guards.push(guard);
-                Some(fmt::layer().with_writer(nb).with_ansi(false))
-            }
-            Err(e) => {
-                eprintln!("Warning: failed to open out_file '{file}' in '{dir}': {e}");
-                None
-            }
-        }
-    });
+    let out_layer = cfg
+        .dir
+        .as_deref()
+        .zip(cfg.out_file.as_deref())
+        .and_then(
+            |(dir, file)| match logging::DailyRotatingFile::new(dir, file) {
+                Ok(w) => {
+                    let (nb, guard) = tracing_appender::non_blocking(w);
+                    guards.push(guard);
+                    Some(fmt::layer().with_writer(nb).with_ansi(false))
+                }
+                Err(e) => {
+                    eprintln!("Warning: failed to open out_file '{file}' in '{dir}': {e}");
+                    None
+                }
+            },
+        );
 
-    let err_layer = cfg.dir.as_deref().zip(cfg.err_file.as_deref()).and_then(|(dir, file)| {
-        match logging::DailyRotatingFile::new(dir, file) {
-            Ok(w) => {
-                let (nb, guard) = tracing_appender::non_blocking(w);
-                guards.push(guard);
-                Some(
-                    fmt::layer()
-                        .with_writer(nb)
-                        .with_ansi(false)
-                        .with_filter(LevelFilter::WARN),
-                )
-            }
-            Err(e) => {
-                eprintln!("Warning: failed to open err_file '{file}' in '{dir}': {e}");
-                None
-            }
-        }
-    });
+    let err_layer = cfg
+        .dir
+        .as_deref()
+        .zip(cfg.err_file.as_deref())
+        .and_then(
+            |(dir, file)| match logging::DailyRotatingFile::new(dir, file) {
+                Ok(w) => {
+                    let (nb, guard) = tracing_appender::non_blocking(w);
+                    guards.push(guard);
+                    Some(
+                        fmt::layer()
+                            .with_writer(nb)
+                            .with_ansi(false)
+                            .with_filter(LevelFilter::WARN),
+                    )
+                }
+                Err(e) => {
+                    eprintln!("Warning: failed to open err_file '{file}' in '{dir}': {e}");
+                    None
+                }
+            },
+        );
 
     tracing_subscriber::registry()
         .with(filter)
@@ -1865,6 +1878,45 @@ async fn main() -> Result<()> {
                 info!("🧠 Starting ZeroClaw Daemon on {host} (random port)");
             } else {
                 info!("🧠 Starting ZeroClaw Daemon on {host}:{port}");
+            }
+
+            // Move the daemon process's working directory into the resolved
+            // workspace before any subsystem is constructed.
+            //
+            // The macOS Seatbelt sandbox policy is generated from
+            // `config.workspace_dir` and only allows read/write access to
+            // that subtree. If the parent process's CWD is outside the
+            // workspace — e.g. when running `cargo run -- daemon` from the
+            // zeroclaw repo root for development — every spawned shell
+            // child inherits that external CWD. bash / bun / node then
+            // resolve it via `getcwd(2)`, which the sandbox blocks (EPERM,
+            // surfaced as "shell-init: error retrieving current directory"
+            // and bun's misleading "low max file descriptors"), even though
+            // `Command::current_dir(workspace_dir)` is set on the child.
+            //
+            // Chdir-ing the daemon itself into the workspace makes the
+            // inherited CWD land inside the policy's allowed region, so
+            // the child `getcwd` probe succeeds. This is also the
+            // expected production posture — the workspace directory is the
+            // canonical place for a daemon to operate from.
+            //
+            // Failure here is non-fatal: we log and continue with the
+            // inherited CWD. Sandbox errors will then surface in
+            // individual shell invocations rather than preventing daemon
+            // startup entirely.
+            if config.workspace_dir.exists() {
+                if let Err(e) = std::env::set_current_dir(&config.workspace_dir) {
+                    tracing::warn!(
+                        workspace = %config.workspace_dir.display(),
+                        error = %e,
+                        "daemon: failed to chdir into workspace, continuing with inherited CWD",
+                    );
+                } else {
+                    tracing::info!(
+                        workspace = %config.workspace_dir.display(),
+                        "daemon: chdir-ed into workspace before subsystem startup",
+                    );
+                }
             }
 
             #[cfg(target_os = "linux")]

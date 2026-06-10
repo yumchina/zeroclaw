@@ -15,8 +15,7 @@ pub struct ActivePendingApproval {
 
 /// Type alias for the pending approvals map.
 /// Key = approval_id, Value = ActivePendingApproval enclosing the sender.
-pub type PendingApprovals =
-    RwLock<HashMap<String, ActivePendingApproval>>;
+pub type PendingApprovals = RwLock<HashMap<String, ActivePendingApproval>>;
 
 /// Type alias for the pending interventions map.
 /// Key = approval_id, Value = oneshot sender to resolve the intervention.
