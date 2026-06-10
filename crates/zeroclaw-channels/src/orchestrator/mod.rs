@@ -5834,11 +5834,6 @@ fn collect_configured_channels(
             wukongim_channel = Some(arc.clone());
             channels.push(ConfiguredChannel {
                 display_name: "WuKongIM",
-                channel: Arc::new(WuKongIMChannel::from_config(
-                    wk,
-                    &config.workspace_dir,
-                    _memory.clone(),
-                )),
                 channel: arc,
             });
         } else {
@@ -5925,6 +5920,7 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 pub async fn start_channels(
     config: Config,
     canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
+    #[allow(unused)]
     channel_msg_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(String, u8, serde_json::Value)>>,
 ) -> Result<()> {
     // No model resolves yet — the user has channels configured but hasn't
@@ -6288,6 +6284,7 @@ pub async fn start_channels(
     }
 
     // Collect active channels from a shared builder to keep startup and doctor parity.
+    #[allow(unused_variables)]
     let (configured_channels, wukongim_channel) =
         collect_configured_channels(&config, "runtime startup", &tool_specs, mem.clone());
     #[allow(unused_mut)]
@@ -6392,33 +6389,35 @@ pub async fn start_channels(
     // the xuanji tools' mpsc sender and forwards them through the WuKongIM
     // channel's send_status_message.
     #[cfg(feature = "channel-wukongim")]
-    let has_rx = channel_msg_rx.is_some();
-    let has_wk = wukongim_channel.is_some();
-    if let (Some(mut rx), Some(wk)) = (channel_msg_rx, wukongim_channel) {
-        tracing::info!("Bridge listener started (Xuanji → WuKongIM)");
-        tokio::spawn(async move {
-            while let Some((recipient, channel_type, payload)) = rx.recv().await {
-                tracing::info!(
-                    recipient,
-                    channel_type,
-                    cmd = %payload.get("cmd").and_then(|v| v.as_str()).unwrap_or("?"),
-                    "Bridge: forwarding message to WuKongIM"
-                );
-                if let Err(e) = wk
-                    .send_status_message(&recipient, channel_type, payload)
-                    .await
-                {
-                    tracing::error!(
-                        ?e,
+    {
+        let has_rx = channel_msg_rx.is_some();
+        let has_wk = wukongim_channel.is_some();
+        if let (Some(mut rx), Some(wk)) = (channel_msg_rx, wukongim_channel) {
+            tracing::info!("Bridge listener started (Xuanji → WuKongIM)");
+            tokio::spawn(async move {
+                while let Some((recipient, channel_type, payload)) = rx.recv().await {
+                    tracing::info!(
                         recipient,
-                        "Failed to forward xuanji message to WuKongIM"
+                        channel_type,
+                        cmd = %payload.get("cmd").and_then(|v| v.as_str()).unwrap_or("?"),
+                        "Bridge: forwarding message to WuKongIM"
                     );
+                    if let Err(e) = wk
+                        .send_status_message(&recipient, channel_type, payload)
+                        .await
+                    {
+                        tracing::error!(
+                            ?e,
+                            recipient,
+                            "Failed to forward xuanji message to WuKongIM"
+                        );
+                    }
                 }
-            }
-            tracing::info!("Xuanji → WuKongIM bridge closed");
-        });
-    } else {
-        tracing::warn!(has_rx, has_wk, "Bridge listener NOT started");
+                tracing::info!("Xuanji → WuKongIM bridge closed");
+            });
+        } else {
+            tracing::warn!(has_rx, has_wk, "Bridge listener NOT started");
+        }
     }
 
     let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
@@ -12816,7 +12815,7 @@ This is an example JSON object for profile settings."#;
         let memory = Arc::new(
             zeroclaw_memory::SqliteMemory::new_named(&config.workspace_dir, "test").unwrap(),
         );
-        let channels = collect_configured_channels(&config, "test", &[], memory);
+        let (channels, _wk) = collect_configured_channels(&config, "test", &[], memory);
         assert!(
             !channels
                 .iter()

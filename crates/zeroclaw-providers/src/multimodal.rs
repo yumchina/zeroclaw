@@ -738,21 +738,6 @@ async fn normalize_remote_image(
     Ok(format!("data:{mime};base64,{}", STANDARD.encode(bytes)))
 }
 
-/// True for errors that mean "this specific marker is unusable" rather than
-/// "the user's request is invalid".  Broken markers are dropped so the rest
-/// of the conversation can still reach the LLM; policy errors propagate.
-fn is_broken_marker_error(error: &anyhow::Error) -> bool {
-    matches!(
-        error.downcast_ref::<MultimodalError>(),
-        Some(
-            MultimodalError::ImageSourceNotFound { .. }
-                | MultimodalError::InvalidMarker { .. }
-                | MultimodalError::LocalReadFailed { .. }
-                | MultimodalError::RemoteFetchFailed { .. }
-        )
-    )
-}
-
 /// Strip the Windows verbatim/extended-length prefix `\\?\` (or `\\?\UNC\`)
 /// from a path string.  Returns the original input on non-Windows or when
 /// there is no prefix to strip.  Borrows when possible to avoid allocations.

@@ -207,8 +207,6 @@ pub(crate) fn default_allowed_commands() -> Vec<String> {
         "pip".into(),
         "node".into(),
         "cd".into(),
-        "bash".into(),
-        "sh".into(),
     ];
     // `free` is Linux-only; it does not exist on macOS or other BSDs.
     #[cfg(target_os = "linux")]
