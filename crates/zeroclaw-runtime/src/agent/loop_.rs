@@ -46,7 +46,7 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
-use zeroclaw_api::channel::Channel;
+use zeroclaw_api::channel::{Channel, SendMessage};
 use zeroclaw_api::provider::StreamEvent;
 use zeroclaw_config::schema::Config;
 use zeroclaw_memory::{
@@ -1570,6 +1570,36 @@ pub async fn run_tool_call_loop(
                     narration.push('\n');
                 }
                 let _ = tx.send(StreamDelta::Text(narration)).await;
+            } else if let Some(ch) = channel {
+                let recipient = channel_reply_target.unwrap_or(channel_name);
+                let mut payload = display_text.clone();
+                if !payload.ends_with('\n') {
+                    payload.push('\n');
+                }
+                runtime_trace::record_event(
+                    "assistant_text_fallback_relay",
+                    Some(channel_name),
+                    Some(provider_name),
+                    Some(model),
+                    Some(&turn_id),
+                    Some(true),
+                    None,
+                    serde_json::json!({
+                        "iteration": iteration + 1,
+                        "text": scrub_credentials(&display_text),
+                        "recipient": recipient,
+                    }),
+                );
+                if let Err(e) = ch
+                    .send(&SendMessage::new(payload, recipient.to_string()))
+                    .await
+                {
+                    tracing::warn!(
+                        iteration = iteration + 1,
+                        error = %e,
+                        "Failed to relay assistant text alongside tool calls"
+                    );
+                }
             }
             if !silent {
                 print!("{display_text}");
@@ -6179,6 +6209,123 @@ mod tests {
         assert!(
             result.ends_with("Final answer"),
             "accumulated result should end with final answer, got: {result}"
+        );
+        assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    }
+
+    /// Regression test: when the LLM returns text + a parsed (non-native)
+    /// tool call, the assistant text must still reach the user via the
+    /// channel's `send`. Previously it was only relayed when
+    /// `native_tool_calls` was non-empty, which caused QR codes and other
+    /// inline content to be silently dropped on channels that don't
+    /// register `on_delta` (e.g. WuKongIM).
+    #[tokio::test]
+    async fn run_tool_call_loop_relays_parsed_tool_call_text_via_channel_send() {
+        use async_trait::async_trait;
+        use std::sync::Mutex as StdMutex;
+        use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+
+        #[derive(Default)]
+        struct CapturingChannel {
+            sent: StdMutex<Vec<String>>,
+        }
+
+        #[async_trait]
+        impl Channel for CapturingChannel {
+            fn name(&self) -> &str {
+                "capturing"
+            }
+
+            async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+                self.sent.lock().unwrap().push(message.content.clone());
+                Ok(())
+            }
+
+            async fn listen(
+                &self,
+                _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+
+        let invocations = Arc::new(AtomicUsize::new(0));
+        let tools_registry: Vec<Box<dyn Tool>> = vec![Box::new(CountingTool::new(
+            "count_tool",
+            Arc::clone(&invocations),
+        ))];
+
+        let mut history = vec![
+            ChatMessage::system("test-system"),
+            ChatMessage::user("show me the QR"),
+        ];
+        let observer = NoopObserver;
+        let channel = CapturingChannel::default();
+
+        // Response contains a <tool_call> tag the parser will extract, plus
+        // inline QR-style text. This simulates a parsed (non-native) tool
+        // call where native_tool_calls is empty.
+        let provider = ScriptedProvider {
+            responses: Arc::new(Mutex::new(VecDeque::from(vec![
+                ChatResponse {
+                    text: Some(
+                        "Please scan the QR code below to log in:\n\n```\nQR-PLACEHOLDER\n```\n\n<tool_call>\n{\"name\":\"count_tool\",\"arguments\":{\"value\":\"X\"}}\n</tool_call>"
+                            .into(),
+                    ),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                },
+                ChatResponse {
+                    text: Some("done".into()),
+                    tool_calls: Vec::new(),
+                    usage: None,
+                    reasoning_content: None,
+                },
+            ]))),
+            capabilities: ProviderCapabilities::default(),
+        };
+
+        let result = run_tool_call_loop(
+            &provider,
+            &mut history,
+            &tools_registry,
+            &observer,
+            "mock-provider",
+            "mock-model",
+            0.0,
+            true,
+            None,
+            "capturing",
+            Some("user-1"),
+            &zeroclaw_config::schema::MultimodalConfig::default(),
+            4,
+            None,
+            None, // no on_delta
+            None,
+            &[],
+            &[],
+            None,
+            None,
+            &zeroclaw_config::schema::PacingConfig::default(),
+            0,
+            0,
+            None,
+            Some(&channel),
+            None,
+            None,
+        )
+        .await
+        .expect("parsed tool-call text should be relayed through channel.send");
+
+        let sent = channel.sent.lock().unwrap().clone();
+        assert!(
+            sent.iter().any(|s| s.contains("QR-PLACEHOLDER")),
+            "assistant text accompanying a parsed tool call must reach channel.send; got: {sent:?}"
+        );
+        assert!(
+            result.ends_with("done"),
+            "result should end with final answer, got: {result}"
         );
         assert_eq!(invocations.load(Ordering::SeqCst), 1);
     }
