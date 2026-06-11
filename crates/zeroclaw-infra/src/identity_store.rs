@@ -92,22 +92,16 @@ impl SqliteIdentityStore {
         .is_ok()
     }
 
-    /// 6-digit code derived from the current nanosecond clock. Retries on the
-    /// (extremely rare) in-flight collision. No `rand` dependency.
-    fn gen_code(&self) -> String {
-        let codes = self.codes.lock();
-        for _ in 0..8 {
-            let nanos = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.subsec_nanos())
-                .unwrap_or(0);
-            let code = format!("{:06}", nanos % 1_000_000);
-            if !codes.contains_key(&code) {
-                return code;
-            }
-        }
-        // Fallback: append a disambiguating suffix.
-        format!("{:06}", codes.len() % 1_000_000)
+    /// 6-digit code derived from the nanosecond clock plus a perturbation
+    /// `seed` so successive attempts differ even within the same nanosecond.
+    /// NOT cryptographically secure — acceptable only for short-lived,
+    /// one-time pairing codes (5-min TTL, single use). Do not reuse elsewhere.
+    fn gen_code(seed: u32) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        format!("{:06}", nanos.wrapping_add(seed) % 1_000_000)
     }
 }
 
@@ -129,17 +123,26 @@ impl IdentityResolver for SqliteIdentityStore {
     }
 
     fn issue_code(&self, master_id: &str) -> Option<String> {
+        // Lock ordering note: we briefly take the `conn` lock here and release
+        // it before taking the `codes` lock below. `redeem_code` takes `codes`
+        // (temporary guard) and releases it before taking `conn`. Neither path
+        // holds both locks at once, so there is no lock-ordering deadlock.
         {
             let conn = self.conn.lock();
             if !Self::is_whitelisted(&conn, master_id) {
                 return None;
             }
         }
-        let code = self.gen_code();
-        self.codes
-            .lock()
-            .insert(code.clone(), (master_id.to_string(), SystemTime::now()));
-        Some(code)
+        // Generate + check + insert atomically under the codes lock (no TOCTOU).
+        let mut codes = self.codes.lock();
+        for seed in 0..16 {
+            let code = Self::gen_code(seed);
+            if !codes.contains_key(&code) {
+                codes.insert(code.clone(), (master_id.to_string(), SystemTime::now()));
+                return Some(code);
+            }
+        }
+        None
     }
 
     fn redeem_code(&self, code: &str, channel_ref: &str, sender: &str) -> Result<String, String> {
