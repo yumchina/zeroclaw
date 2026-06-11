@@ -10774,6 +10774,15 @@ pub struct ChannelsConfig {
     /// Enable the CLI interactive channel. Default: `true`.
     #[serde(default = "default_true")]
     pub cli: bool,
+    /// Master channel ChannelRef (`"<type>.<alias>"`, e.g. `"dawnim.work"`).
+    /// When set, unified cross-channel sessions are enabled: the master
+    /// channel's user id IS the unified person id. `None` disables the feature.
+    #[serde(default)]
+    pub master_channel: Option<String>,
+    /// Master-channel user ids seeded into the unified-session whitelist on
+    /// first init. Only these users may initiate `/bind`.
+    #[serde(default)]
+    pub superusers: Vec<String>,
     /// Telegram bot channel instances (`[channels.telegram.<alias>]`).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     #[nested]
@@ -11278,6 +11287,8 @@ impl Default for ChannelsConfig {
     fn default() -> Self {
         Self {
             cli: true,
+            master_channel: None,
+            superusers: Vec::new(),
             telegram: HashMap::new(),
             discord: HashMap::new(),
             slack: HashMap::new(),
@@ -18250,6 +18261,8 @@ auto_save = true
             acp: AcpConfig::default(),
             channels: ChannelsConfig {
                 cli: true,
+                master_channel: None,
+                superusers: Vec::new(),
                 telegram: HashMap::from([(
                     "default".to_string(),
                     TelegramConfig {
@@ -19696,6 +19709,8 @@ allowed_users = ["@u:matrix.org"]
     async fn channels_with_imessage_and_matrix() {
         let c = ChannelsConfig {
             cli: true,
+            master_channel: None,
+            superusers: Vec::new(),
             telegram: HashMap::new(),
             discord: HashMap::new(),
             slack: HashMap::new(),
@@ -20145,6 +20160,8 @@ allowed_numbers = ["+1", "+2"]
     async fn channels_with_whatsapp() {
         let c = ChannelsConfig {
             cli: true,
+            master_channel: None,
+            superusers: Vec::new(),
             telegram: HashMap::new(),
             discord: HashMap::new(),
             slack: HashMap::new(),
@@ -25474,5 +25491,27 @@ token = "s3-tok"
             config.dawn.s3.base_url.as_deref(),
             Some("https://dawn-server.hwwt2.com")
         );
+    }
+
+    mod unified_cfg_tests {
+        use super::ChannelsConfig;
+
+        #[test]
+        fn channels_config_parses_master_and_superusers() {
+            let toml = r#"
+                master_channel = "dawnim.work"
+                superusers = ["u_alice", "u_bob"]
+            "#;
+            let cfg: ChannelsConfig = toml::from_str(toml).unwrap();
+            assert_eq!(cfg.master_channel.as_deref(), Some("dawnim.work"));
+            assert_eq!(cfg.superusers, vec!["u_alice".to_string(), "u_bob".to_string()]);
+        }
+
+        #[test]
+        fn channels_config_defaults_are_empty() {
+            let cfg: ChannelsConfig = toml::from_str("").unwrap();
+            assert!(cfg.master_channel.is_none());
+            assert!(cfg.superusers.is_empty());
+        }
     }
 }
