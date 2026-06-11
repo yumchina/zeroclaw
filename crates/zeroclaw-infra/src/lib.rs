@@ -4,6 +4,7 @@
 
 pub mod acp_session_store;
 pub mod debounce;
+pub mod identity_store;
 pub mod session_backend;
 pub mod session_queue;
 pub mod session_sqlite;
