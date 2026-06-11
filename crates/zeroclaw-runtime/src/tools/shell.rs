@@ -280,23 +280,6 @@ impl Tool for ShellTool {
 
         ensure_valid_parent_cwd();
 
-        let parent_cwd_before_spawn = std::env::current_dir().ok();
-        let target_arg0 = cmd
-            .as_std()
-            .get_args()
-            .next()
-            .map(|s| s.to_string_lossy().to_string());
-        tracing::info!(
-            target: "zeroclaw_runtime::tools::shell",
-            exec_dir = %exec_dir.display(),
-            exec_dir_exists = exec_dir.exists(),
-            exec_dir_is_dir = exec_dir.is_dir(),
-            parent_cwd = ?parent_cwd_before_spawn.as_ref().map(|p| p.display().to_string()),
-            arg0 = ?target_arg0,
-            command = %command,
-            "shell.spawn"
-        );
-
         let timeout_secs = self.timeout_secs;
         let result = tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await;
 
