@@ -354,6 +354,15 @@ struct ChannelCostTrackingState {
     agent_alias: Arc<String>,
 }
 
+/// Runtime handle for unified cross-channel sessions. Present only when
+/// `[channels].master_channel` is configured.
+#[derive(Clone)]
+struct IdentityRuntime {
+    resolver: Arc<dyn zeroclaw_infra::identity_store::IdentityResolver>,
+    /// `"<type>.<alias>"` of the master channel.
+    master_channel: String,
+}
+
 #[derive(Clone)]
 struct ChannelRuntimeContext {
     channels_by_name: Arc<HashMap<String, Arc<dyn Channel>>>,
@@ -404,6 +413,9 @@ struct ChannelRuntimeContext {
     show_tool_calls: bool,
     progress_observer: zeroclaw_config::schema::ProgressObserverConfig,
     session_store: Option<Arc<dyn zeroclaw_infra::session_backend::SessionBackend>>,
+    /// Cross-channel identity resolver + master channel ref. `None` disables
+    /// unified sessions (behaviour identical to before this feature).
+    identity: Option<Arc<IdentityRuntime>>,
     /// Non-interactive approval manager for channel-driven runs.
     /// Enforces `auto_approve` / `always_ask` / supervised policy from
     /// `[autonomy]` config; auto-denies tools that would need interactive
@@ -8702,6 +8714,7 @@ pub async fn start_channels(
             show_tool_calls: config.channels.show_tool_calls,
             progress_observer: config.channels.progress_observer.clone(),
             session_store: shared_session_store.clone(),
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(&risk_profile)),
             activated_tools: ch_activated_handle,
             cost_tracking: zeroclaw_runtime::cost::CostTracker::get_or_init_global(
@@ -9500,6 +9513,7 @@ mod tests {
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -10265,6 +10279,7 @@ mod tests {
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -10396,6 +10411,7 @@ mod tests {
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -10498,6 +10514,7 @@ mod tests {
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -10604,6 +10621,7 @@ mod tests {
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: Some(Arc::clone(&store)),
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -10946,6 +10964,7 @@ mod tests {
             ack_reactions: true,
             show_tool_calls: true,
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -11599,6 +11618,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -11702,6 +11722,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: Some(Arc::clone(&session_store)),
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(&{
                 let mut profile = zeroclaw_config::schema::RiskProfileConfig::default();
                 profile.auto_approve.push("sessions_current".to_string());
@@ -11815,6 +11836,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig {
                     level: zeroclaw_config::autonomy::AutonomyLevel::Full,
@@ -11955,6 +11977,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig {
                     level: zeroclaw_config::autonomy::AutonomyLevel::Full,
@@ -12066,6 +12089,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig {
                     level: zeroclaw_config::autonomy::AutonomyLevel::Full,
@@ -12197,6 +12221,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -12310,6 +12335,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -12408,6 +12434,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -12526,6 +12553,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -12661,6 +12689,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -12859,6 +12888,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -12952,6 +12982,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -13055,6 +13086,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -13417,6 +13449,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -13549,6 +13582,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -13681,6 +13715,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
@@ -13830,6 +13865,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -13947,6 +13983,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -14045,6 +14082,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -15323,6 +15361,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -15481,6 +15520,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -15679,6 +15719,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -15809,7 +15850,9 @@ BTC is currently around $65,000 based on latest tool output."#
             query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
             ack_reactions: true,
             show_tool_calls: true,
+            progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -15943,6 +15986,7 @@ BTC is currently around $65,000 based on latest tool output."#
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -17010,6 +17054,7 @@ This is an example JSON object for profile settings."#;
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -17115,6 +17160,7 @@ This is an example JSON object for profile settings."#;
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -17257,6 +17303,7 @@ This is an example JSON object for profile settings."#;
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -17454,6 +17501,7 @@ This is an example JSON object for profile settings."#;
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -17593,6 +17641,7 @@ This is an example JSON object for profile settings."#;
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -17724,6 +17773,7 @@ This is an example JSON object for profile settings."#;
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -17876,6 +17926,7 @@ This is an example JSON object for profile settings."#;
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -18229,6 +18280,7 @@ This is an example JSON object for profile settings."#;
             show_tool_calls: true,
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
+            identity: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
