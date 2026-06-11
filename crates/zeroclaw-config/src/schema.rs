@@ -90,6 +90,10 @@ pub struct Config {
     #[nested]
     pub observability: ObservabilityConfig,
 
+    /// Dawn Agent task type configuration (`[dawn_agents]`).
+    #[serde(default)]
+    pub dawn_agents: crate::dawn_agents::DawnAgents,
+
     /// Autonomy and security policy configuration (`[autonomy]`).
     #[serde(default)]
     #[nested]
@@ -9944,6 +9948,7 @@ impl Default for Config {
             schema_version: crate::migration::CURRENT_SCHEMA_VERSION,
             providers: crate::providers::ProvidersConfig::default(),
             observability: ObservabilityConfig::default(),
+            dawn_agents: crate::dawn_agents::DawnAgents::default(),
             autonomy: AutonomyConfig::default(),
             trust: crate::scattered_types::TrustConfig::default(),
             backup: BackupConfig::default(),
@@ -13586,6 +13591,7 @@ default_temperature = 0.7
             workspace_dir: dir.join("workspace"),
             config_path: config_path.clone(),
             observability: ObservabilityConfig::default(),
+            dawn_agents: crate::dawn_agents::DawnAgents::default(),
             autonomy: AutonomyConfig::default(),
             trust: crate::scattered_types::TrustConfig::default(),
             backup: BackupConfig::default(),
