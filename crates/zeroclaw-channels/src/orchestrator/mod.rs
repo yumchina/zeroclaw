@@ -512,6 +512,33 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
     sanitize_session_key(&raw)
 }
 
+/// Wrap `conversation_history_key` with cross-channel identity merging.
+/// Returns `unified_<master_id>` for 1:1 messages whose (channel_ref, sender)
+/// resolves to a whitelisted master id; otherwise the base key (unchanged
+/// per-channel isolation). Group chats and unconfigured identity always use
+/// the base key.
+fn resolve_session_key(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    identity: Option<&IdentityRuntime>,
+) -> String {
+    let base = conversation_history_key(msg);
+    let Some(identity) = identity else {
+        return base;
+    };
+    if is_group_reply_target(&msg.reply_target) {
+        return base;
+    }
+    let channel_ref = match &msg.channel_alias {
+        Some(alias) => format!("{}.{}", msg.channel, alias),
+        None => msg.channel.clone(),
+    };
+    let is_master = channel_ref == identity.master_channel;
+    match identity.resolver.resolve(&channel_ref, &msg.sender, is_master) {
+        Some(master_id) => sanitize_session_key(&format!("unified_{master_id}")),
+        None => base,
+    }
+}
+
 fn followup_thread_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<String> {
     if is_matrix_channel_name(&msg.channel) {
         msg.thread_ts.clone()
@@ -2176,7 +2203,7 @@ async fn handle_runtime_command_if_needed(
         return true;
     };
 
-    let sender_key = conversation_history_key(msg);
+    let sender_key = resolve_session_key(msg, ctx.identity.as_deref());
     let mut current = get_route_selection(ctx, &sender_key);
 
     let response = match command {
@@ -3676,7 +3703,7 @@ async fn process_channel_message_body(
         return;
     }
 
-    let history_key = conversation_history_key(&msg);
+    let history_key = resolve_session_key(&msg, ctx.identity.as_deref());
     if let Some(ref store) = ctx.session_store {
         let channel_id = msg
             .channel_alias
@@ -3697,7 +3724,10 @@ async fn process_channel_message_body(
         let context = zeroclaw_infra::session_backend::SessionContext {
             channel_id: channel_id.as_deref(),
             room_id,
-            sender_id: Some(msg.sender.as_str()).filter(|s| !s.is_empty()),
+            sender_id: history_key
+                .strip_prefix("unified_")
+                .or(Some(msg.sender.as_str()))
+                .filter(|s| !s.is_empty()),
         };
         if let Err(e) = store.set_session_context(&history_key, context) {
             ::zeroclaw_log::record!(
@@ -19199,6 +19229,89 @@ mod error_code_tests {
         assert_eq!(classify_failure_code(&cb), "ERR:loop_detected");
         let other = anyhow::anyhow!("some provider 500");
         assert_eq!(classify_failure_code(&other), "ERR:step_error");
+    }
+
+    struct StubResolver {
+        // (channel_ref, sender) -> master_id
+        map: std::collections::HashMap<(String, String), String>,
+        whitelist: std::collections::HashSet<String>,
+    }
+    impl zeroclaw_infra::identity_store::IdentityResolver for StubResolver {
+        fn resolve(&self, channel_ref: &str, sender: &str, is_master: bool) -> Option<String> {
+            if is_master {
+                return self.whitelist.contains(sender).then(|| sender.to_string());
+            }
+            let m = self.map.get(&(channel_ref.to_string(), sender.to_string()))?;
+            self.whitelist.contains(m).then(|| m.clone())
+        }
+        fn issue_code(&self, _m: &str) -> Option<String> { None }
+        fn redeem_code(&self, _c: &str, _ch: &str, _s: &str) -> Result<String, String> {
+            Err("stub".into())
+        }
+        fn unbind(&self, _ch: &str, _s: &str) -> bool { false }
+    }
+
+    fn dm(channel: &str, alias: &str, sender: &str) -> zeroclaw_api::channel::ChannelMessage {
+        let mut m = zeroclaw_api::channel::ChannelMessage::new(
+            "id1", sender, sender, "hi", channel, 0,
+        );
+        m.channel_alias = Some(alias.to_string());
+        m
+    }
+
+    #[test]
+    fn resolve_session_key_master_uses_sender_identity() {
+        let mut whitelist = std::collections::HashSet::new();
+        whitelist.insert("u_alice".to_string());
+        let ident = IdentityRuntime {
+            resolver: Arc::new(StubResolver { map: Default::default(), whitelist }),
+            master_channel: "dawnim.work".to_string(),
+        };
+        let msg = dm("dawnim", "work", "u_alice");
+        assert_eq!(resolve_session_key(&msg, Some(&ident)), "unified_u_alice");
+    }
+
+    #[test]
+    fn resolve_session_key_slave_uses_binding() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(("lark.work".to_string(), "ou_aaa".to_string()), "u_alice".to_string());
+        let mut whitelist = std::collections::HashSet::new();
+        whitelist.insert("u_alice".to_string());
+        let ident = IdentityRuntime {
+            resolver: Arc::new(StubResolver { map, whitelist }),
+            master_channel: "dawnim.work".to_string(),
+        };
+        let msg = dm("lark", "work", "ou_aaa");
+        assert_eq!(resolve_session_key(&msg, Some(&ident)), "unified_u_alice");
+    }
+
+    #[test]
+    fn resolve_session_key_unbound_falls_back_to_base() {
+        let ident = IdentityRuntime {
+            resolver: Arc::new(StubResolver { map: Default::default(), whitelist: Default::default() }),
+            master_channel: "dawnim.work".to_string(),
+        };
+        let msg = dm("lark", "work", "ou_stranger");
+        assert_eq!(resolve_session_key(&msg, Some(&ident)), conversation_history_key(&msg));
+    }
+
+    #[test]
+    fn resolve_session_key_none_identity_is_base() {
+        let msg = dm("lark", "work", "ou_aaa");
+        assert_eq!(resolve_session_key(&msg, None), conversation_history_key(&msg));
+    }
+
+    #[test]
+    fn resolve_session_key_group_is_not_unified() {
+        let mut whitelist = std::collections::HashSet::new();
+        whitelist.insert("u_alice".to_string());
+        let ident = IdentityRuntime {
+            resolver: Arc::new(StubResolver { map: Default::default(), whitelist }),
+            master_channel: "dawnim.work".to_string(),
+        };
+        let mut msg = dm("dawnim", "work", "u_alice");
+        msg.reply_target = "group:team".to_string(); // group → no unify
+        assert_eq!(resolve_session_key(&msg, Some(&ident)), conversation_history_key(&msg));
     }
 }
 
