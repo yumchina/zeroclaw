@@ -158,7 +158,7 @@ pub async fn run(
     // the WuKongIM channel supervisor reads the receiver.
     let (_channel_msg_tx, channel_msg_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, u8, serde_json::Value)>();
-    crate::tools::xuanji::set_xuanji_bridge(_channel_msg_tx.clone());
+    crate::tools::dawn_task::set_dawn_bridge(_channel_msg_tx.clone());
     let mut channel_msg_rx = Some(channel_msg_rx);
 
     if config.heartbeat.enabled {

@@ -2874,8 +2874,8 @@ async fn process_channel_message(
         return;
     }
 
-    // Parse sender UID for xuanji context (102535169_la_1780499236481 → 102535169).
-    let xuanji_ctx = zeroclaw_runtime::tools::xuanji::XuanjiContext {
+    // Parse sender UID for dawn context (102535169_la_1780499236481 → 102535169).
+    let dawn_ctx = zeroclaw_runtime::tools::dawn_task::DawnContext {
         from_uid: msg.sender.split("_la_").next().unwrap_or(&msg.sender).to_string(),
         reply_target: msg.reply_target.clone(),
     };
@@ -3593,8 +3593,8 @@ async fn process_channel_message(
                             cost_tracking_context.clone(),
                         zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT.scope(
                             receipt_scope.clone(),
-                        zeroclaw_runtime::tools::xuanji::XUANJI_CONTEXT.scope(
-                            xuanji_ctx.clone(),
+                        zeroclaw_runtime::tools::dawn_task::DAWN_CONTEXT.scope(
+                            dawn_ctx.clone(),
                         run_tool_call_loop(
                         active_provider.as_ref(),
                         &mut history,
@@ -6385,8 +6385,8 @@ pub async fn start_channels(
         }
     }
 
-    // Xuanji → WuKongIM bridge: spawn a listener that consumes messages from
-    // the xuanji tools' mpsc sender and forwards them through the WuKongIM
+    // Dawn → WuKongIM bridge: spawn a listener that consumes messages from
+    // the dawn tools' mpsc sender and forwards them through the WuKongIM
     // channel's send_status_message.
     #[cfg(feature = "channel-wukongim")]
     {
