@@ -52,6 +52,23 @@ pub fn make_session_backend(
     }
 }
 
+/// Construct the cross-channel identity store and seed the superuser whitelist.
+///
+/// Opens `{workspace}/sessions/identity.db` and inserts each `superusers`
+/// entry into the `unified_member` whitelist (idempotent). Call only when
+/// `[channels].master_channel` is configured.
+pub fn make_identity_store(
+    workspace_dir: &Path,
+    superusers: &[String],
+) -> std::io::Result<Arc<dyn identity_store::IdentityResolver>> {
+    let store = identity_store::SqliteIdentityStore::new(workspace_dir)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    store
+        .seed_superusers(superusers)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    Ok(Arc::new(store))
+}
+
 /// Open the SQLite backend and, on first open, import any pre-existing
 /// `sessions/*.jsonl` files left over from the legacy JSONL store. Renames
 /// the imported files to `*.jsonl.migrated` so re-runs are no-ops; preserves
@@ -161,5 +178,17 @@ mod tests {
             jsonl_migrated.exists(),
             ".jsonl.migrated rollback file should remain"
         );
+    }
+
+    #[test]
+    fn make_identity_store_seeds_and_resolves() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_identity_store(tmp.path(), &["u_alice".to_string()]).unwrap();
+        assert_eq!(
+            store.resolve("dawnim.work", "u_alice", true),
+            Some("u_alice".to_string())
+        );
+        let db = tmp.path().join("sessions").join("identity.db");
+        assert!(db.exists(), "identity.db must be created under sessions/");
     }
 }
