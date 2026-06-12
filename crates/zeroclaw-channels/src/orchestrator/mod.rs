@@ -6385,8 +6385,8 @@ pub async fn start_channels(
         }
     }
 
-    // Dawn → WuKongIM bridge: spawn a listener that consumes messages from
-    // the dawn tools' mpsc sender and forwards them through the WuKongIM
+    // zeroclaw → WuKongIM bridge: spawn a listener that consumes messages from
+    // the zeroclaw tools' mpsc sender and forwards them through the WuKongIM
     // channel's send_status_message.
     #[cfg(feature = "channel-wukongim")]
     let has_rx = channel_msg_rx.is_some();
