@@ -68,11 +68,9 @@ impl Tool for DawnCreateTask {
     }
 
     fn description(&self) -> &str {
-        "向 Dawn 平台 Agent 提交任务。根据 type 参数选择目标 Agent。\
+        "向 Dawn 平台 Agent 提交任务。根据 type 参数选择目标 Agent，通过 WuKongIM 发送任务消息。\
          当前支持：1=文档提取, 2=代码分析, 3=数据处理。\
-         type=1 时 params.files 为对象格式：\
-         {\"file1\": {\"file_url\": \"...\", \"file_name\": \"...\", \"file_type\": \"...\"}}，\
-         多文件用 file1, file2, ... 组织。"
+         每个 Agent 的 params 结构不同，参考对应 Agent 的文档。"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -90,7 +88,7 @@ impl Tool for DawnCreateTask {
                 },
                 "params": {
                     "type": "object",
-                    "description": "Agent 自定义参数。type=1 时 files 为对象：{\"file1\": {\"file_url\":\"...\",\"file_name\":\"...\",\"file_type\":\"...\"}}，多文件用 file1,file2,... 组织"
+                    "description": "Agent 自定义参数，不同 type 对应不同结构"
                 }
             },
             "required": ["type", "user_text", "params"]
