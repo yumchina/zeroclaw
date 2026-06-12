@@ -300,6 +300,11 @@ enum ChannelRuntimeCommand {
     SetModel(String),
     ShowConfig,
     NewSession,
+    /// `/bind` — no arg on master channel issues a code; `<code>` on a slave
+    /// channel redeems it.
+    Bind(Option<String>),
+    /// `/unbind` — remove the current slave-channel binding.
+    Unbind,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1095,6 +1100,10 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
     match base_command.as_str() {
         // `/new` is available on every channel — no model-switch gate.
         "/new" => Some(ChannelRuntimeCommand::NewSession),
+        "/bind" => Some(ChannelRuntimeCommand::Bind(
+            parts.next().map(|s| s.trim().to_string()),
+        )),
+        "/unbind" => Some(ChannelRuntimeCommand::Unbind),
         // Model/model_provider switching is channel-gated.
         "/models" if supports_runtime_model_switch(channel_name) => {
             if let Some(model_provider) = parts.next() {
@@ -2306,6 +2315,44 @@ async fn handle_runtime_command_if_needed(
             mark_sender_for_new_session(ctx, &sender_key);
             "Conversation history cleared. Starting fresh.".to_string()
         }
+        ChannelRuntimeCommand::Bind(arg) => match ctx.identity.as_deref() {
+            None => "统一会话未启用。".to_string(),
+            Some(identity) => {
+                let channel_ref = match &msg.channel_alias {
+                    Some(alias) => format!("{}.{}", msg.channel, alias),
+                    None => msg.channel.clone(),
+                };
+                let is_master = channel_ref == identity.master_channel;
+                match arg {
+                    None if is_master => match identity.resolver.issue_code(&msg.sender) {
+                        Some(code) => format!(
+                            "绑定码:{code}\n请在 5 分钟内,到其他渠道发送 /bind {code} 完成绑定。"
+                        ),
+                        None => "你不是 superuser,无法发起绑定。".to_string(),
+                    },
+                    None => "请先在主渠道发送 /bind 获取绑定码,再在此渠道发送 /bind <码>。".to_string(),
+                    Some(_) if is_master => "主渠道无需绑定。".to_string(),
+                    Some(code) => match identity.resolver.redeem_code(&code, &channel_ref, &msg.sender) {
+                        Ok(master_id) => format!("已绑定到 {master_id},此后本渠道会话将与主渠道合并。"),
+                        Err(reason) => format!("绑定失败:{reason}"),
+                    },
+                }
+            }
+        },
+        ChannelRuntimeCommand::Unbind => match ctx.identity.as_deref() {
+            None => "统一会话未启用。".to_string(),
+            Some(identity) => {
+                let channel_ref = match &msg.channel_alias {
+                    Some(alias) => format!("{}.{}", msg.channel, alias),
+                    None => msg.channel.clone(),
+                };
+                if identity.resolver.unbind(&channel_ref, &msg.sender) {
+                    "已解绑,本渠道会话恢复独立。".to_string()
+                } else {
+                    "当前没有绑定。".to_string()
+                }
+            }
+        },
     };
 
     if let Err(err) = channel
@@ -14917,6 +14964,22 @@ BTC is currently around $65,000 based on latest tool output."#
             parse_runtime_command("wecom_ws", "/model qwen-max"),
             Some(ChannelRuntimeCommand::SetModel("qwen-max".into()))
         );
+    }
+
+    #[test]
+    fn parse_runtime_command_recognizes_bind_and_unbind() {
+        assert!(matches!(
+            parse_runtime_command("lark", "/bind 123456"),
+            Some(ChannelRuntimeCommand::Bind(Some(c))) if c == "123456"
+        ));
+        assert!(matches!(
+            parse_runtime_command("dawnim", "/bind"),
+            Some(ChannelRuntimeCommand::Bind(None))
+        ));
+        assert!(matches!(
+            parse_runtime_command("lark", "/unbind"),
+            Some(ChannelRuntimeCommand::Unbind)
+        ));
     }
 
     /// `/models <family>` must resolve to a configured alias-backed ref so the
