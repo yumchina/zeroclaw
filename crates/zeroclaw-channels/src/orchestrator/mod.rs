@@ -2495,7 +2495,10 @@ fn format_memory_context(
 }
 
 fn is_group_reply_target(reply_target: &str) -> bool {
-    reply_target.contains("@g.us") || reply_target.starts_with("group:")
+    reply_target.contains("@g.us")
+        || reply_target.starts_with("group:")
+        || reply_target.starts_with("group--")
+        || reply_target.starts_with("2:")
 }
 
 fn sender_memory_session_ids(
@@ -19471,3 +19474,33 @@ mod omitted_feature_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod group_detection_tests {
+    use super::*;
+
+    #[test]
+    fn is_group_reply_target_covers_participating_channels() {
+        // Existing WhatsApp group format
+        assert!(is_group_reply_target("123456789@g.us"));
+        assert!(is_group_reply_target("some_id@g.us"));
+
+        // QQ group format (already covered by starts_with("group:"))
+        assert!(is_group_reply_target("group:12345678"));
+
+        // WeCom group format (NEW - needs to be added)
+        assert!(is_group_reply_target("group--wrjEwKDwAALbgnNSPHc1AsopD6TIvxxx"));
+
+        // DawnIM group format (NEW - needs to be added)
+        assert!(is_group_reply_target("2:channel_123"));
+
+        // Negative cases - 1:1 private chats that must NOT be detected as groups
+        assert!(!is_group_reply_target("ou_alice"));
+        assert!(!is_group_reply_target("u_alice"));
+        assert!(!is_group_reply_target("user:12345678")); // QQ DM
+        assert!(!is_group_reply_target("user--bob")); // WeCom DM
+        assert!(!is_group_reply_target("1:user_456")); // DawnIM DM (PERSONAL = 1)
+        assert!(!is_group_reply_target("oc_chat123")); // Lark chat_id (cannot distinguish)
+    }
+}
+
