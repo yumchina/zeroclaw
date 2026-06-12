@@ -70,7 +70,9 @@ impl Tool for DawnCreateTask {
     fn description(&self) -> &str {
         "向 Dawn 平台 Agent 提交任务。根据 type 参数选择目标 Agent，通过 WuKongIM 发送任务消息。\
          当前支持：1=文档提取, 2=代码分析, 3=数据处理。\
-         每个 Agent 的 params 结构不同，参考对应 Agent 的文档。"
+         重要：params 结构因 type 而异。比如：type=1 时 params 必须包含 files 数组：\
+         {\"files\": [{\"file_url\": \"<下载URL>\", \"file_name\": \"<文件名>\", \"file_type\": \"<类型>\"}]}. \
+         请严格参考对应 Agent 的技能文档。"
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

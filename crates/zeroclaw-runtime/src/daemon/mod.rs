@@ -154,7 +154,7 @@ pub async fn run(
     // heartbeat) can publish real-time events to dashboard clients.
     let (event_tx, _rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
 
-    // WuKongIM channel bridge: xuanji tools write the sender,
+    // WuKongIM channel bridge: tool-to-agent tasks write the sender,
     // the WuKongIM channel supervisor reads the receiver.
     let (_channel_msg_tx, channel_msg_rx) =
         tokio::sync::mpsc::unbounded_channel::<(String, u8, serde_json::Value)>();

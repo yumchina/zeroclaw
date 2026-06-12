@@ -6389,35 +6389,33 @@ pub async fn start_channels(
     // the dawn tools' mpsc sender and forwards them through the WuKongIM
     // channel's send_status_message.
     #[cfg(feature = "channel-wukongim")]
-    {
-        let has_rx = channel_msg_rx.is_some();
-        let has_wk = wukongim_channel.is_some();
-        if let (Some(mut rx), Some(wk)) = (channel_msg_rx, wukongim_channel) {
-            tracing::info!("Bridge listener started (Xuanji → WuKongIM)");
-            tokio::spawn(async move {
-                while let Some((recipient, channel_type, payload)) = rx.recv().await {
-                    tracing::info!(
+    let has_rx = channel_msg_rx.is_some();
+    let has_wk = wukongim_channel.is_some();
+    if let (Some(mut rx), Some(wk)) = (channel_msg_rx, wukongim_channel) {
+        tracing::info!("Bridge listener started (Tool → WuKongIM)");
+        tokio::spawn(async move {
+            while let Some((recipient, channel_type, payload)) = rx.recv().await {
+                tracing::info!(
+                    recipient,
+                    channel_type,
+                    cmd = %payload.get("cmd").and_then(|v| v.as_str()).unwrap_or("?"),
+                    "Bridge: forwarding message to WuKongIM"
+                );
+                if let Err(e) = wk
+                    .send_status_message(&recipient, channel_type, payload)
+                    .await
+                {
+                    tracing::error!(
+                        ?e,
                         recipient,
-                        channel_type,
-                        cmd = %payload.get("cmd").and_then(|v| v.as_str()).unwrap_or("?"),
-                        "Bridge: forwarding message to WuKongIM"
+                        "Failed to forward tool message to WuKongIM"
                     );
-                    if let Err(e) = wk
-                        .send_status_message(&recipient, channel_type, payload)
-                        .await
-                    {
-                        tracing::error!(
-                            ?e,
-                            recipient,
-                            "Failed to forward xuanji message to WuKongIM"
-                        );
-                    }
                 }
-                tracing::info!("Xuanji → WuKongIM bridge closed");
-            });
-        } else {
-            tracing::warn!(has_rx, has_wk, "Bridge listener NOT started");
-        }
+            }
+            tracing::info!("Tool → WuKongIM bridge closed");
+        });
+    } else {
+        tracing::warn!(has_rx, has_wk, "Bridge listener NOT started");
     }
 
     let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
