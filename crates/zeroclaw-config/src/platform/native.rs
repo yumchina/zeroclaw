@@ -274,6 +274,56 @@ mod tests {
         );
     }
 
+    /// On Windows, actually invoke `cmd /C` with a quoted `echo`
+    /// argument to confirm the fix works end-to-end. Skipped on
+    /// non-Windows hosts since there's no `cmd.exe`.
+    ///
+    /// Ignored after the upstream/master merge: the local NativeRuntime
+    /// prefers PowerShell over cmd.exe, so this cmd.exe-oriented test is
+    /// imported but not validated here.
+    #[tokio::test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "local NativeRuntime prefers PowerShell; upstream cmd.exe test not adapted"]
+    async fn windows_echo_quoted_argument_succeeds() {
+        let cwd = std::env::temp_dir();
+        let output = NativeRuntime::new()
+            .build_shell_command(r#"echo "hello world""#, &cwd)
+            .unwrap()
+            .output()
+            .await
+            .expect("cmd /C echo should execute");
+
+        assert!(output.status.success(), "cmd must exit 0");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("hello world"),
+            "quoted echo output mismatch, got: {stdout}"
+        );
+    }
+
+    /// On Windows, verify `dir` with a quoted path works (previous
+    /// behavior: "The filename, directory name, or volume label
+    /// syntax is incorrect").
+    #[tokio::test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "local NativeRuntime prefers PowerShell; upstream cmd.exe test not adapted"]
+    async fn windows_dir_quoted_path_succeeds() {
+        let cwd = std::env::temp_dir();
+        let output = NativeRuntime::new()
+            .build_shell_command(r#"dir "C:\Windows" /b"#, &cwd)
+            .unwrap()
+            .output()
+            .await
+            .expect("cmd /C dir should execute");
+
+        assert!(output.status.success(), "cmd must exit 0");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("explorer.exe") || stdout.contains("System32"),
+            "dir should list C:\\Windows contents, got: {stdout}"
+        );
+    }
+
     /// Verify a command with entirely unquoted arguments still works
     /// (regression check for the raw_arg conversion).
     #[test]
@@ -284,5 +334,27 @@ mod tests {
             .unwrap();
         let debug = format!("{command:?}");
         assert!(debug.contains("echo hello_world"));
+    }
+
+    /// Verify `echo %VAR%` expansion syntax is preserved verbatim
+    /// and not mangled by escaping.
+    #[tokio::test]
+    #[cfg(target_os = "windows")]
+    #[ignore = "local NativeRuntime prefers PowerShell; upstream cmd.exe test not adapted"]
+    async fn windows_echo_percent_expansion_preserved() {
+        let cwd = std::env::temp_dir();
+        let output = NativeRuntime::new()
+            .build_shell_command("echo %USERPROFILE%", &cwd)
+            .unwrap()
+            .output()
+            .await
+            .expect("cmd /C echo should execute");
+
+        assert!(output.status.success(), "cmd must exit 0");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(":\\"),
+            "%%USERPROFILE%% should expand to a path, got: {stdout}"
+        );
     }
 }

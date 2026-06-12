@@ -148,7 +148,7 @@ impl DawnCrawlTool {
     }
 }
 
-tool_attribution!(DawnCrawlTool, ::zeroclaw_api::attribution::ToolKind::WebFetch);
+tool_attribution!(DawnCrawlTool, ::zeroclaw_api::attribution::ToolKind::FetchUrl);
 
 #[async_trait]
 impl Tool for DawnCrawlTool {

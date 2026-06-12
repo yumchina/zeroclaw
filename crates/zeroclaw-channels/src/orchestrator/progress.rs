@@ -83,6 +83,7 @@ pub(crate) fn event_to_progress(
         ObserverEvent::AgentStart {
             model_provider,
             model,
+            ..
         } if cfg.agent_start => {
             let text = get_event_string_with_args(
                 "event-agent-start",
@@ -117,6 +118,7 @@ pub(crate) fn event_to_progress(
             tool,
             tool_call_id,
             arguments,
+            ..
         } if cfg.tool_call_start => {
             let snippet = summarize_tool_args(arguments.as_deref());
             let (key, args) = tool_start_key_and_args(tool, snippet.as_deref());
@@ -371,6 +373,9 @@ mod tests {
             tool: "shell".into(),
             tool_call_id: Some("call_9".into()),
             arguments: Some(r#"{"command": "ls -la"}"#.into()),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         };
         let u = event_to_progress(&event, &cfg).expect("should translate");
         assert!(u.text.contains("ls -la"), "text was: {}", u.text);
@@ -390,6 +395,9 @@ mod tests {
             tool: "weird_custom_tool".into(),
             tool_call_id: None,
             arguments: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         };
         let u = event_to_progress(&event, &cfg).expect("should translate");
         assert!(u.text.contains("weird_custom_tool"), "text was: {}", u.text);
@@ -406,6 +414,9 @@ mod tests {
             success: true,
             arguments: None,
             result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         };
         let u = event_to_progress(&event, &cfg).expect("should translate");
         assert!(u.text.contains("456"), "text was: {}", u.text);
@@ -426,6 +437,9 @@ mod tests {
         let event = ObserverEvent::AgentStart {
             model_provider: "openai".into(),
             model: "gpt-5".into(),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         };
         let u = event_to_progress(&event, &cfg).expect("should translate");
         assert!(u.text.contains("openai"), "text was: {}", u.text);
@@ -456,6 +470,9 @@ mod tests {
             success: true,
             arguments: None,
             result: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         };
         assert!(event_to_progress(&event, &cfg).is_none());
     }
@@ -600,6 +617,9 @@ mod tests {
             tool: "shell".into(),
             tool_call_id: None,
             arguments: Some(r#"{"command": "ls"}"#.into()),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
 
         assert_eq!(inner.events.load(Ordering::SeqCst), 1, "inner must run");
@@ -631,6 +651,9 @@ mod tests {
             duration: Duration::from_millis(10),
             tokens_used: None,
             cost_usd: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
 
         wait_for_calls(&ch, 1, 200).await;
@@ -684,6 +707,9 @@ mod tests {
             tool: "shell".into(),
             tool_call_id: None,
             arguments: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
         });
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         assert!(ch.calls.lock().await.is_empty());
