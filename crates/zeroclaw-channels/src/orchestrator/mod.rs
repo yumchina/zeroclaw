@@ -2874,8 +2874,8 @@ async fn process_channel_message(
         return;
     }
 
-    // Parse sender UID for xuanji context (102535169_la_1780499236481 → 102535169).
-    let xuanji_ctx = zeroclaw_runtime::tools::xuanji::XuanjiContext {
+    // Parse sender UID for dawn context (102535169_la_1780499236481 → 102535169).
+    let dawn_ctx = zeroclaw_runtime::tools::dawn_task::DawnContext {
         from_uid: msg.sender.split("_la_").next().unwrap_or(&msg.sender).to_string(),
         reply_target: msg.reply_target.clone(),
     };
@@ -3593,8 +3593,8 @@ async fn process_channel_message(
                             cost_tracking_context.clone(),
                         zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT.scope(
                             receipt_scope.clone(),
-                        zeroclaw_runtime::tools::xuanji::XUANJI_CONTEXT.scope(
-                            xuanji_ctx.clone(),
+                        zeroclaw_runtime::tools::dawn_task::DAWN_CONTEXT.scope(
+                            dawn_ctx.clone(),
                         run_tool_call_loop(
                         active_provider.as_ref(),
                         &mut history,
@@ -6385,39 +6385,37 @@ pub async fn start_channels(
         }
     }
 
-    // Xuanji → WuKongIM bridge: spawn a listener that consumes messages from
-    // the xuanji tools' mpsc sender and forwards them through the WuKongIM
+    // zeroclaw → WuKongIM bridge: spawn a listener that consumes messages from
+    // the zeroclaw tools' mpsc sender and forwards them through the WuKongIM
     // channel's send_status_message.
     #[cfg(feature = "channel-wukongim")]
-    {
-        let has_rx = channel_msg_rx.is_some();
-        let has_wk = wukongim_channel.is_some();
-        if let (Some(mut rx), Some(wk)) = (channel_msg_rx, wukongim_channel) {
-            tracing::info!("Bridge listener started (Xuanji → WuKongIM)");
-            tokio::spawn(async move {
-                while let Some((recipient, channel_type, payload)) = rx.recv().await {
-                    tracing::info!(
+    let has_rx = channel_msg_rx.is_some();
+    let has_wk = wukongim_channel.is_some();
+    if let (Some(mut rx), Some(wk)) = (channel_msg_rx, wukongim_channel) {
+        tracing::info!("Bridge listener started (Tool → WuKongIM)");
+        tokio::spawn(async move {
+            while let Some((recipient, channel_type, payload)) = rx.recv().await {
+                tracing::info!(
+                    recipient,
+                    channel_type,
+                    cmd = %payload.get("cmd").and_then(|v| v.as_str()).unwrap_or("?"),
+                    "Bridge: forwarding message to WuKongIM"
+                );
+                if let Err(e) = wk
+                    .send_status_message(&recipient, channel_type, payload)
+                    .await
+                {
+                    tracing::error!(
+                        ?e,
                         recipient,
-                        channel_type,
-                        cmd = %payload.get("cmd").and_then(|v| v.as_str()).unwrap_or("?"),
-                        "Bridge: forwarding message to WuKongIM"
+                        "Failed to forward tool message to WuKongIM"
                     );
-                    if let Err(e) = wk
-                        .send_status_message(&recipient, channel_type, payload)
-                        .await
-                    {
-                        tracing::error!(
-                            ?e,
-                            recipient,
-                            "Failed to forward xuanji message to WuKongIM"
-                        );
-                    }
                 }
-                tracing::info!("Xuanji → WuKongIM bridge closed");
-            });
-        } else {
-            tracing::warn!(has_rx, has_wk, "Bridge listener NOT started");
-        }
+            }
+            tracing::info!("Tool → WuKongIM bridge closed");
+        });
+    } else {
+        tracing::warn!(has_rx, has_wk, "Bridge listener NOT started");
     }
 
     let max_in_flight_messages = compute_max_in_flight_messages(channels.len());

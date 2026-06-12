@@ -5,6 +5,7 @@ pub mod autonomy;
 pub mod comment_writer;
 pub mod cost;
 pub mod domain_matcher;
+pub mod dawn_agents;
 pub mod helpers;
 pub mod migration;
 pub mod pairing;
