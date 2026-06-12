@@ -2326,15 +2326,15 @@ async fn handle_runtime_command_if_needed(
                 match arg {
                     None if is_master => match identity.resolver.issue_code(&msg.sender) {
                         Some(code) => format!(
-                            "绑定码:{code}\n请在 5 分钟内,到其他渠道发送 /bind {code} 完成绑定。"
+                            "绑定码：{code}\n请在 5 分钟内，到其他渠道发送 /bind {code} 完成绑定。"
                         ),
-                        None => "你不是 superuser,无法发起绑定。".to_string(),
+                        None => "你不是 superuser，无法发起绑定。".to_string(),
                     },
-                    None => "请先在主渠道发送 /bind 获取绑定码,再在此渠道发送 /bind <码>。".to_string(),
+                    None => "请先在主渠道发送 /bind 获取绑定码，再在此渠道发送 /bind <码>。".to_string(),
                     Some(_) if is_master => "主渠道无需绑定。".to_string(),
                     Some(code) => match identity.resolver.redeem_code(&code, &channel_ref, &msg.sender) {
-                        Ok(master_id) => format!("已绑定到 {master_id},此后本渠道会话将与主渠道合并。"),
-                        Err(reason) => format!("绑定失败:{reason}"),
+                        Ok(master_id) => format!("已绑定到 {master_id}，此后本渠道会话将与主渠道合并。"),
+                        Err(reason) => format!("绑定失败：{reason}"),
                     },
                 }
             }
@@ -2347,7 +2347,7 @@ async fn handle_runtime_command_if_needed(
                     None => msg.channel.clone(),
                 };
                 if identity.resolver.unbind(&channel_ref, &msg.sender) {
-                    "已解绑,本渠道会话恢复独立。".to_string()
+                    "已解绑，本渠道会话恢复独立。".to_string()
                 } else {
                     "当前没有绑定。".to_string()
                 }
