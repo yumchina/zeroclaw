@@ -8098,6 +8098,43 @@ pub async fn start_channels(
             None
         };
 
+    // Cross-channel identity runtime (unified sessions). Built once and shared
+    // across agent ctxs, like the session backend. Disabled unless
+    // `[channels].master_channel` is set.
+    let shared_identity: Option<Arc<IdentityRuntime>> = match config
+        .channels
+        .master_channel
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        Some(master_channel) => {
+            match zeroclaw_infra::make_identity_store(&config.data_dir, &config.channels.superusers) {
+                Ok(resolver) => {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
+                        &format!("🔗 Unified sessions enabled (master: {master_channel})")
+                    );
+                    Some(Arc::new(IdentityRuntime {
+                        resolver,
+                        master_channel: master_channel.to_string(),
+                    }))
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "Unified sessions disabled (identity store init failed)"
+                    );
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+
     // Channel infrastructure (listeners, `channels_by_name`, the mpsc bus)
     // is built once inside the loop on the first iteration — the primary
     // agent's `tool_specs` are used to wire Telegram slash commands.
@@ -8791,7 +8828,7 @@ pub async fn start_channels(
             show_tool_calls: config.channels.show_tool_calls,
             progress_observer: config.channels.progress_observer.clone(),
             session_store: shared_session_store.clone(),
-            identity: None,
+            identity: shared_identity.clone(),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(&risk_profile)),
             activated_tools: ch_activated_handle,
             cost_tracking: zeroclaw_runtime::cost::CostTracker::get_or_init_global(
@@ -19375,6 +19412,34 @@ mod error_code_tests {
         let mut msg = dm("dawnim", "work", "u_alice");
         msg.reply_target = "group:team".to_string(); // group → no unify
         assert_eq!(resolve_session_key(&msg, Some(&ident)), conversation_history_key(&msg));
+    }
+
+    #[test]
+    fn end_to_end_master_and_bound_slave_share_session_key() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let resolver = zeroclaw_infra::make_identity_store(tmp.path(), &["u_alice".to_string()])
+            .unwrap();
+        // Bind lark.work/ou_aaa -> u_alice via a real code.
+        let code = resolver.issue_code("u_alice").unwrap();
+        resolver.redeem_code(&code, "lark.work", "ou_aaa").unwrap();
+
+        let ident = IdentityRuntime { resolver, master_channel: "dawnim.work".to_string() };
+
+        let master_msg = dm("dawnim", "work", "u_alice");
+        let slave_msg = dm("lark", "work", "ou_aaa");
+        let stranger = dm("lark", "work", "ou_zzz");
+
+        assert_eq!(
+            resolve_session_key(&master_msg, Some(&ident)),
+            resolve_session_key(&slave_msg, Some(&ident)),
+            "master and bound slave must share the unified session_key"
+        );
+        assert_eq!(resolve_session_key(&master_msg, Some(&ident)), "unified_u_alice");
+        assert_eq!(
+            resolve_session_key(&stranger, Some(&ident)),
+            conversation_history_key(&stranger),
+            "unbound stranger stays isolated"
+        );
     }
 }
 
