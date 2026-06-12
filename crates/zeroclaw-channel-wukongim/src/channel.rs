@@ -23,8 +23,9 @@ use crate::approval::{
 use crate::config::WuKongIMConfig;
 use crate::connection::{
     ClearUnreadRequest, ConnectParams, HEARTBEAT_TIMEOUT, JsonRpcNotification, JsonRpcRequest,
-    JsonRpcResponse, PING_INTERVAL, RecvAckParams, RecvNotificationParams, SendParams, SyncRequest,
-    SyncResponse, WUKONGIM_RPC_VERSION, WkChannelType, WkMessageType, WsSink,
+    JsonRpcResponse, PING_INTERVAL, RecvAckParams, RecvNotificationParams, SendParams,
+    SettingFlags, SyncRequest, SyncResponse, WUKONGIM_RPC_VERSION, WkChannelType, WkMessageType,
+    WsSink,
 };
 use crate::filter::{is_mentioned, is_user_allowed, parse_recipient};
 use crate::messaging::{
@@ -468,6 +469,7 @@ impl WuKongIMChannel {
                         payload: m.payload.clone(),
                         timestamp: m.timestamp,
                         topic: m.topic.clone(),
+                        setting: None,
                     });
 
                     // Log the message content summary by decoding Base64 payload if string
@@ -1179,7 +1181,14 @@ impl WuKongIMChannel {
         let payload_b64 = base64::engine::general_purpose::STANDARD.encode(json);
 
         let topic = topic.filter(|t| !t.is_empty() && *t != "0");
-        let setting = if topic.is_some() { Some(8) } else { None };
+        let setting = if topic.is_some() {
+            Some(SettingFlags {
+                topic: Some(true),
+                ..Default::default()
+            })
+        } else {
+            None
+        };
 
         // WK 服务端会根据 from_uid 自动规范化 channel_id 为 "{from_uid}@{to_uid}"，
         // 这里直接使用调用方传入的原始 channel_id，不要自行拼接。
@@ -1485,7 +1494,14 @@ impl Channel for WuKongIMChannel {
             .as_ref()
             .filter(|&t| !t.is_empty() && *t != "0")
             .map(ToString::to_string);
-        let setting = if topic.is_some() { Some(8) } else { None };
+        let setting = if topic.is_some() {
+            Some(SettingFlags {
+                topic: Some(true),
+                ..Default::default()
+            })
+        } else {
+            None
+        };
 
         let params = SendParams {
             from_uid: Some(self.uid.clone()),
@@ -2070,7 +2086,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_inbound_topic_mapping() {
-        let ch = make_test_channel(false);
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace = temp_dir.path().to_path_buf();
+        let memory = Arc::new(MockMemory);
+        let config = make_config(vec!["*".to_string()], false);
+        let ch = WuKongIMChannel::from_config(&config, &workspace, memory);
         let (tx, mut rx) = tokio::sync::mpsc::channel(10);
 
         // Scenario 1: topic is present and has a valid value
@@ -2086,6 +2106,7 @@ mod tests {
             }),
             timestamp: 123456,
             topic: Some("db_lock".to_string()),
+            setting: None,
         };
 
         ch.process_inbound_message(params, &tx).await.unwrap();
@@ -2105,6 +2126,7 @@ mod tests {
             }),
             timestamp: 123457,
             topic: Some("0".to_string()),
+            setting: None,
         };
 
         ch.process_inbound_message(params, &tx).await.unwrap();
@@ -2124,6 +2146,7 @@ mod tests {
             }),
             timestamp: 123458,
             topic: Some("".to_string()),
+            setting: None,
         };
 
         ch.process_inbound_message(params, &tx).await.unwrap();
