@@ -23,8 +23,9 @@ use crate::approval::{
 use crate::config::WuKongIMConfig;
 use crate::connection::{
     ClearUnreadRequest, ConnectParams, HEARTBEAT_TIMEOUT, JsonRpcNotification, JsonRpcRequest,
-    JsonRpcResponse, PING_INTERVAL, RecvAckParams, RecvNotificationParams, SendParams, SyncRequest,
-    SyncResponse, WUKONGIM_RPC_VERSION, WkChannelType, WkMessageType, WsSink,
+    JsonRpcResponse, PING_INTERVAL, RecvAckParams, RecvNotificationParams, SendParams,
+    SettingFlags, SyncRequest, SyncResponse, WUKONGIM_RPC_VERSION, WkChannelType, WkMessageType,
+    WsSink,
 };
 use crate::filter::{is_mentioned, is_user_allowed, parse_recipient};
 use crate::messaging::{
@@ -467,6 +468,8 @@ impl WuKongIMChannel {
                         channel_type: conv.channel_type,
                         payload: m.payload.clone(),
                         timestamp: m.timestamp,
+                        topic: m.topic.clone(),
+                        setting: None,
                     });
 
                     // Log the message content summary by decoding Base64 payload if string
@@ -523,6 +526,11 @@ impl WuKongIMChannel {
         params: RecvNotificationParams,
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> anyhow::Result<()> {
+        let topic_thread = params
+            .topic
+            .as_deref()
+            .filter(|&t| !t.is_empty() && t != "0")
+            .map(ToString::to_string);
         if params.from_uid == self.uid {
             return Ok(());
         }
@@ -568,7 +576,10 @@ impl WuKongIMChannel {
             .unwrap_or(0);
 
         // System command — handle la_init_helloworld CMD
-        if msg_type == WkMessageType::CMD as u64 || msg_type == WkMessageType::AGENT_MSG as u64 || payload_json.get("cmd").is_some() {
+        if msg_type == WkMessageType::CMD as u64
+            || msg_type == WkMessageType::AGENT_MSG as u64
+            || payload_json.get("cmd").is_some()
+        {
             let _ = self
                 .send_ack(params.message_id.clone(), params.message_seq)
                 .await;
@@ -589,7 +600,7 @@ impl WuKongIMChannel {
                     content: content.to_string(),
                     channel: "wukongim".to_string(),
                     timestamp: params.timestamp.max(0) as u64,
-                    thread_ts: None,
+                    thread_ts: topic_thread.clone(),
                     interruption_scope_id: None,
                     attachments: vec![],
                 };
@@ -602,16 +613,26 @@ impl WuKongIMChannel {
                     )
                     .await?;
                 }
-            } else if payload_json.get("cmd").and_then(|c| c.as_str()) == Some("xuanji.extraction_complete") {
+            } else if payload_json.get("cmd").and_then(|c| c.as_str())
+                == Some("xuanji.extraction_complete")
+            {
                 // Handle xuanji extraction completion notification
                 let param = payload_json.get("param");
                 let status = param.and_then(|p| p.get("status")).and_then(|s| s.as_str());
 
                 // Handle both completed and failed status
-                let task_id = param.and_then(|p| p.get("task_id")).and_then(|t| t.as_str());
-                let user_id = param.and_then(|p| p.get("user_id")).and_then(|u| u.as_str());
-                let reply_target = param.and_then(|p| p.get("reply_target")).and_then(|r| r.as_str());
-                let user_text = param.and_then(|p| p.get("user_text")).and_then(|t| t.as_str());
+                let task_id = param
+                    .and_then(|p| p.get("task_id"))
+                    .and_then(|t| t.as_str());
+                let _user_id = param
+                    .and_then(|p| p.get("user_id"))
+                    .and_then(|u| u.as_str());
+                let reply_target = param
+                    .and_then(|p| p.get("reply_target"))
+                    .and_then(|r| r.as_str());
+                let user_text = param
+                    .and_then(|p| p.get("user_text"))
+                    .and_then(|t| t.as_str());
 
                 if status != Some("completed") {
                     // Failed: notify Agent without downloading
@@ -633,7 +654,7 @@ impl WuKongIMChannel {
                             (1u8, rt.to_string())
                         }
                     } else {
-                        (params.channel_type as u8, params.from_uid.clone())
+                        (params.channel_type, params.from_uid.clone())
                     };
                     let ch_msg = ChannelMessage {
                         id: format!("xuanji_{}", task_id.unwrap_or("unknown")),
@@ -642,19 +663,27 @@ impl WuKongIMChannel {
                         content,
                         channel: "wukongim".to_string(),
                         timestamp: params.timestamp.max(0) as u64,
-                        thread_ts: None,
+                        thread_ts: topic_thread.clone(),
                         interruption_scope_id: None,
                         attachments: vec![],
                     };
                     if tx.send(ch_msg).await.is_ok() {
                         tracing::info!("Xuanji: sent failed ChannelMessage to orchestrator");
-                        self.update_sync_state(&params.channel_id, params.channel_type, params.message_seq, params.timestamp * 1_000_000_000).await?;
+                        self.update_sync_state(
+                            &params.channel_id,
+                            params.channel_type,
+                            params.message_seq,
+                            params.timestamp * 1_000_000_000,
+                        )
+                        .await?;
                     }
                     return Ok(());
                 }
 
                 // Completed: download files and notify Agent
-                let files = param.and_then(|p| p.get("files")).and_then(|f| f.as_array());
+                let files = param
+                    .and_then(|p| p.get("files"))
+                    .and_then(|f| f.as_array());
 
                 if let Some(files_arr) = files {
                     // Download all result files
@@ -665,7 +694,9 @@ impl WuKongIMChannel {
                         let file_name = file.get("file_name").and_then(|n| n.as_str());
 
                         if let (Some(url), Some(name)) = (file_url, file_name) {
-                            let result = download_file_to_workspace(url, &self.downloads_dir, Some(name)).await;
+                            let result =
+                                download_file_to_workspace(url, &self.downloads_dir, Some(name))
+                                    .await;
                             match result {
                                 Ok(local_path) => {
                                     tracing::info!("Xuanji: downloaded {} to {}", name, local_path);
@@ -695,7 +726,8 @@ impl WuKongIMChannel {
                     }
 
                     // Extract summary from first result file (if any)
-                    let summary_text = files_arr.first()
+                    let summary_text = files_arr
+                        .first()
                         .and_then(|f| f.get("summary"))
                         .and_then(|s| s.as_str())
                         .filter(|s| !s.is_empty())
@@ -724,7 +756,7 @@ impl WuKongIMChannel {
                             (1u8, rt.to_string())
                         }
                     } else {
-                        (params.channel_type as u8, params.from_uid.clone())
+                        (params.channel_type, params.from_uid.clone())
                     };
 
                     let ch_msg = ChannelMessage {
@@ -734,27 +766,40 @@ impl WuKongIMChannel {
                         content,
                         channel: "wukongim".to_string(),
                         timestamp: params.timestamp.max(0) as u64,
-                        thread_ts: None,
+                        thread_ts: topic_thread.clone(),
                         interruption_scope_id: None,
-                        attachments: vec![],  // TODO: if attachments needed, fill here
+                        attachments: vec![], // TODO: if attachments needed, fill here
                     };
 
                     if tx.send(ch_msg).await.is_ok() {
                         tracing::info!("Xuanji: sent ChannelMessage to orchestrator");
-                        self.update_sync_state(&params.channel_id, params.channel_type, params.message_seq, params.timestamp * 1_000_000_000).await?;
+                        self.update_sync_state(
+                            &params.channel_id,
+                            params.channel_type,
+                            params.message_seq,
+                            params.timestamp * 1_000_000_000,
+                        )
+                        .await?;
                     }
                 }
 
                 return Ok(());
             } else if payload_json.get("cmd").and_then(|c| c.as_str()) == Some("xuanji.task_ack") {
-                let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
+                let _ = self
+                    .send_ack(params.message_id.clone(), params.message_seq)
+                    .await;
 
                 let param = payload_json.get("param");
-                let task_id = param.and_then(|p| p.get("task_id")).and_then(|t| t.as_str());
+                let task_id = param
+                    .and_then(|p| p.get("task_id"))
+                    .and_then(|t| t.as_str());
                 let status = param.and_then(|p| p.get("status")).and_then(|s| s.as_str());
 
-                tracing::info!("Xuanji: task_ack received, task_id={}, status={}",
-                    task_id.unwrap_or("unknown"), status.unwrap_or("unknown"));
+                tracing::info!(
+                    "Xuanji: task_ack received, task_id={}, status={}",
+                    task_id.unwrap_or("unknown"),
+                    status.unwrap_or("unknown")
+                );
 
                 let target_id = if params.channel_type == WkChannelType::PERSONAL {
                     &params.from_uid
@@ -765,7 +810,8 @@ impl WuKongIMChannel {
                 // 静默消息：agent 获取 task_id 但不回复用户
                 let content = format!(
                     "<!-- zeroclaw:silent -->[璇玑任务确认] task_id={}，状态={}",
-                    task_id.unwrap_or("unknown"), status.unwrap_or("unknown")
+                    task_id.unwrap_or("unknown"),
+                    status.unwrap_or("unknown")
                 );
 
                 let ch_msg = ChannelMessage {
@@ -775,28 +821,48 @@ impl WuKongIMChannel {
                     content,
                     channel: "wukongim".to_string(),
                     timestamp: params.timestamp.max(0) as u64,
-                    thread_ts: None,
+                    thread_ts: topic_thread.clone(),
                     interruption_scope_id: None,
                     attachments: vec![],
                 };
 
                 if tx.send(ch_msg).await.is_ok() {
-                    self.update_sync_state(&params.channel_id, params.channel_type, params.message_seq, params.timestamp * 1_000_000_000).await?;
+                    self.update_sync_state(
+                        &params.channel_id,
+                        params.channel_type,
+                        params.message_seq,
+                        params.timestamp * 1_000_000_000,
+                    )
+                    .await?;
                 }
 
                 return Ok(());
-            } else if payload_json.get("cmd").and_then(|c| c.as_str()) == Some("xuanji.task_status") {
-                let _ = self.send_ack(params.message_id.clone(), params.message_seq).await;
+            } else if payload_json.get("cmd").and_then(|c| c.as_str()) == Some("xuanji.task_status")
+            {
+                let _ = self
+                    .send_ack(params.message_id.clone(), params.message_seq)
+                    .await;
 
                 let param = payload_json.get("param");
-                let task_id = param.and_then(|p| p.get("task_id")).and_then(|t| t.as_str());
+                let task_id = param
+                    .and_then(|p| p.get("task_id"))
+                    .and_then(|t| t.as_str());
                 let status = param.and_then(|p| p.get("status")).and_then(|s| s.as_str());
-                let reply_target = param.and_then(|p| p.get("reply_target")).and_then(|r| r.as_str());
-                let user_text = param.and_then(|p| p.get("user_text")).and_then(|t| t.as_str());
-                let files = param.and_then(|p| p.get("files")).and_then(|f| f.as_array());
+                let reply_target = param
+                    .and_then(|p| p.get("reply_target"))
+                    .and_then(|r| r.as_str());
+                let user_text = param
+                    .and_then(|p| p.get("user_text"))
+                    .and_then(|t| t.as_str());
+                let files = param
+                    .and_then(|p| p.get("files"))
+                    .and_then(|f| f.as_array());
 
-                tracing::info!("Xuanji: task_status received, task_id={}, status={}",
-                    task_id.unwrap_or("unknown"), status.unwrap_or("unknown"));
+                tracing::info!(
+                    "Xuanji: task_status received, task_id={}, status={}",
+                    task_id.unwrap_or("unknown"),
+                    status.unwrap_or("unknown")
+                );
 
                 // Parse reply_target from param (not from from_uid)
                 let (ct, tid) = if let Some(rt) = reply_target {
@@ -807,19 +873,23 @@ impl WuKongIMChannel {
                         (1u8, rt.to_string())
                     }
                 } else {
-                    (params.channel_type as u8, params.from_uid.clone())
+                    (params.channel_type, params.from_uid.clone())
                 };
 
-                let file_list = files.map(|arr| {
-                    arr.iter()
-                        .filter_map(|f| {
-                            let name = f.get("file_name").and_then(|n| n.as_str()).unwrap_or("?");
-                            f.get("file_url").and_then(|u| u.as_str())
-                                .map(|url| format!("- {} ({})", name, url))
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                }).unwrap_or_default();
+                let file_list = files
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|f| {
+                                let name =
+                                    f.get("file_name").and_then(|n| n.as_str()).unwrap_or("?");
+                                f.get("file_url")
+                                    .and_then(|u| u.as_str())
+                                    .map(|url| format!("- {} ({})", name, url))
+                            })
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .unwrap_or_default();
 
                 let content = match status {
                     Some("completed") => format!(
@@ -830,7 +900,8 @@ impl WuKongIMChannel {
                     ),
                     _ => format!(
                         "[璇玑任务状态] task_id={}，状态：{}",
-                        task_id.unwrap_or("unknown"), status.unwrap_or("unknown")
+                        task_id.unwrap_or("unknown"),
+                        status.unwrap_or("unknown")
                     ),
                 };
 
@@ -841,13 +912,19 @@ impl WuKongIMChannel {
                     content,
                     channel: "wukongim".to_string(),
                     timestamp: params.timestamp.max(0) as u64,
-                    thread_ts: None,
+                    thread_ts: topic_thread.clone(),
                     interruption_scope_id: None,
                     attachments: vec![],
                 };
 
                 if tx.send(ch_msg).await.is_ok() {
-                    self.update_sync_state(&params.channel_id, params.channel_type, params.message_seq, params.timestamp * 1_000_000_000).await?;
+                    self.update_sync_state(
+                        &params.channel_id,
+                        params.channel_type,
+                        params.message_seq,
+                        params.timestamp * 1_000_000_000,
+                    )
+                    .await?;
                 }
 
                 return Ok(());
@@ -1032,7 +1109,7 @@ impl WuKongIMChannel {
             },
             channel: "wukongim".to_string(),
             timestamp: params.timestamp.max(0) as u64,
-            thread_ts: None,
+            thread_ts: topic_thread.clone(),
             interruption_scope_id: None,
             attachments: vec![],
         };
@@ -1088,8 +1165,30 @@ impl WuKongIMChannel {
         channel_type: u8,
         cmd_payload: serde_json::Value,
     ) -> anyhow::Result<()> {
+        self.send_status_message_with_topic(channel_id, channel_type, cmd_payload, None)
+            .await
+    }
+
+    /// Send a structured "application command" message with an optional topic.
+    pub async fn send_status_message_with_topic(
+        &self,
+        channel_id: &str,
+        channel_type: u8,
+        cmd_payload: serde_json::Value,
+        topic: Option<String>,
+    ) -> anyhow::Result<()> {
         let json = serde_json::to_string(&cmd_payload)?;
         let payload_b64 = base64::engine::general_purpose::STANDARD.encode(json);
+
+        let topic = topic.filter(|t| !t.is_empty() && *t != "0");
+        let setting = if topic.is_some() {
+            Some(SettingFlags {
+                topic: Some(true),
+                ..Default::default()
+            })
+        } else {
+            None
+        };
 
         // WK 服务端会根据 from_uid 自动规范化 channel_id 为 "{from_uid}@{to_uid}"，
         // 这里直接使用调用方传入的原始 channel_id，不要自行拼接。
@@ -1100,11 +1199,11 @@ impl WuKongIMChannel {
             channel_type,
             payload: serde_json::Value::String(payload_b64),
             header: None,
-            setting: None,
+            setting,
             msg_key: None,
             expire: None,
             stream_no: None,
-            topic: None,
+            topic,
         };
         let _: serde_json::Value = self.send_rpc("send", params).await?;
         tracing::info!(
@@ -1326,6 +1425,12 @@ impl WuKongIMChannel {
         }
         let combined_content = lines.join("\n");
 
+        let topic_thread = first
+            .topic
+            .as_deref()
+            .filter(|&t| !t.is_empty() && t != "0")
+            .map(ToString::to_string);
+
         let ch_msg = ChannelMessage {
             id: first.message_id.clone(),
             sender: target_id.clone(),
@@ -1337,7 +1442,7 @@ impl WuKongIMChannel {
             },
             channel: "wukongim".to_string(),
             timestamp: last.timestamp.max(0) as u64,
-            thread_ts: None,
+            thread_ts: topic_thread,
             interruption_scope_id: None,
             attachments: vec![],
         };
@@ -1384,6 +1489,20 @@ impl Channel for WuKongIMChannel {
         };
         let payload_b64 = encode_text_payload(content)?;
         let (channel_id, channel_type) = parse_recipient(&message.recipient);
+        let topic = message
+            .thread_ts
+            .as_ref()
+            .filter(|&t| !t.is_empty() && *t != "0")
+            .map(ToString::to_string);
+        let setting = if topic.is_some() {
+            Some(SettingFlags {
+                topic: Some(true),
+                ..Default::default()
+            })
+        } else {
+            None
+        };
+
         let params = SendParams {
             from_uid: Some(self.uid.clone()),
             client_msg_no: Uuid::new_v4().to_string(),
@@ -1391,11 +1510,11 @@ impl Channel for WuKongIMChannel {
             channel_type,
             payload: serde_json::Value::String(payload_b64),
             header: None,
-            setting: None,
+            setting,
             msg_key: None,
             expire: None,
             stream_no: None,
-            topic: None,
+            topic,
         };
 
         let mut g = self.ws_sink.write().await;
@@ -1511,7 +1630,8 @@ impl Channel for WuKongIMChannel {
             "type": WkMessageType::STATUS_UPDATE,
             "content": content
         });
-        self.send_status_message(&channel_id, channel_type, payload)
+        let topic = _thread_ts.map(ToString::to_string);
+        self.send_status_message_with_topic(&channel_id, channel_type, payload, topic)
             .await
     }
 
@@ -1583,20 +1703,23 @@ impl Channel for WuKongIMChannel {
         //    (ack reactions) etc., which depend on the live read loop below
         //    draining RPC responses. Awaiting inline before the read loop
         //    starts would deadlock waiting for responses no one is reading.
-        // 3. Process History (now that WS is connected, Agent can reply)
-        // Group offline messages by conversation and batch process them
+        // Group offline messages by conversation and topic, and batch process them
         use std::collections::HashMap;
-        let mut grouped: HashMap<(String, u8), Vec<RecvNotificationParams>> = HashMap::new();
+        let mut grouped: HashMap<(String, u8, Option<String>), Vec<RecvNotificationParams>> = HashMap::new();
         for msg in history {
-            let key = (msg.channel_id.clone(), msg.channel_type);
+            let topic = msg.topic.as_deref()
+                .filter(|&t| !t.is_empty() && t != "0")
+                .map(ToString::to_string);
+            let key = (msg.channel_id.clone(), msg.channel_type, topic);
             grouped.entry(key).or_default().push(msg);
         }
 
-        for ((channel_id, channel_type), messages) in grouped {
+        for ((channel_id, channel_type, topic), messages) in grouped {
             tracing::info!(
-                "WuKongIM: processing offline batch for channel={}:{} count={}",
+                "WuKongIM: processing offline batch for channel={}:{} topic={:?} count={}",
                 channel_id,
                 channel_type,
+                topic,
                 messages.len()
             );
             if let Err(e) = self.process_offline_batch(messages, &tx).await {
@@ -1959,5 +2082,75 @@ mod tests {
             desc: "x".into(),
         };
         assert!(ch.send_status_update("P:u1", None, update).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_inbound_topic_mapping() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace = temp_dir.path().to_path_buf();
+        let memory = Arc::new(MockMemory);
+        let config = make_config(vec!["*".to_string()], false);
+        let ch = WuKongIMChannel::from_config(&config, &workspace, memory);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+
+        // Scenario 1: topic is present and has a valid value
+        let params = RecvNotificationParams {
+            message_id: "msg-001".to_string(),
+            message_seq: 1,
+            from_uid: "user_alice".to_string(),
+            channel_id: "user_alice".to_string(),
+            channel_type: WkChannelType::PERSONAL,
+            payload: serde_json::json!({
+                "type": WkMessageType::TEXT,
+                "content": "Hello thread"
+            }),
+            timestamp: 123456,
+            topic: Some("db_lock".to_string()),
+            setting: None,
+        };
+
+        ch.process_inbound_message(params, &tx).await.unwrap();
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.thread_ts, Some("db_lock".to_string()));
+
+        // Scenario 2: topic is "0" (should normalize to None)
+        let params = RecvNotificationParams {
+            message_id: "msg-002".to_string(),
+            message_seq: 2,
+            from_uid: "user_alice".to_string(),
+            channel_id: "user_alice".to_string(),
+            channel_type: WkChannelType::PERSONAL,
+            payload: serde_json::json!({
+                "type": WkMessageType::TEXT,
+                "content": "Hello thread 0"
+            }),
+            timestamp: 123457,
+            topic: Some("0".to_string()),
+            setting: None,
+        };
+
+        ch.process_inbound_message(params, &tx).await.unwrap();
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.thread_ts, None);
+
+        // Scenario 3: topic is empty string (should normalize to None)
+        let params = RecvNotificationParams {
+            message_id: "msg-003".to_string(),
+            message_seq: 3,
+            from_uid: "user_alice".to_string(),
+            channel_id: "user_alice".to_string(),
+            channel_type: WkChannelType::PERSONAL,
+            payload: serde_json::json!({
+                "type": WkMessageType::TEXT,
+                "content": "Hello thread empty"
+            }),
+            timestamp: 123458,
+            topic: Some("".to_string()),
+            setting: None,
+        };
+
+        ch.process_inbound_message(params, &tx).await.unwrap();
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.thread_ts, None);
     }
 }

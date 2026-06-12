@@ -81,6 +81,18 @@ pub struct ConnectParams {
     pub version: Option<i32>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct SettingFlags {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signal: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<bool>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SendParams {
     #[serde(rename = "fromUid", skip_serializing_if = "Option::is_none")]
@@ -95,7 +107,7 @@ pub struct SendParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub header: Option<Header>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub setting: Option<u32>,
+    pub setting: Option<SettingFlags>,
     #[serde(rename = "msgKey", skip_serializing_if = "Option::is_none")]
     pub msg_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -120,6 +132,10 @@ pub struct RecvNotificationParams {
     pub channel_type: u8,
     pub payload: serde_json::Value,
     pub timestamp: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setting: Option<SettingFlags>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -150,6 +166,8 @@ pub struct SyncMessage {
     pub from_uid: String,
     pub payload: serde_json::Value,
     pub timestamp: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
