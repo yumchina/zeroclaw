@@ -39,6 +39,15 @@ struct SyncState {
     channel_seqs: HashMap<String, u32>,
 }
 
+#[derive(Debug, Clone)]
+struct ConversationSyncUpdate {
+    channel_id: String,
+    channel_type: u8,
+    last_msg_seq: u32,
+    version: i64,
+}
+
+
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct PendingMessage {
     content: String,
@@ -94,6 +103,8 @@ pub struct WuKongIMChannel {
     pub(crate) workspace_dir: PathBuf,
     pub(crate) progress_streaming: bool,
     pub(crate) pending_outbound: Arc<tokio::sync::Mutex<Vec<SendMessage>>>,
+    pub(crate) sync_state_lock: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) history_sync_complete: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl WuKongIMChannel {
@@ -135,6 +146,8 @@ impl WuKongIMChannel {
             workspace_dir: workspace_dir.to_path_buf(),
             progress_streaming: config.progress_streaming,
             pending_outbound: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            sync_state_lock: Arc::new(tokio::sync::Mutex::new(())),
+            history_sync_complete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -298,13 +311,17 @@ impl WuKongIMChannel {
         seq: u32,
         timestamp_ns: i64,
     ) -> anyhow::Result<()> {
+        let _lock = self.sync_state_lock.lock().await;
+
+        let allow_disk_commit = timestamp_ns == 0 || self.history_sync_complete.load(std::sync::atomic::Ordering::Relaxed);
+
         let mut state = self.load_sync_state().await;
         let mut changed = false;
 
         // 1. Update channel sequence
         let seq_key_file = format!("{}:{}", channel_id, channel_type);
         let current_seq = *state.channel_seqs.get(&seq_key_file).unwrap_or(&0);
-        if seq > current_seq {
+        if seq > current_seq && allow_disk_commit {
             tracing::info!(
                 "WuKongIM: updating sequence for {} from {} to {}",
                 seq_key_file,
@@ -316,7 +333,7 @@ impl WuKongIMChannel {
         }
 
         // 2. Update max version
-        if timestamp_ns > state.max_version {
+        if timestamp_ns > state.max_version && allow_disk_commit {
             tracing::info!(
                 "WuKongIM: updating max_version from {} to {}",
                 state.max_version,
@@ -387,7 +404,7 @@ impl WuKongIMChannel {
         Ok(())
     }
 
-    async fn sync_history(&self) -> anyhow::Result<Vec<RecvNotificationParams>> {
+    async fn sync_history(&self) -> anyhow::Result<(Vec<RecvNotificationParams>, Vec<ConversationSyncUpdate>)> {
         // 1. Load sync state from file
         let state = self.load_sync_state().await;
         let version = state.max_version;
@@ -441,6 +458,7 @@ impl WuKongIMChannel {
             }
         };
         let mut all_history = Vec::new();
+        let mut updates = Vec::new();
         let mut total_messages = 0;
         let num_conversations = sync_resp.conversations.len();
         for conv in sync_resp.conversations {
@@ -451,6 +469,12 @@ impl WuKongIMChannel {
                 conv.last_msg_seq,
                 conv.version
             );
+            updates.push(ConversationSyncUpdate {
+                channel_id: conv.channel_id.clone(),
+                channel_type: conv.channel_type,
+                last_msg_seq: conv.last_msg_seq,
+                version: conv.version,
+            });
             if let Some(messages) = conv.recents {
                 total_messages += messages.len();
                 for m in messages {
@@ -497,14 +521,6 @@ impl WuKongIMChannel {
                     tracing::info!("  - [History] from {}: {}", m.from_uid, summary);
                 }
             }
-            // Update version based on conversation
-            self.update_sync_state(
-                &conv.channel_id,
-                conv.channel_type,
-                conv.last_msg_seq,
-                conv.version,
-            )
-            .await?;
         }
 
         // Sort globally by timestamp
@@ -518,7 +534,7 @@ impl WuKongIMChannel {
                 num_conversations
             );
         }
-        Ok(all_history)
+        Ok((all_history, updates))
     }
 
     async fn process_inbound_message(
@@ -1333,14 +1349,9 @@ impl WuKongIMChannel {
             filtered_messages,
             is_silent,
             tx,
-            last_seq,
-            last.timestamp * 1_000_000_000,
         )
         .await?;
 
-        // Clear unread up to the latest sequence number in the batch
-        self.clear_unread(&channel_id, channel_type, last_seq)
-            .await?;
         Ok(())
     }
 
@@ -1349,8 +1360,6 @@ impl WuKongIMChannel {
         messages: Vec<RecvNotificationParams>,
         silent: bool,
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
-        last_seq: u32,
-        last_timestamp_ns: i64,
     ) -> anyhow::Result<()> {
         if messages.is_empty() {
             return Ok(());
@@ -1449,17 +1458,15 @@ impl WuKongIMChannel {
 
         if tx.send(ch_msg).await.is_ok() {
             tracing::info!(
-                "WuKongIM: offline batch sent (silent={}), updating sync state: channel={}:{} seq={}",
+                "WuKongIM: offline batch sent (silent={}) for channel={}:{}",
                 silent,
                 channel_id,
-                channel_type,
-                last_seq
+                channel_type
             );
-            self.update_sync_state(channel_id, channel_type, last_seq, last_timestamp_ns)
-                .await?;
+            Ok(())
+        } else {
+            anyhow::bail!("Failed to send offline batch to orchestrator channel")
         }
-
-        Ok(())
     }
 }
 
@@ -1474,6 +1481,31 @@ fn phase_to_content(phase: &zeroclaw_api::channel::StatusPhase) -> &'static str 
         StatusPhase::Error => "错误",
         StatusPhase::AgentEnd => "处理完成",
     }
+}
+
+fn calculate_safe_watermark(
+    current_seq: u32,
+    conv_messages: &[&RecvNotificationParams],
+    processed_messages: &HashMap<(String, u8, u32), bool>,
+    last_msg_seq: u32,
+) -> (u32, bool) {
+    let mut safe_seq = current_seq;
+    let mut all_succeeded = true;
+    if conv_messages.is_empty() {
+        safe_seq = safe_seq.max(last_msg_seq);
+    } else {
+        for m in conv_messages {
+            if m.message_seq > current_seq {
+                if let Some(&true) = processed_messages.get(&(m.channel_id.clone(), m.channel_type, m.message_seq)) {
+                    safe_seq = m.message_seq;
+                } else {
+                    all_succeeded = false;
+                    break;
+                }
+            }
+        }
+    }
+    (safe_seq, all_succeeded)
 }
 
 #[async_trait]
@@ -1638,10 +1670,13 @@ impl Channel for WuKongIMChannel {
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
         let res = async {
         // 1. Fetch history from HTTP (before WS connect to avoid version race)
-        let history = self.sync_history().await.unwrap_or_else(|e| {
-            tracing::error!("WuKongIM: history sync failed: {}", e);
-            vec![]
-        });
+        let (history, updates) = match self.sync_history().await {
+            Ok(res) => res,
+            Err(e) => {
+                tracing::error!("WuKongIM: history sync failed: {}", e);
+                (vec![], vec![])
+            }
+        };
 
         // 2. Connect WebSocket
         tracing::info!("WuKongIM: connecting to {}", self.ws_url);
@@ -1698,34 +1733,121 @@ impl Channel for WuKongIMChannel {
             }
         }
 
-        // 3. Process History (now that WS is connected, Agent can reply).
-        //    Spawn each entry: process_inbound_message awaits send_text_message
-        //    (ack reactions) etc., which depend on the live read loop below
-        //    draining RPC responses. Awaiting inline before the read loop
-        //    starts would deadlock waiting for responses no one is reading.
-        // Group offline messages by conversation and topic, and batch process them
-        use std::collections::HashMap;
-        let mut grouped: HashMap<(String, u8, Option<String>), Vec<RecvNotificationParams>> = HashMap::new();
-        for msg in history {
-            let topic = msg.topic.as_deref()
-                .filter(|&t| !t.is_empty() && t != "0")
-                .map(ToString::to_string);
-            let key = (msg.channel_id.clone(), msg.channel_type, topic);
-            grouped.entry(key).or_default().push(msg);
-        }
-
-        for ((channel_id, channel_type, topic), messages) in grouped {
-            tracing::info!(
-                "WuKongIM: processing offline batch for channel={}:{} topic={:?} count={}",
-                channel_id,
-                channel_type,
-                topic,
-                messages.len()
-            );
-            if let Err(e) = self.process_offline_batch(messages, &tx).await {
-                tracing::warn!("WuKongIM: offline batch processing failed: {}", e);
+        // 3. Process History in background tokio task
+        let self_clone = self.clone();
+        let tx_clone = tx.clone();
+        tokio::spawn(async move {
+            // First, filter out messages that are already processed (idempotency check)
+            let mut filtered_history = Vec::new();
+            for msg in history {
+                let seq_key = format!(
+                    "wukongim:channel_seq:{}:{}",
+                    msg.channel_id, msg.channel_type
+                );
+                let mem_seq = self_clone
+                    .memory
+                    .get(&seq_key)
+                    .await
+                    .unwrap_or(None)
+                    .and_then(|e| e.content.parse::<u32>().ok())
+                    .unwrap_or(0);
+                let sync_state = self_clone.load_sync_state().await;
+                let file_seq = *sync_state
+                    .channel_seqs
+                    .get(&format!("{}:{}", msg.channel_id, msg.channel_type))
+                    .unwrap_or(&0);
+                let current_seq = mem_seq.max(file_seq);
+                if msg.message_seq > current_seq {
+                    filtered_history.push(msg);
+                }
             }
-        }
+
+            use std::collections::HashMap;
+            let mut processed_messages = HashMap::new();
+            let mut grouped: HashMap<(String, u8, Option<String>), Vec<RecvNotificationParams>> = HashMap::new();
+            for msg in filtered_history.clone() {
+                let topic = msg.topic.as_deref()
+                    .filter(|&t| !t.is_empty() && t != "0")
+                    .map(ToString::to_string);
+                let key = (msg.channel_id.clone(), msg.channel_type, topic);
+                grouped.entry(key).or_default().push(msg);
+            }
+
+            for ((channel_id, channel_type, topic), messages) in grouped {
+                tracing::info!(
+                    "WuKongIM: processing offline batch for channel={}:{} topic={:?} count={}",
+                    channel_id,
+                    channel_type,
+                    topic,
+                    messages.len()
+                );
+                let res = self_clone.process_offline_batch(messages.clone(), &tx_clone).await;
+                let success = res.is_ok();
+                if !success {
+                    tracing::warn!("WuKongIM: offline batch processing failed: {:?}", res);
+                }
+                for m in messages {
+                    processed_messages.insert((m.channel_id.clone(), m.channel_type, m.message_seq), success);
+                }
+            }
+
+            let mut final_max_version = self_clone.load_sync_state().await.max_version;
+            for up in updates {
+                let seq_key = format!(
+                    "wukongim:channel_seq:{}:{}",
+                    up.channel_id, up.channel_type
+                );
+                let mem_seq = self_clone
+                    .memory
+                    .get(&seq_key)
+                    .await
+                    .unwrap_or(None)
+                    .and_then(|e| e.content.parse::<u32>().ok())
+                    .unwrap_or(0);
+                let sync_state = self_clone.load_sync_state().await;
+                let file_seq = *sync_state
+                    .channel_seqs
+                    .get(&format!("{}:{}", up.channel_id, up.channel_type))
+                    .unwrap_or(&0);
+                let current_seq = mem_seq.max(file_seq);
+
+                // Filter messages belonging to this conversation
+                let mut conv_messages: Vec<&RecvNotificationParams> = filtered_history
+                    .iter()
+                    .filter(|m| m.channel_id == up.channel_id && m.channel_type == up.channel_type)
+                    .collect();
+                conv_messages.sort_by_key(|m| m.message_seq);
+
+                let (safe_seq, all_succeeded) = calculate_safe_watermark(
+                    current_seq,
+                    &conv_messages,
+                    &processed_messages,
+                    up.last_msg_seq,
+                );
+
+                if safe_seq > current_seq {
+                    if let Err(e) = self_clone.update_sync_state(&up.channel_id, up.channel_type, safe_seq, 0).await {
+                        tracing::error!("WuKongIM: failed to update sync state: {}", e);
+                    }
+                    let _ = self_clone.clear_unread(&up.channel_id, up.channel_type, safe_seq).await;
+                }
+
+                if all_succeeded {
+                    final_max_version = final_max_version.max(up.version);
+                }
+            }
+
+            // Save final max_version if it changed
+            let mut current_state = self_clone.load_sync_state().await;
+            if final_max_version > current_state.max_version {
+                current_state.max_version = final_max_version;
+                let _ = self_clone.save_sync_state(&current_state).await;
+            }
+
+            // Mark history sync as complete
+            self_clone.history_sync_complete.store(true, std::sync::atomic::Ordering::Relaxed);
+            tracing::info!("WuKongIM: background history processing completed");
+        });
 
         // 4. Start Live Listening.
         //    INVARIANT: this loop must NOT await any operation that ultimately
@@ -2152,5 +2274,111 @@ mod tests {
         ch.process_inbound_message(params, &tx).await.unwrap();
         let msg = rx.recv().await.unwrap();
         assert_eq!(msg.thread_ts, None);
+    }
+
+    #[test]
+    fn test_history_sync_watermark_logic() {
+        let current_seq = 9u32;
+        let last_msg_seq = 14u32;
+
+        let msg1 = RecvNotificationParams {
+            message_id: "1".into(),
+            message_seq: 10,
+            from_uid: "a".into(),
+            channel_id: "c".into(),
+            channel_type: 2,
+            payload: serde_json::json!({}),
+            timestamp: 100,
+            topic: Some("topic1".into()),
+            setting: None,
+        };
+        let msg2 = RecvNotificationParams {
+            message_id: "2".into(),
+            message_seq: 11,
+            from_uid: "a".into(),
+            channel_id: "c".into(),
+            channel_type: 2,
+            payload: serde_json::json!({}),
+            timestamp: 200,
+            topic: Some("topic2".into()),
+            setting: None,
+        };
+        let msg3 = RecvNotificationParams {
+            message_id: "3".into(),
+            message_seq: 12,
+            from_uid: "a".into(),
+            channel_id: "c".into(),
+            channel_type: 2,
+            payload: serde_json::json!({}),
+            timestamp: 300,
+            topic: Some("topic1".into()),
+            setting: None,
+        };
+        let msg4 = RecvNotificationParams {
+            message_id: "4".into(),
+            message_seq: 13,
+            from_uid: "a".into(),
+            channel_id: "c".into(),
+            channel_type: 2,
+            payload: serde_json::json!({}),
+            timestamp: 400,
+            topic: Some("topic2".into()),
+            setting: None,
+        };
+        let msg5 = RecvNotificationParams {
+            message_id: "5".into(),
+            message_seq: 14,
+            from_uid: "a".into(),
+            channel_id: "c".into(),
+            channel_type: 2,
+            payload: serde_json::json!({}),
+            timestamp: 500,
+            topic: Some("topic1".into()),
+            setting: None,
+        };
+
+        let conv_messages = vec![&msg1, &msg2, &msg3, &msg4, &msg5];
+
+        // Scenario A: All succeeded
+        let mut processed = HashMap::new();
+        processed.insert(("c".to_string(), 2, 10), true);
+        processed.insert(("c".to_string(), 2, 11), true);
+        processed.insert(("c".to_string(), 2, 12), true);
+        processed.insert(("c".to_string(), 2, 13), true);
+        processed.insert(("c".to_string(), 2, 14), true);
+
+        let (safe, all_ok) = calculate_safe_watermark(current_seq, &conv_messages, &processed, last_msg_seq);
+        assert_eq!(safe, 14);
+        assert!(all_ok);
+
+        // Scenario B: topic1 failed, topic2 succeeded
+        let mut processed = HashMap::new();
+        processed.insert(("c".to_string(), 2, 10), false);
+        processed.insert(("c".to_string(), 2, 11), true);
+        processed.insert(("c".to_string(), 2, 12), false);
+        processed.insert(("c".to_string(), 2, 13), true);
+        processed.insert(("c".to_string(), 2, 14), false);
+
+        let (safe, all_ok) = calculate_safe_watermark(current_seq, &conv_messages, &processed, last_msg_seq);
+        assert_eq!(safe, 9); // Stops before seq 10
+        assert!(!all_ok);
+
+        // Scenario C: topic1 succeeded, topic2 failed
+        let mut processed = HashMap::new();
+        processed.insert(("c".to_string(), 2, 10), true);
+        processed.insert(("c".to_string(), 2, 11), false);
+        processed.insert(("c".to_string(), 2, 12), true);
+        processed.insert(("c".to_string(), 2, 13), false);
+        processed.insert(("c".to_string(), 2, 14), true);
+
+        let (safe, all_ok) = calculate_safe_watermark(current_seq, &conv_messages, &processed, last_msg_seq);
+        assert_eq!(safe, 10); // Stops at 10 (since 11 failed)
+        assert!(!all_ok);
+
+        // Scenario D: Empty list (no messages)
+        let empty_messages = vec![];
+        let (safe, all_ok) = calculate_safe_watermark(current_seq, &empty_messages, &processed, 100);
+        assert_eq!(safe, 100);
+        assert!(all_ok);
     }
 }
