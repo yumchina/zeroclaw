@@ -120,6 +120,8 @@ pub struct RecvNotificationParams {
     pub channel_type: u8,
     pub payload: serde_json::Value,
     pub timestamp: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -150,6 +152,8 @@ pub struct SyncMessage {
     pub from_uid: String,
     pub payload: serde_json::Value,
     pub timestamp: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
