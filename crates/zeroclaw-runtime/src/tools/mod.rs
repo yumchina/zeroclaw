@@ -2074,3 +2074,137 @@ mod tests {
         );
     }
 }
+
+/// Sweep `[dawn_task.<n>]` executor configs against the populated channel
+/// handle. Any `executor.channel` that doesn't match a registered channel
+/// key emits a WARN log. Does not fail or block startup — surfaces config
+/// typos / disabled channels early so operators see them in logs without
+/// the deployment dying.
+pub fn validate_dawn_task_executors(config: &Config, handle: &PerToolChannelHandle) {
+    let missing = validate_dawn_task_executors_collect(config, handle);
+    if missing.is_empty() {
+        return;
+    }
+    let map = handle.read();
+    let available: Vec<&String> = map.keys().collect();
+    for ch_ref in &missing {
+        let affected_task_types: Vec<&String> = config
+            .dawn_task
+            .executors
+            .iter()
+            .filter(|(_, exec)| &exec.channel == ch_ref)
+            .map(|(k, _)| k)
+            .collect();
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "missing_channel": ch_ref,
+                    "affected_task_types": affected_task_types,
+                    "available_channels": available,
+                })),
+            "dawn_task: configured channel is not registered; affected tasks will be unavailable"
+        );
+    }
+}
+
+/// Test-friendly variant: returns the deduped list of missing channel refs
+/// instead of logging them. Production callers use
+/// [`validate_dawn_task_executors`].
+pub fn validate_dawn_task_executors_collect(
+    config: &Config,
+    handle: &PerToolChannelHandle,
+) -> Vec<String> {
+    let map = handle.read();
+    let mut missing: Vec<String> = config
+        .dawn_task
+        .executors
+        .values()
+        .map(|exec| exec.channel.clone())
+        .filter(|ch_ref| !map.contains_key(ch_ref))
+        .collect();
+    missing.sort();
+    missing.dedup();
+    missing
+}
+
+#[cfg(test)]
+mod validate_dawn_task_tests {
+    use super::*;
+
+    fn cfg_with_one_executor(channel_ref: &str) -> Config {
+        let toml = format!(
+            r#"
+[dawn_task.1]
+channel = "{channel_ref}"
+recipient = "r"
+name = "n"
+description = "d"
+"#
+        );
+        toml::from_str(&toml).expect("test toml parses")
+    }
+
+    #[test]
+    fn validate_returns_missing_channel_refs() {
+        let cfg = cfg_with_one_executor("wechat.missing");
+        let handle: PerToolChannelHandle =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let missing = validate_dawn_task_executors_collect(&cfg, &handle);
+        assert_eq!(missing, vec!["wechat.missing".to_string()]);
+    }
+
+    #[test]
+    fn validate_returns_empty_when_channel_present() {
+        let cfg = cfg_with_one_executor("dawnim.work");
+        let map = std::collections::HashMap::from([(
+            "dawnim.work".to_string(),
+            placeholder_channel(),
+        )]);
+        let handle: PerToolChannelHandle = Arc::new(RwLock::new(map));
+        let missing = validate_dawn_task_executors_collect(&cfg, &handle);
+        assert!(missing.is_empty(), "got: {missing:?}");
+    }
+
+    #[test]
+    fn validate_no_executors_returns_empty() {
+        let cfg: Config = toml::from_str("").expect("empty toml parses");
+        let handle: PerToolChannelHandle =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let missing = validate_dawn_task_executors_collect(&cfg, &handle);
+        assert!(missing.is_empty());
+    }
+
+    fn placeholder_channel() -> Arc<dyn zeroclaw_api::channel::Channel> {
+        use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+
+        struct Stub;
+        impl zeroclaw_api::attribution::Attributable for Stub {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Channel(
+                    zeroclaw_api::attribution::ChannelKind::Cli,
+                )
+            }
+            fn alias(&self) -> &str {
+                "stub"
+            }
+        }
+        #[async_trait::async_trait]
+        impl Channel for Stub {
+            fn name(&self) -> &str {
+                "stub"
+            }
+            async fn send(&self, _: &SendMessage) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn listen(
+                &self,
+                _: tokio::sync::mpsc::Sender<ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        Arc::new(Stub)
+    }
+}

@@ -496,6 +496,9 @@ async fn handle_socket(
             "Seeded {} channel(s) into dashboard agent session",
         );
     }
+    if let Some(task_handle) = ch.task.as_ref() {
+        zeroclaw_runtime::tools::validate_dawn_task_executors(&config, task_handle);
+    }
 
     // Process the first message if it was not a connect frame
     if let Some(ref text) = first_msg_fallback {

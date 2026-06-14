@@ -843,6 +843,10 @@ pub async fn run_gateway(
                     ),
                 );
             }
+            zeroclaw_runtime::tools::validate_dawn_task_executors(
+                &config,
+                &all_tools_result.task_channel_handle,
+            );
             (all_tools_result.tools, all_tools_result.delegate_handle)
         }
         (Some(_), None) => {
