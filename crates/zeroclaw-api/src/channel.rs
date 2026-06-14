@@ -146,6 +146,18 @@ pub struct ChannelOrigin {
     /// Original `ChannelMessage.reply_target` value, preserved verbatim
     /// so reply paths reconstruct correctly.
     pub reply_target: String,
+    /// Per-turn topic identifier. `None` means "no topic" (default
+    /// behaviour, equivalent to pre-multi-topic single-thread session).
+    /// `Some(t)` means the current turn lives in the isolated topic `t`
+    /// — its conversation history and memory are scoped separately from
+    /// other topics under the same (channel, user) pair.
+    ///
+    /// Sourced from the inbound `ChannelMessage.thread_ts` by the
+    /// orchestrator. Channel-aware tools read this to make topic-aware
+    /// decisions; the default tools (e.g. `dawn_create_task`) currently
+    /// ignore it (task messages route to external agent UIDs, not topic-
+    /// scoped user sessions).
+    pub topic: Option<String>,
 }
 
 tokio::task_local! {
@@ -812,6 +824,7 @@ mod channel_origin_tests {
             from_uid: "u_alice".into(),
             channel_ref: "dawnim.work".into(),
             reply_target: "1:u_alice".into(),
+            topic: None,
         };
         let read_back = CHANNEL_ORIGIN
             .scope(origin.clone(), async {
@@ -827,6 +840,28 @@ mod channel_origin_tests {
     async fn channel_origin_outside_scope_is_default() {
         let result = CHANNEL_ORIGIN.try_with(|o| o.clone()).unwrap_or_default();
         assert!(result.from_uid.is_empty());
+    }
+
+    #[test]
+    fn channel_origin_default_topic_is_none() {
+        let o = ChannelOrigin::default();
+        assert!(o.topic.is_none());
+    }
+
+    #[tokio::test]
+    async fn channel_origin_scope_carries_topic() {
+        let origin = ChannelOrigin {
+            from_uid: "u_alice".into(),
+            channel_ref: "dawnim.work".into(),
+            reply_target: "1:u_alice".into(),
+            topic: Some("db_lock".into()),
+        };
+        let read_back = CHANNEL_ORIGIN
+            .scope(origin.clone(), async {
+                CHANNEL_ORIGIN.try_with(|o| o.topic.clone()).unwrap()
+            })
+            .await;
+        assert_eq!(read_back, Some("db_lock".to_string()));
     }
 }
 
