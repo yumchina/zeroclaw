@@ -852,6 +852,39 @@ impl DawnIMChannel {
 
     /// Send a task-related CMD payload (`dawn.create_task` or `dawn.query_task`)
     /// to an external DawnIM task executor via the `send` JSON-RPC endpoint.
+    /// Construct `SendParams` for a `SendKind::Text` outbound message,
+    /// including the DawnIM topic mapping (`SendMessage.thread_ts` →
+    /// `SendParams.topic` + `setting` bit-3 to flag topic presence to the
+    /// DawnIM server). Topic sentinels `""` and `"0"` are filtered to
+    /// `None` via `topic_to_thread`.
+    fn build_text_send_params(
+        &self,
+        message: &zeroclaw_api::channel::SendMessage,
+    ) -> anyhow::Result<SendParams> {
+        let payload_b64 = if let Some(code) = message.content.strip_prefix("ERR:") {
+            let card = build_exception_card(code);
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(&card)?)
+        } else {
+            encode_text_payload(&message.content)?
+        };
+        let (channel_id, channel_type) = parse_recipient(&message.recipient);
+        let topic_out = topic_to_thread(message.thread_ts.as_deref());
+        let setting_out: Option<u32> = topic_out.as_ref().map(|_| 8u32);
+        Ok(SendParams {
+            from_uid: Some(self.uid.clone()),
+            client_msg_no: Uuid::new_v4().to_string(),
+            channel_id,
+            channel_type,
+            payload: serde_json::Value::String(payload_b64),
+            header: None,
+            setting: setting_out,
+            msg_key: None,
+            expire: None,
+            stream_no: None,
+            topic: topic_out,
+        })
+    }
+
     ///
     /// The `payload` is serialised to JSON, base64-encoded per the DawnIM
     /// `SendParams.payload` contract, and shipped via `send_rpc("send")` with
@@ -1101,26 +1134,7 @@ impl Channel for DawnIMChannel {
 
         match &message.kind {
             SendKind::Text => {
-                let payload_b64 = if let Some(code) = message.content.strip_prefix("ERR:") {
-                    let card = build_exception_card(code);
-                    base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(&card)?)
-                } else {
-                    encode_text_payload(&message.content)?
-                };
-                let (channel_id, channel_type) = parse_recipient(&message.recipient);
-                let params = SendParams {
-                    from_uid: Some(self.uid.clone()),
-                    client_msg_no: Uuid::new_v4().to_string(),
-                    channel_id,
-                    channel_type,
-                    payload: serde_json::Value::String(payload_b64),
-                    header: None,
-                    setting: None,
-                    msg_key: None,
-                    expire: None,
-                    stream_no: None,
-                    topic: None,
-                };
+                let params = self.build_text_send_params(message)?;
                 let mut g = self.ws_sink.write().await;
                 match g.as_mut() {
                     Some(s) => {
@@ -1708,5 +1722,76 @@ mod inbound_topic_mapping_tests {
             .unwrap();
         let msg = rx.recv().await.expect("text message delivered");
         assert!(msg.thread_ts.is_none());
+    }
+}
+
+#[cfg(test)]
+mod outbound_topic_mapping_tests {
+    use super::*;
+    use zeroclaw_api::channel::{SendKind, SendMessage};
+
+    fn channel_with_test_state() -> DawnIMChannel {
+        let cfg = zeroclaw_config::schema::DawnIMConfig {
+            enabled: true,
+            ws_url: "ws://localhost:5200".into(),
+            uid: "bot_uid_1".into(),
+            token: String::new(),
+            device_id: "test-device".into(),
+            ..Default::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn zeroclaw_api::memory_traits::Memory> = Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", tmp.path(), "outbound_topic_test")
+                .unwrap(),
+        );
+        DawnIMChannel::from_config(&cfg, "test", tmp.path(), memory)
+    }
+
+    /// Verify outbound mapping by intercepting the SendParams the helper
+    /// constructs. We can't easily test the full WS path here; the helper
+    /// is the unit-testable seam.
+    #[test]
+    fn outbound_text_with_thread_ts_sets_topic_and_setting_bit() {
+        let ch = channel_with_test_state();
+        let msg = SendMessage {
+            content: "hello".into(),
+            recipient: "1:u_alice".into(),
+            thread_ts: Some("db_lock".into()),
+            kind: SendKind::Text,
+            ..Default::default()
+        };
+        let params = ch.build_text_send_params(&msg).unwrap();
+        assert_eq!(params.topic.as_deref(), Some("db_lock"));
+        assert_eq!(params.setting, Some(8u32));
+    }
+
+    #[test]
+    fn outbound_text_without_thread_ts_keeps_topic_and_setting_none() {
+        let ch = channel_with_test_state();
+        let msg = SendMessage {
+            content: "hello".into(),
+            recipient: "1:u_alice".into(),
+            thread_ts: None,
+            kind: SendKind::Text,
+            ..Default::default()
+        };
+        let params = ch.build_text_send_params(&msg).unwrap();
+        assert!(params.topic.is_none());
+        assert!(params.setting.is_none());
+    }
+
+    #[test]
+    fn outbound_text_with_zero_sentinel_keeps_topic_and_setting_none() {
+        let ch = channel_with_test_state();
+        let msg = SendMessage {
+            content: "hello".into(),
+            recipient: "1:u_alice".into(),
+            thread_ts: Some("0".into()),
+            kind: SendKind::Text,
+            ..Default::default()
+        };
+        let params = ch.build_text_send_params(&msg).unwrap();
+        assert!(params.topic.is_none());
+        assert!(params.setting.is_none());
     }
 }
