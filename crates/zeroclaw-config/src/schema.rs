@@ -8613,6 +8613,51 @@ impl ChannelConfig for WuKongIMConfig {
     }
 }
 
+// ── Leak Detector Config ─────────────────────────────────────────────
+
+/// 凭证泄露检测器配置 (`[security.leak_detector]`)
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "security.leak_detector"]
+pub struct LeakDetectorConfig {
+    /// 检测敏感度 (0.0-1.0)，默认 0.7
+    #[serde(default = "LeakDetectorConfig::default_sensitivity")]
+    pub sensitivity: f64,
+
+    /// URL 白名单
+    #[serde(default)]
+    pub url_allowlist: Vec<UrlAllowlistEntry>,
+}
+
+impl LeakDetectorConfig {
+    const fn default_sensitivity() -> f64 {
+        0.7
+    }
+}
+
+impl Default for LeakDetectorConfig {
+    fn default() -> Self {
+        Self {
+            sensitivity: 0.7,
+            url_allowlist: Vec::new(),
+        }
+    }
+}
+
+/// URL 白名单条目
+#[derive(Debug, Clone, Serialize, Deserialize, Default, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct UrlAllowlistEntry {
+    /// 域名模式，支持通配符 *，如 "*.lkcoffee.com"
+    pub domain: String,
+    /// URL 路径模式，支持通配符 *（可选）
+    #[serde(default)]
+    pub url_pattern: Option<String>,
+    /// 描述
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
 // ── Security Config ─────────────────────────────────────────────────
 
 /// Security configuration for sandboxing, resource limits, and audit logging
@@ -8654,6 +8699,11 @@ pub struct SecurityConfig {
     #[serde(default)]
     #[nested]
     pub webauthn: WebAuthnConfig,
+
+    /// 凭证泄露检测器配置
+    #[serde(default)]
+    #[nested]
+    pub leak_detector: LeakDetectorConfig,
 }
 
 /// WebAuthn / FIDO2 hardware key authentication configuration (`[security.webauthn]`).

@@ -291,6 +291,61 @@ pub fn scrub_credentials(input: &str) -> String {
         .to_string()
 }
 
+// Task-local holding leak detector config for the current tool loop.
+tokio::task_local! {
+    pub static TOOL_LOOP_LEAK_DETECTOR_CONFIG: std::sync::Arc<zeroclaw_config::schema::LeakDetectorConfig>;
+}
+
+// Task-local holding URL allowlist rules for the current tool loop.
+// Set by `run_tool_call_loop`; read by `execute_one_tool` to preserve
+// whitelisted URL parameters during credential scrubbing.
+tokio::task_local! {
+    pub static TOOL_LOOP_ALLOWLIST: std::sync::Arc<Vec<crate::security::AllowlistRule>>;
+}
+
+/// Scrub credentials while preserving whitelisted URL parameters.
+/// Temporarily masks whitelisted URLs with placeholders, runs the normal
+/// scrub, then restores the original URLs so their query params survive.
+pub fn scrub_credentials_with_allowlist(
+    input: &str,
+    allowlist: &[crate::security::AllowlistRule],
+) -> String {
+    if allowlist.is_empty() {
+        return scrub_credentials(input);
+    }
+
+    // 1. Mask whitelisted URLs with unique placeholders
+    static URL_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let url_re = URL_RE.get_or_init(|| Regex::new(r"https?://[^\s]+").unwrap());
+
+    let mut masked = String::with_capacity(input.len());
+    let mut preserved_urls: Vec<String> = Vec::new();
+    let mut last_end = 0;
+
+    for url_match in url_re.find_iter(input) {
+        let url = url_match.as_str();
+        if crate::security::url_matches_any_rule(url, allowlist) {
+            masked.push_str(&input[last_end..url_match.start()]);
+            preserved_urls.push(url.to_string());
+            masked.push_str(&format!("\u{0}ZCWLU_{}\u{0}", preserved_urls.len() - 1));
+            last_end = url_match.end();
+        }
+    }
+    masked.push_str(&input[last_end..]);
+
+    // 2. Scrub credentials on the masked content
+    let scrubbed = scrub_credentials(&masked);
+
+    // 3. Restore original URLs
+    let restore_re = Regex::new(r"\u{0}ZCWLU_(\d+)\u{0}").unwrap();
+    restore_re
+        .replace_all(&scrubbed, |caps: &regex::Captures| {
+            let idx: usize = caps[1].parse().unwrap_or(usize::MAX);
+            preserved_urls.get(idx).cloned().unwrap_or_default()
+        })
+        .to_string()
+}
+
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
 /// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
 /// used when callers omit the parameter.
@@ -882,11 +937,32 @@ pub async fn run_tool_call_loop(
     receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
     collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
 ) -> Result<String> {
+    let leak_detector_config = TOOL_LOOP_LEAK_DETECTOR_CONFIG
+        .try_with(std::sync::Arc::clone)
+        .ok();
+
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
         max_tool_iterations
     };
+
+    // Build URL allowlist rules from config
+    let allowlist_rules: std::sync::Arc<Vec<crate::security::AllowlistRule>> =
+        std::sync::Arc::new(
+            leak_detector_config
+                .as_ref()
+                .map(|c| {
+                    c.url_allowlist
+                        .iter()
+                        .map(|e| crate::security::AllowlistRule {
+                            domain_pattern: e.domain.clone(),
+                            url_pattern: e.url_pattern.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
 
     let turn_id = Uuid::new_v4().to_string();
     let loop_started_at = Instant::now();
@@ -1853,27 +1929,31 @@ pub async fn run_tool_call_loop(
             });
         }
 
-        let executed_outcomes = if allow_parallel_execution && executable_calls.len() > 1 {
-            execute_tools_parallel(
-                &executable_calls,
-                tools_registry,
-                activated_tools,
-                observer,
-                cancellation_token.as_ref(),
-                receipt_generator,
-            )
-            .await?
-        } else {
-            execute_tools_sequential(
-                &executable_calls,
-                tools_registry,
-                activated_tools,
-                observer,
-                cancellation_token.as_ref(),
-                receipt_generator,
-            )
-            .await?
-        };
+        let executed_outcomes = TOOL_LOOP_ALLOWLIST
+            .scope(allowlist_rules.clone(), async {
+                if allow_parallel_execution && executable_calls.len() > 1 {
+                    execute_tools_parallel(
+                        &executable_calls,
+                        tools_registry,
+                        activated_tools,
+                        observer,
+                        cancellation_token.as_ref(),
+                        receipt_generator,
+                    )
+                    .await
+                } else {
+                    execute_tools_sequential(
+                        &executable_calls,
+                        tools_registry,
+                        activated_tools,
+                        observer,
+                        cancellation_token.as_ref(),
+                        receipt_generator,
+                    )
+                    .await
+                }
+            })
+            .await?;
 
         for ((idx, call), outcome) in executable_indices
             .iter()
@@ -3098,7 +3178,7 @@ pub async fn run(
                             None, // channel: interactive CLI — uses prompt_cli
                             None, // receipt_generator
                             None, // collected_receipts
-                        ),
+                                    ),
                     )
                     .await
                 {
@@ -4944,7 +5024,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect_err("provider without vision support should fail");
 
@@ -5000,7 +5080,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("oversized payload should be skipped and continue as text-only");
 
@@ -5060,7 +5140,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("valid multimodal payload should pass");
 
@@ -5111,7 +5191,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect_err("should fail without vision_provider config");
 
@@ -5169,7 +5249,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect_err("should fail when vision provider cannot be created");
 
@@ -5227,7 +5307,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("text-only messages should succeed with default provider");
 
@@ -5286,7 +5366,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect_err("should fail due to nonexistent vision provider");
 
@@ -5343,7 +5423,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("empty image markers should not trigger vision routing");
 
@@ -5400,7 +5480,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect_err("should attempt vision provider creation for multiple images");
 
@@ -5540,7 +5620,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("parallel execution should complete");
 
@@ -5620,7 +5700,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("cron_add delivery defaults should be injected");
 
@@ -5692,7 +5772,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("explicit delivery mode should be preserved");
 
@@ -5759,7 +5839,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("loop should finish after deduplicating repeated calls");
 
@@ -5839,7 +5919,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("non-interactive shell should succeed for low-risk command");
 
@@ -5909,7 +5989,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("loop should finish with exempt tool executing twice");
 
@@ -5999,7 +6079,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("loop should complete");
 
@@ -6063,7 +6143,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("native fallback id flow should complete");
 
@@ -6155,7 +6235,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("native tool-call text should be relayed through on_delta");
 
@@ -6223,7 +6303,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("streaming provider should complete");
 
@@ -6294,7 +6374,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("streaming tool loop should execute tool and finish");
 
@@ -6373,7 +6453,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("native streaming events should preserve tool loop semantics");
 
@@ -6460,7 +6540,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("routed streaming provider should complete");
 
@@ -7775,7 +7855,7 @@ Let me check the result."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("tool loop should complete");
 
@@ -7937,7 +8017,7 @@ Let me check the result."#;
                     None, // channel
                     None, // receipt_generator
                     None, // collected_receipts
-                ),
+            ),
             )
             .await
             .expect("tool loop should succeed");
@@ -8089,7 +8169,7 @@ Let me check the result."#;
                     None, // channel
                     None, // receipt_generator
                     None, // collected_receipts
-                ),
+            ),
             )
             .await
             .expect_err("should fail with budget exceeded");
@@ -8150,7 +8230,7 @@ Let me check the result."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("should succeed without cost scope");
 

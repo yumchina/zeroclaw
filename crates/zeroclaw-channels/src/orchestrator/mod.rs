@@ -2506,7 +2506,11 @@ fn strip_think_tags_inline(s: &str) -> String {
     result.trim().to_string()
 }
 
-fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
+fn sanitize_channel_response(
+    response: &str,
+    tools: &[Box<dyn Tool>],
+    leak_detector_config: &zeroclaw_config::schema::LeakDetectorConfig,
+) -> String {
     let known_tool_names: HashSet<String> = tools
         .iter()
         .map(|tool| tool.name().to_ascii_lowercase())
@@ -2523,7 +2527,7 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
     let sanitized = strip_tool_narration(&stripped_json);
 
     // Scan for credential leaks before returning to caller
-    match zeroclaw_runtime::security::LeakDetector::new().scan(&sanitized) {
+    match zeroclaw_runtime::security::LeakDetector::from_config(leak_detector_config).scan(&sanitized) {
         zeroclaw_runtime::security::LeakResult::Clean => sanitized,
         zeroclaw_runtime::security::LeakResult::Detected { patterns, redacted } => {
             tracing::warn!(
@@ -3584,61 +3588,67 @@ async fn process_channel_message(
                 result = tokio::time::timeout(
                     Duration::from_secs(timeout_budget_secs),
                     scope_thread_id(
-                        msg.interruption_scope_id.clone()
+                        msg.interruption_scope_id
+                            .clone()
                             .or_else(|| msg.thread_ts.clone())
                             .or_else(|| Some(msg.id.clone())),
-                    scope_session_key(
-                        Some(history_key.clone()),
-                        zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
-                            cost_tracking_context.clone(),
-                        zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT.scope(
-                            receipt_scope.clone(),
-                        zeroclaw_runtime::tools::dawn_task::DAWN_CONTEXT.scope(
-                            dawn_ctx.clone(),
-                        run_tool_call_loop(
-                        active_provider.as_ref(),
-                        &mut history,
-                        ctx.tools_registry.as_ref(),
-                        notify_observer.as_ref() as &dyn Observer,
-                        route.provider.as_str(),
-                        route.model.as_str(),
-                        runtime_defaults.temperature,
-                        true,
-                        Some(&*ctx.approval_manager),
-                        msg.channel.as_str(),
-                        Some(msg.reply_target.as_str()),
-                        &ctx.multimodal,
-                        ctx.max_tool_iterations,
-                        Some(cancellation_token.clone()),
-                        delta_tx.clone(),
-                        ctx.hooks.as_deref(),
-                        if msg.channel == "cli"
-                            || ctx.autonomy_level == AutonomyLevel::Full
-                        {
-                            &[]
-                        } else {
-                            ctx.non_cli_excluded_tools.as_ref()
-                        },
-                        ctx.tool_call_dedup_exempt.as_ref(),
-                        ctx.activated_tools.as_ref(),
-                        Some(model_switch_callback.clone()),
-                        &ctx.pacing,
-                        ctx.max_tool_result_chars,
-                        ctx.context_token_budget,
-                        None, // shared_budget
-                        target_channel.as_deref(),
-                        ctx.receipt_generator.as_ref(),
-                        // Collector is meaningful only when the generator is
-                        // active. Pass None when receipts are disabled so the
-                        // call site reflects that coupling explicitly.
-                        ctx.receipt_generator
-                            .as_ref()
-                            .map(|_| tool_receipts_collector.as_ref()),
-                    ),
-                    ),
-                    ),
-                    ),
-                    ),
+                        scope_session_key(
+                            Some(history_key.clone()),
+                            zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
+                                cost_tracking_context.clone(),
+                                zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT.scope(
+                                    receipt_scope.clone(),
+                                    zeroclaw_runtime::tools::dawn_task::DAWN_CONTEXT.scope(
+                                        dawn_ctx.clone(),
+                                        zeroclaw_runtime::agent::loop_::TOOL_LOOP_LEAK_DETECTOR_CONFIG.scope(
+                                            std::sync::Arc::new(
+                                                ctx.prompt_config.security.leak_detector.clone(),
+                                            ),
+                                            run_tool_call_loop(
+                                                active_provider.as_ref(),
+                                                &mut history,
+                                                ctx.tools_registry.as_ref(),
+                                                notify_observer.as_ref() as &dyn Observer,
+                                                route.provider.as_str(),
+                                                route.model.as_str(),
+                                                runtime_defaults.temperature,
+                                                true,
+                                                Some(&*ctx.approval_manager),
+                                                msg.channel.as_str(),
+                                                Some(msg.reply_target.as_str()),
+                                                &ctx.multimodal,
+                                                ctx.max_tool_iterations,
+                                                Some(cancellation_token.clone()),
+                                                delta_tx.clone(),
+                                                ctx.hooks.as_deref(),
+                                                if msg.channel == "cli"
+                                                    || ctx.autonomy_level == AutonomyLevel::Full
+                                                {
+                                                    &[]
+                                                } else {
+                                                    ctx.non_cli_excluded_tools.as_ref()
+                                                },
+                                                ctx.tool_call_dedup_exempt.as_ref(),
+                                                ctx.activated_tools.as_ref(),
+                                                Some(model_switch_callback.clone()),
+                                                &ctx.pacing,
+                                                ctx.max_tool_result_chars,
+                                                ctx.context_token_budget,
+                                                None, // shared_budget
+                                                target_channel.as_deref(),
+                                                ctx.receipt_generator.as_ref(),
+                                                // Collector is meaningful only when the generator is
+                                                // active. Pass None when receipts are disabled so the
+                                                // call site reflects that coupling explicitly.
+                                                ctx.receipt_generator
+                                                    .as_ref()
+                                                    .map(|_| tool_receipts_collector.as_ref()),
+                                            ),
+                                        ),
+                                    ),
+                                ),
+                            ),
+                        ),
                     ),
                 ) => LlmExecutionResult::Completed(result),
             };
@@ -3883,7 +3893,7 @@ async fn process_channel_message(
             }
 
             let sanitized_response =
-                sanitize_channel_response(&outbound_response, ctx.tools_registry.as_ref());
+                sanitize_channel_response(&outbound_response, ctx.tools_registry.as_ref(), &ctx.prompt_config.security.leak_detector);
             let mut delivered_response =
                 if sanitized_response.is_empty() && !outbound_response.trim().is_empty() {
                     channel_runtime_string("channel-runtime-malformed-tool-output")
@@ -6389,34 +6399,38 @@ pub async fn start_channels(
     // the zeroclaw tools' mpsc sender and forwards them through the WuKongIM
     // channel's send_status_message.
     #[cfg(feature = "channel-wukongim")]
-    let has_rx = channel_msg_rx.is_some();
-    let has_wk = wukongim_channel.is_some();
-    if let (Some(mut rx), Some(wk)) = (channel_msg_rx, wukongim_channel) {
-        tracing::info!("Bridge listener started (Tool → WuKongIM)");
-        tokio::spawn(async move {
-            while let Some((recipient, channel_type, payload)) = rx.recv().await {
-                tracing::info!(
-                    recipient,
-                    channel_type,
-                    cmd = %payload.get("cmd").and_then(|v| v.as_str()).unwrap_or("?"),
-                    "Bridge: forwarding message to WuKongIM"
-                );
-                if let Err(e) = wk
-                    .send_status_message(&recipient, channel_type, payload)
-                    .await
-                {
-                    tracing::error!(
-                        ?e,
+    {
+        let has_rx = channel_msg_rx.is_some();
+        let has_wk = wukongim_channel.is_some();
+        if let (Some(mut rx), Some(wk)) = (channel_msg_rx, wukongim_channel) {
+            tracing::info!("Bridge listener started (Tool → WuKongIM)");
+            tokio::spawn(async move {
+                while let Some((recipient, channel_type, payload)) = rx.recv().await {
+                    tracing::info!(
                         recipient,
-                        "Failed to forward tool message to WuKongIM"
+                        channel_type,
+                        cmd = %payload.get("cmd").and_then(|v| v.as_str()).unwrap_or("?"),
+                        "Bridge: forwarding message to WuKongIM"
                     );
+                    if let Err(e) = wk
+                        .send_status_message(&recipient, channel_type, payload)
+                        .await
+                    {
+                        tracing::error!(
+                            ?e,
+                            recipient,
+                            "Failed to forward tool message to WuKongIM"
+                        );
+                    }
                 }
-            }
-            tracing::info!("Tool → WuKongIM bridge closed");
-        });
-    } else {
-        tracing::warn!(has_rx, has_wk, "Bridge listener NOT started");
+                tracing::info!("Tool → WuKongIM bridge closed");
+            });
+        } else {
+            tracing::warn!(has_rx, has_wk, "Bridge listener NOT started");
+        }
     }
+    #[cfg(not(feature = "channel-wukongim"))]
+    let _ = channel_msg_rx;
 
     let max_in_flight_messages = compute_max_in_flight_messages(channels.len());
 
@@ -6653,7 +6667,7 @@ pub async fn deliver_announcement(
     use zeroclaw_api::channel::SendMessage;
 
     // Scan for credential leaks before delivering
-    let leak_detector = zeroclaw_runtime::security::LeakDetector::new();
+    let leak_detector = zeroclaw_runtime::security::LeakDetector::from_config(&config.security.leak_detector);
     let safe_output = match leak_detector.scan(output) {
         zeroclaw_runtime::security::LeakResult::Detected { redacted, .. } => redacted,
         zeroclaw_runtime::security::LeakResult::Clean => output.to_string(),
@@ -7201,7 +7215,7 @@ mod tests {
         // Issue #4478: response with leading whitespace before [Used tools: ...]
         let input = "  [Used tools: web_search_tool]\nHere is the search result.";
 
-        let result = sanitize_channel_response(input, &tools);
+        let result = sanitize_channel_response(input, &tools, &Default::default());
 
         assert!(!result.contains("[Used tools:"));
         assert!(result.contains("Here is the search result."));
@@ -14248,7 +14262,7 @@ This is an example JSON object for profile settings."#;
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let leaked = "Temporary key: AKIAABCDEFGHIJKLMNOP"; // gitleaks:allow
 
-        let result = sanitize_channel_response(leaked, &tools);
+        let result = sanitize_channel_response(leaked, &tools, &Default::default());
 
         assert!(!result.contains("AKIAABCDEFGHIJKLMNOP")); // gitleaks:allow
         assert!(result.contains("[REDACTED"));
@@ -14259,7 +14273,7 @@ This is an example JSON object for profile settings."#;
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let clean_text = "This is a normal message with no credentials.";
 
-        let result = sanitize_channel_response(clean_text, &tools);
+        let result = sanitize_channel_response(clean_text, &tools, &Default::default());
 
         assert_eq!(result, clean_text);
     }
