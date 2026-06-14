@@ -509,6 +509,7 @@ impl DawnIMChannel {
                         channel_type: conv.channel_type,
                         payload: m.payload.clone(),
                         timestamp: m.timestamp,
+                        topic: m.topic.clone(),
                     });
 
                     let payload_json: Option<serde_json::Value> = if m.payload.is_string() {
