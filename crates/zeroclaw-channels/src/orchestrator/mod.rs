@@ -579,10 +579,11 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
 }
 
 /// Wrap `conversation_history_key` with cross-channel identity merging.
-/// Returns `unified_<master_id>` for 1:1 messages whose (channel_ref, sender)
-/// resolves to a whitelisted master id; otherwise the base key (unchanged
-/// per-channel isolation). Group chats and unconfigured identity always use
-/// the base key.
+/// Returns `unified_<master_id>` (or `unified_<master_id>_<topic>` when
+/// the inbound message carries a `thread_ts`) for 1:1 messages whose
+/// (channel_ref, sender) resolves to a whitelisted master id; otherwise
+/// the base key (unchanged per-channel isolation). Group chats and
+/// unconfigured identity always use the base key.
 fn resolve_session_key(
     msg: &zeroclaw_api::channel::ChannelMessage,
     identity: Option<&IdentityRuntime>,
@@ -603,7 +604,19 @@ fn resolve_session_key(
         .resolver
         .resolve(&channel_ref, &msg.sender, is_master)
     {
-        Some(master_id) => sanitize_session_key(&format!("unified_{master_id}")),
+        Some(master_id) => {
+            // Compose unified key with topic suffix when the inbound
+            // message carries `thread_ts`, so multi-topic isolation
+            // (introduced for DawnIM) continues to work for master /
+            // superuser identities. Without this suffix, all topics for
+            // a master user would flatten into the same unified session.
+            match msg.thread_ts.as_deref() {
+                Some(topic) if !topic.is_empty() => {
+                    sanitize_session_key(&format!("unified_{master_id}_{topic}"))
+                }
+                _ => sanitize_session_key(&format!("unified_{master_id}")),
+            }
+        }
         None => base,
     }
 }
@@ -21072,6 +21085,48 @@ mod error_code_tests {
             resolve_session_key(&msg, Some(&ident)),
             conversation_history_key(&msg)
         );
+    }
+
+    #[test]
+    fn resolve_session_key_master_with_topic_appends_topic_to_unified_key() {
+        // Bug regression guard: when identity resolves AND msg.thread_ts is
+        // set, the session key must include the topic so multi-topic isolation
+        // works even for master/superuser identities.
+        let mut whitelist = std::collections::HashSet::new();
+        whitelist.insert("u_alice".to_string());
+        let ident = IdentityRuntime {
+            resolver: Arc::new(StubResolver {
+                map: Default::default(),
+                whitelist,
+            }),
+            master_channel: "dawnim.work".to_string(),
+        };
+        let mut msg = dm("dawnim", "work", "u_alice");
+        msg.thread_ts = Some("db_lock".to_string());
+        let key = resolve_session_key(&msg, Some(&ident));
+        assert!(
+            key.contains("unified_u_alice") && key.contains("db_lock"),
+            "expected unified+topic key, got: {key}"
+        );
+    }
+
+    #[test]
+    fn resolve_session_key_master_without_topic_still_uses_plain_unified() {
+        // Regression guard: when thread_ts is None, behaviour is unchanged
+        // (plain unified_<master_id>).
+        let mut whitelist = std::collections::HashSet::new();
+        whitelist.insert("u_alice".to_string());
+        let ident = IdentityRuntime {
+            resolver: Arc::new(StubResolver {
+                map: Default::default(),
+                whitelist,
+            }),
+            master_channel: "dawnim.work".to_string(),
+        };
+        let msg = dm("dawnim", "work", "u_alice");
+        // thread_ts is None
+        let key = resolve_session_key(&msg, Some(&ident));
+        assert_eq!(key, "unified_u_alice");
     }
 
     #[test]
