@@ -131,11 +131,6 @@ pub struct CreateTaskTool {
     /// `orchestrator::register_channels_for_tools` at startup. Used by
     /// `execute` to look up the `Arc<dyn Channel>` named in the matching
     /// `[dawn_task.<n>].channel` config entry.
-    ///
-    /// Unused until Task 8 swaps the legacy bridge call path for the
-    /// channel-handle call path; suppressed warning lets the field land
-    /// in T6 without touching execute().
-    #[allow(dead_code)]
     channels: zeroclaw_api::channel::PerToolChannelHandle,
 }
 
@@ -189,56 +184,49 @@ impl Tool for CreateTaskTool {
             .and_then(|v| v.as_u64())
             .ok_or_else(|| anyhow::anyhow!("缺少 type 参数"))? as u8;
 
-        let task = resolve_executor(&self.config, task_type)
-            .ok_or_else(|| anyhow::anyhow!("未配置 type={} 的 Dawn 任务", task_type))?;
+        let executor = resolve_executor(&self.config, task_type)
+            .ok_or_else(|| anyhow::anyhow!("未配置 type={} 的 dawn task", task_type))?;
 
-        let ctx = read_context();
-        if ctx.channel_alias.is_empty() {
-            anyhow::bail!("dawn_create_task 必须在 DawnIM 渠道会话中调用（TASK_CONTEXT 未注入）");
-        }
-        let la_id = resolve_la_id(&self.config, &ctx.channel_alias).ok_or_else(|| {
-            anyhow::anyhow!(
-                "DawnIM 渠道别名 \"{}\" 未配置，无法解析当前机器人的 UID",
-                ctx.channel_alias
-            )
-        })?;
-        let reply_target = if ctx.reply_target.is_empty() || ctx.reply_target.ends_with(':') {
-            format!("1:{}", ctx.from_uid)
-        } else {
-            ctx.reply_target.clone()
+        let origin = zeroclaw_api::channel::CHANNEL_ORIGIN
+            .try_with(|o| o.clone())
+            .unwrap_or_default();
+
+        let channel: std::sync::Arc<dyn zeroclaw_api::channel::Channel> = {
+            let map = self.channels.read();
+            map.get(&executor.channel).cloned().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "channel '{}' 未注册或未启用（dawn_task type={} 配置依赖此 channel）",
+                    executor.channel,
+                    task_type,
+                )
+            })?
         };
 
-        let user_text = args.get("user_text").and_then(|v| v.as_str()).unwrap_or("");
+        let user_text = args
+            .get("user_text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         let params = args.get("params").cloned().unwrap_or(serde_json::Value::Null);
 
-        let payload = json!({
-            "type": 2000,
-            "cmd": "dawn.create_task",
-            "param": {
-                "type": task_type,
-                "user_id": ctx.from_uid,
-                "user_text": user_text,
-                "params": params,
-                "reply_to": la_id,
-                "reply_target": reply_target,
-            }
-        });
-
-        let msg = TaskMessage {
-            channel_alias: ctx.channel_alias.clone(),
-            recipient: task.recipient.clone(),
-            channel_type: 1,
-            payload,
+        let msg = zeroclaw_api::channel::SendMessage {
+            recipient: executor.recipient.clone(),
+            kind: zeroclaw_api::channel::SendKind::TaskSubmit {
+                task_type,
+                user_id: origin.from_uid,
+                user_text,
+                params,
+            },
+            ..Default::default()
         };
 
-        bridge_sender()
-            .ok_or_else(|| anyhow::anyhow!("Dawn 任务通道未初始化（CHANNEL_BRIDGE 未配置）"))?
-            .send(msg)
-            .map_err(|e| anyhow::anyhow!("发送任务到 Dawn 失败：{}", e))?;
+        channel.send(&msg).await.map_err(|e| {
+            anyhow::anyhow!("通过 channel '{}' 投递任务失败：{e}", executor.channel)
+        })?;
 
         Ok(ToolResult {
             success: true,
-            output: format!("已提交任务到 {}，等待处理，完成后会主动通知您", task.name),
+            output: format!("已提交任务到 {}，等待处理，完成后会主动通知您", executor.name),
             error: None,
         })
     }
@@ -253,11 +241,6 @@ pub struct QueryTaskTool {
     /// `orchestrator::register_channels_for_tools` at startup. Used by
     /// `execute` to look up the `Arc<dyn Channel>` named in the matching
     /// `[dawn_task.<n>].channel` config entry.
-    ///
-    /// Unused until Task 8 swaps the legacy bridge call path for the
-    /// channel-handle call path; suppressed warning lets the field land
-    /// in T6 without touching execute().
-    #[allow(dead_code)]
     channels: zeroclaw_api::channel::PerToolChannelHandle,
 }
 
@@ -308,48 +291,44 @@ impl Tool for QueryTaskTool {
         let task_id = args
             .get("task_id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("缺少 task_id 参数"))?;
+            .ok_or_else(|| anyhow::anyhow!("缺少 task_id 参数"))?
+            .to_string();
 
-        let task = resolve_executor(&self.config, task_type)
-            .ok_or_else(|| anyhow::anyhow!("未配置 type={} 的 Dawn 任务", task_type))?;
+        let executor = resolve_executor(&self.config, task_type)
+            .ok_or_else(|| anyhow::anyhow!("未配置 type={} 的 dawn task", task_type))?;
 
-        let ctx = read_context();
-        if ctx.channel_alias.is_empty() {
-            anyhow::bail!("dawn_query_task 必须在 DawnIM 渠道会话中调用（TASK_CONTEXT 未注入）");
-        }
-        let la_id = resolve_la_id(&self.config, &ctx.channel_alias).ok_or_else(|| {
-            anyhow::anyhow!(
-                "DawnIM 渠道别名 \"{}\" 未配置，无法解析当前机器人的 UID",
-                ctx.channel_alias
-            )
-        })?;
+        let origin = zeroclaw_api::channel::CHANNEL_ORIGIN
+            .try_with(|o| o.clone())
+            .unwrap_or_default();
 
-        let payload = json!({
-            "type": 2000,
-            "cmd": "dawn.query_task",
-            "param": {
-                "type": task_type,
-                "task_id": task_id,
-                "user_id": ctx.from_uid,
-                "reply_to": la_id,
-            }
-        });
-
-        let msg = TaskMessage {
-            channel_alias: ctx.channel_alias.clone(),
-            recipient: task.recipient.clone(),
-            channel_type: 1,
-            payload,
+        let channel: std::sync::Arc<dyn zeroclaw_api::channel::Channel> = {
+            let map = self.channels.read();
+            map.get(&executor.channel).cloned().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "channel '{}' 未注册或未启用（dawn_task type={} 配置依赖此 channel）",
+                    executor.channel,
+                    task_type,
+                )
+            })?
         };
 
-        bridge_sender()
-            .ok_or_else(|| anyhow::anyhow!("Dawn 任务通道未初始化（CHANNEL_BRIDGE 未配置）"))?
-            .send(msg)
-            .map_err(|e| anyhow::anyhow!("发送查询到 Dawn 失败：{}", e))?;
+        let msg = zeroclaw_api::channel::SendMessage {
+            recipient: executor.recipient.clone(),
+            kind: zeroclaw_api::channel::SendKind::TaskQuery {
+                task_type,
+                user_id: origin.from_uid,
+                task_id: task_id.clone(),
+            },
+            ..Default::default()
+        };
+
+        channel.send(&msg).await.map_err(|e| {
+            anyhow::anyhow!("通过 channel '{}' 投递查询失败：{e}", executor.channel)
+        })?;
 
         Ok(ToolResult {
             success: true,
-            output: format!("已发送查询请求，task_id: {}", task_id),
+            output: format!("已发送查询请求，task_id: {task_id}"),
             error: None,
         })
     }
@@ -386,6 +365,156 @@ description = "doc extraction"
         std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()))
     }
 
+    use std::sync::Mutex as StdMutex;
+    use zeroclaw_api::channel::{Channel, ChannelMessage, PerToolChannelHandle, SendMessage};
+
+    /// Records every SendMessage passed to its `send()`.
+    struct RecordingChannel {
+        name: &'static str,
+        recorded: StdMutex<Vec<SendMessage>>,
+    }
+
+    impl RecordingChannel {
+        fn new(name: &'static str) -> Self {
+            Self { name, recorded: StdMutex::new(Vec::new()) }
+        }
+        fn take(&self) -> Vec<SendMessage> {
+            std::mem::take(&mut *self.recorded.lock().unwrap())
+        }
+    }
+
+    impl zeroclaw_api::attribution::Attributable for RecordingChannel {
+        fn role(&self) -> zeroclaw_api::attribution::Role {
+            zeroclaw_api::attribution::Role::Channel(
+                zeroclaw_api::attribution::ChannelKind::Cli,
+            )
+        }
+        fn alias(&self) -> &str { self.name }
+    }
+
+    #[async_trait::async_trait]
+    impl Channel for RecordingChannel {
+        fn name(&self) -> &str { self.name }
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.recorded.lock().unwrap().push(message.clone());
+            Ok(())
+        }
+        async fn listen(
+            &self,
+            _: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn make_handle_with_channel(
+        alias: &str,
+        ch: Arc<RecordingChannel>,
+    ) -> PerToolChannelHandle {
+        let map = std::collections::HashMap::from([(alias.to_string(), ch as Arc<dyn Channel>)]);
+        Arc::new(parking_lot::RwLock::new(map))
+    }
+
+    #[tokio::test]
+    async fn create_task_sends_via_channel_handle() {
+        let cfg = make_config_with_dawnim("work", "bot_uid_1");
+        let ch = Arc::new(RecordingChannel::new("dawnim"));
+        let handle = make_handle_with_channel("dawnim.work", ch.clone());
+
+        let tool = CreateTaskTool::new(cfg, handle);
+        let origin = zeroclaw_api::channel::ChannelOrigin {
+            from_uid: "u_alice".into(),
+            channel_ref: "dawnim.work".into(),
+            reply_target: "1:u_alice".into(),
+        };
+        let result = zeroclaw_api::channel::CHANNEL_ORIGIN
+            .scope(origin, async {
+                tool.execute(serde_json::json!({
+                    "type": 1,
+                    "user_text": "extract this pdf",
+                    "params": {"files": []}
+                }))
+                .await
+            })
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        let recorded = ch.take();
+        assert_eq!(recorded.len(), 1);
+        let msg = &recorded[0];
+        assert_eq!(msg.recipient, "1878_xuanji_agent");
+        match &msg.kind {
+            zeroclaw_api::channel::SendKind::TaskSubmit {
+                task_type, user_id, user_text, params,
+            } => {
+                assert_eq!(*task_type, 1);
+                assert_eq!(user_id, "u_alice");
+                assert_eq!(user_text, "extract this pdf");
+                assert_eq!(params["files"], serde_json::json!([]));
+            }
+            other => panic!("expected TaskSubmit, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_task_errors_when_channel_not_in_handle() {
+        let cfg = make_config_with_dawnim("work", "bot_uid_1");
+        // 注册一个错的 alias，让 handle 查 dawnim.work 时 miss
+        let ch = Arc::new(RecordingChannel::new("dawnim"));
+        let handle = make_handle_with_channel("dawnim.other", ch);
+
+        let tool = CreateTaskTool::new(cfg, handle);
+        let origin = zeroclaw_api::channel::ChannelOrigin {
+            from_uid: "u_alice".into(),
+            channel_ref: "dawnim.other".into(),
+            reply_target: "1:u_alice".into(),
+        };
+        let err = zeroclaw_api::channel::CHANNEL_ORIGIN
+            .scope(origin, async {
+                tool.execute(serde_json::json!({"type": 1, "user_text": "x", "params": {}}))
+                    .await
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("dawnim.work"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn query_task_sends_via_channel_handle() {
+        let cfg = make_config_with_dawnim("work", "bot_uid_1");
+        let ch = Arc::new(RecordingChannel::new("dawnim"));
+        let handle = make_handle_with_channel("dawnim.work", ch.clone());
+
+        let tool = QueryTaskTool::new(cfg, handle);
+        let origin = zeroclaw_api::channel::ChannelOrigin {
+            from_uid: "u_alice".into(),
+            channel_ref: "dawnim.work".into(),
+            reply_target: "1:u_alice".into(),
+        };
+        let result = zeroclaw_api::channel::CHANNEL_ORIGIN
+            .scope(origin, async {
+                tool.execute(serde_json::json!({"type": 1, "task_id": "task_abc"}))
+                    .await
+            })
+            .await
+            .unwrap();
+        assert!(result.success);
+
+        let recorded = ch.take();
+        assert_eq!(recorded.len(), 1);
+        match &recorded[0].kind {
+            zeroclaw_api::channel::SendKind::TaskQuery {
+                task_type, user_id, task_id,
+            } => {
+                assert_eq!(*task_type, 1);
+                assert_eq!(user_id, "u_alice");
+                assert_eq!(task_id, "task_abc");
+            }
+            other => panic!("expected TaskQuery, got {other:?}"),
+        }
+    }
+
     #[test]
     fn bridge_sender_none_when_unset() {
         // Use a fresh lock guard; can't reset the static, but its initial
@@ -408,28 +537,18 @@ description = "doc extraction"
     }
 
     #[tokio::test]
-    async fn create_task_errors_without_context() {
-        let cfg = make_config_with_dawnim("work", "bot_uid_1");
-        let tool = CreateTaskTool::new(cfg, make_empty_channel_handle());
-        // Don't scope TASK_CONTEXT — execute should bail.
-        let result = tool
-            .execute(json!({"type": 1, "user_text": "hi", "params": {}}))
-            .await
-            .unwrap_err();
-        assert!(result.to_string().contains("TASK_CONTEXT"));
-    }
-
-    #[tokio::test]
     async fn create_task_unknown_type_errors() {
         let cfg = make_config_with_dawnim("work", "bot_uid_1");
-        let tool = CreateTaskTool::new(cfg, make_empty_channel_handle());
-        let ctx = TaskContext {
+        let ch = Arc::new(RecordingChannel::new("dawnim"));
+        let handle = make_handle_with_channel("dawnim.work", ch);
+        let tool = CreateTaskTool::new(cfg, handle);
+        let origin = zeroclaw_api::channel::ChannelOrigin {
             from_uid: "u_alice".into(),
             reply_target: "1:u_alice".into(),
-            channel_alias: "work".into(),
+            channel_ref: "dawnim.work".into(),
         };
-        let err = TASK_CONTEXT
-            .scope(ctx, async {
+        let err = zeroclaw_api::channel::CHANNEL_ORIGIN
+            .scope(origin, async {
                 tool.execute(json!({"type": 99, "user_text": "x", "params": {}}))
                     .await
             })
@@ -438,82 +557,4 @@ description = "doc extraction"
         assert!(err.to_string().contains("未配置 type=99"));
     }
 
-    #[tokio::test]
-    async fn create_task_unknown_alias_errors() {
-        let cfg = make_config_with_dawnim("work", "bot_uid_1");
-        let tool = CreateTaskTool::new(cfg, make_empty_channel_handle());
-        let ctx = TaskContext {
-            from_uid: "u_alice".into(),
-            reply_target: "1:u_alice".into(),
-            channel_alias: "nonexistent_alias".into(),
-        };
-        let err = TASK_CONTEXT
-            .scope(ctx, async {
-                tool.execute(json!({"type": 1, "user_text": "x", "params": {}}))
-                    .await
-            })
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("未配置"));
-    }
-
-    /// Single combined test for bridge-using tools. The bridge is a process-
-    /// global static, so concurrent `#[tokio::test]`s installing different
-    /// senders would race; we serialise them here. Behaviour exercised:
-    /// `dawn_create_task` and `dawn_query_task` both push their payloads
-    /// onto the bridge with correctly-shaped JSON and the originating
-    /// channel alias.
-    #[tokio::test]
-    async fn create_and_query_push_payloads_via_bridge() {
-        let cfg = make_config_with_dawnim("work", "bot_uid_1");
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        set_channel_bridge(tx);
-
-        let create = CreateTaskTool::new(cfg.clone(), make_empty_channel_handle());
-        let ctx = TaskContext {
-            from_uid: "u_alice".into(),
-            reply_target: "1:u_alice".into(),
-            channel_alias: "work".into(),
-        };
-        let create_result = TASK_CONTEXT
-            .scope(ctx.clone(), async {
-                create
-                    .execute(json!({
-                        "type": 1,
-                        "user_text": "extract this pdf",
-                        "params": {"files": []}
-                    }))
-                    .await
-            })
-            .await
-            .unwrap();
-        assert!(create_result.success);
-
-        let msg = rx.recv().await.expect("bridge received create message");
-        assert_eq!(msg.channel_alias, "work");
-        assert_eq!(msg.recipient, "1878_xuanji_agent");
-        assert_eq!(msg.channel_type, 1);
-        assert_eq!(msg.payload["type"], 2000);
-        assert_eq!(msg.payload["cmd"], "dawn.create_task");
-        assert_eq!(msg.payload["param"]["type"], 1);
-        assert_eq!(msg.payload["param"]["user_id"], "u_alice");
-        assert_eq!(msg.payload["param"]["reply_to"], "bot_uid_1");
-        assert_eq!(msg.payload["param"]["reply_target"], "1:u_alice");
-
-        let query = QueryTaskTool::new(cfg, make_empty_channel_handle());
-        let query_result = TASK_CONTEXT
-            .scope(ctx, async {
-                query
-                    .execute(json!({"type": 1, "task_id": "task_xxx"}))
-                    .await
-            })
-            .await
-            .unwrap();
-        assert!(query_result.success);
-
-        let msg = rx.recv().await.expect("bridge received query message");
-        assert_eq!(msg.payload["cmd"], "dawn.query_task");
-        assert_eq!(msg.payload["param"]["task_id"], "task_xxx");
-        assert_eq!(msg.payload["param"]["reply_to"], "bot_uid_1");
-    }
 }

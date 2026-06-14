@@ -4648,10 +4648,8 @@ async fn process_channel_message_body(
     // Per-turn context for Dawn task tools (dawn_create_task /
     // dawn_query_task). Parsed from the inbound message's sender + channel
     // metadata so the tool can both identify the originating user and route
-    // the task message back through the same DawnIM channel alias.
-    // For non-DawnIM channels, `channel_alias` is empty and the tools
-    // refuse to execute — matches the original PR's tool-availability scope.
-    let task_ctx = dawn_tools::TaskContext {
+    // the task message back through the correct DawnIM channel instance.
+    let channel_origin = zeroclaw_api::channel::ChannelOrigin {
         from_uid: msg
             .sender
             .split("_la_")
@@ -4659,7 +4657,11 @@ async fn process_channel_message_body(
             .unwrap_or(msg.sender.as_str())
             .to_string(),
         reply_target: msg.reply_target.clone(),
-        channel_alias: msg.channel_alias.clone().unwrap_or_default(),
+        channel_ref: msg
+            .channel_alias
+            .as_ref()
+            .map(|a| format!("{}.{}", msg.channel, a))
+            .unwrap_or_else(|| msg.channel.clone()),
     };
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {
@@ -4677,8 +4679,8 @@ async fn process_channel_message_body(
                             cost_tracking_context.clone(),
                         zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT.scope(
                             receipt_scope.clone(),
-                        dawn_tools::TASK_CONTEXT.scope(
-                            task_ctx.clone(),
+                        zeroclaw_api::channel::CHANNEL_ORIGIN.scope(
+                            channel_origin.clone(),
                         run_tool_call_loop(
                         active_model_provider.as_ref(),
                         &mut history,
