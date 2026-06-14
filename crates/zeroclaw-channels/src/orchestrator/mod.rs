@@ -4688,7 +4688,7 @@ async fn process_channel_message_body(
             .as_ref()
             .map(|a| format!("{}.{}", msg.channel, a))
             .unwrap_or_else(|| msg.channel.clone()),
-        topic: None,
+        topic: msg.thread_ts.clone(),
     };
     let loop_knobs = LoopKnobs::default();
     let (llm_result, fallback_info) = scope_provider_fallback(async {
