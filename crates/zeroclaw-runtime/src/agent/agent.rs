@@ -234,6 +234,10 @@ pub struct AgentChannelHandles {
     pub reaction: tools::PerToolChannelHandle,
     pub poll: Option<tools::PerToolChannelHandle>,
     pub escalate: Option<tools::PerToolChannelHandle>,
+    /// Channel registry for dawn-task tools (CreateTaskTool / QueryTaskTool).
+    /// Populated by `register_channels_for_tools` so the tools can resolve
+    /// the channel named in `[dawn_task.<n>].channel`.
+    pub task: Option<tools::PerToolChannelHandle>,
 }
 
 impl AgentChannelHandles {
@@ -244,6 +248,7 @@ impl AgentChannelHandles {
             Some(&self.reaction),
             self.poll.as_ref(),
             self.escalate.as_ref(),
+            self.task.as_ref(),
         ]
     }
 
@@ -1226,6 +1231,7 @@ impl Agent {
         let reaction_handle = all_tools_result.reaction_handle;
         let poll_handle = all_tools_result.poll_handle;
         let escalate_handle = all_tools_result.escalate_handle;
+        let task_channel_handle = Some(all_tools_result.task_channel_handle);
 
         // ── Built-in SecurityPolicy tool gate (parity with agent::run) ──
         // Apply the agent's allowlist (`allowed_tools`) AND denylist
@@ -1527,6 +1533,7 @@ impl Agent {
             reaction: reaction_handle,
             poll: poll_handle,
             escalate: escalate_handle,
+            task: task_channel_handle,
         };
 
         Ok(agent)

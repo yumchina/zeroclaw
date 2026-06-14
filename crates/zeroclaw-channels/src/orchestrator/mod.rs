@@ -6681,6 +6681,7 @@ pub fn register_channels_for_tools(
     reaction_handle: &Option<tools::PerToolChannelHandle>,
     poll_handle: &Option<tools::PerToolChannelHandle>,
     escalate_handle: &Option<tools::PerToolChannelHandle>,
+    task_channel_handle: &Option<tools::PerToolChannelHandle>,
 ) -> Vec<String> {
     let config_arc = Arc::new(RwLock::new(config.clone()));
     let configured = collect_configured_channels(&config_arc, "", &[]).channels;
@@ -6690,6 +6691,7 @@ pub fn register_channels_for_tools(
         reaction_handle.as_ref(),
         poll_handle.as_ref(),
         escalate_handle.as_ref(),
+        task_channel_handle.as_ref(),
     ];
 
     let mut names = Vec::new();

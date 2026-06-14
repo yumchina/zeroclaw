@@ -823,12 +823,14 @@ pub async fn run_gateway(
             // reaction_handle_gw is PerToolChannelHandle (not Option);
             // register_channels_for_tools expects &Option for all handles.
             let reaction_handle_gw_opt = Some(all_tools_result.reaction_handle.clone());
+            let task_handle_gw_opt = Some(all_tools_result.task_channel_handle.clone());
             let channel_names = zeroclaw_channels::orchestrator::register_channels_for_tools(
                 &config,
                 &all_tools_result.ask_user_handle,
                 &reaction_handle_gw_opt,
                 &all_tools_result.poll_handle,
                 &all_tools_result.escalate_handle,
+                &task_handle_gw_opt,
             );
             if !channel_names.is_empty() {
                 ::zeroclaw_log::record!(

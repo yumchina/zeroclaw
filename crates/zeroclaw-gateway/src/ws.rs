@@ -485,6 +485,7 @@ async fn handle_socket(
         &Some(ch.reaction.clone()),
         &ch.poll,
         &ch.escalate,
+        &ch.task,
     );
     if !channel_names.is_empty() {
         ::zeroclaw_log::record!(
