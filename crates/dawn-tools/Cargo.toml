@@ -12,7 +12,6 @@ zeroclaw-config = { workspace = true, default-features = true }
 zeroclaw-log.workspace = true
 anyhow = "1.0"
 async-trait = "0.1"
-parking_lot = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls-webpki-roots-no-provider", "__rustls-ring", "stream"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 toml = { version = "1.0", default-features = false, features = ["parse"] }
@@ -21,6 +20,7 @@ urlencoding = "2.1"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 
 [dev-dependencies]
+parking_lot = "0.12"
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 wiremock = "0.6"

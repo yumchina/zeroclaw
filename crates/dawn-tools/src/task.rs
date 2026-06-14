@@ -1,115 +1,31 @@
 //! Dawn task submission tools (`dawn_create_task`, `dawn_query_task`).
 //!
 //! These tools let the assistant hand off long-running work — document
-//! extraction, code analysis, data processing — to specialised Agents on the
-//! Dawn platform. Tasks are dispatched via a one-way bridge into the DawnIM
-//! channel supervisor, which forwards them as CMD (`type=2000`) messages over
-//! WebSocket to the target Agent. Results come back asynchronously as new
-//! inbound DawnIM CMD messages routed through the normal channel inbound path.
+//! extraction, code analysis, data processing — to specialised executors
+//! reachable via any configured `Channel`. The tool reads
+//! `[dawn_task.<n>]` to look up the executor's `channel` (composite ref
+//! like `"dawnim.work"`) and `recipient`, resolves the channel from the
+//! late-bound [`PerToolChannelHandle`] populated at startup, and calls
+//! `Channel::send` with a [`SendMessage`] carrying [`SendKind::TaskSubmit`]
+//! / [`SendKind::TaskQuery`]. The receiving channel encodes the payload
+//! in its native protocol.
 //!
-//! ## Architecture
+//! Reply routing back to the user is handled by the receiving executor:
+//! it sends a reply message back through the same channel, which the
+//! orchestrator routes through the user's existing session.
 //!
-//! - **Bridge** — [`CHANNEL_BRIDGE`] holds an mpsc sender swapped in by the
-//!   channel supervisor at startup (and refreshed on `/admin/reload`).
-//!   Tools push [`TaskMessage`]s onto it without holding any channel
-//!   reference; a separate listener task owns the receiver and dispatches
-//!   to the right `DawnIMChannel` instance.
-//! - **Routing** — every message carries the originating `channel_alias`,
-//!   so the listener can pick the correct `DawnIMChannel` in multi-instance
-//!   deployments.
-//! - **Context** — [`TASK_CONTEXT`] task-local carries the originating
-//!   user UID, reply target, and channel alias from the orchestrator into
-//!   the tool's `execute` body.
-//!
-//! Reply routing back to the user is handled by the receiving Agent on the
-//! Dawn side: it sends a `xxx.task_complete` CMD message back to the
-//! originating bot, which the orchestrator routes through the user's
-//! existing session.
+//! [`PerToolChannelHandle`]: zeroclaw_api::channel::PerToolChannelHandle
+//! [`SendMessage`]: zeroclaw_api::channel::SendMessage
+//! [`SendKind::TaskSubmit`]: zeroclaw_api::channel::SendKind::TaskSubmit
+//! [`SendKind::TaskQuery`]: zeroclaw_api::channel::SendKind::TaskQuery
 
 use async_trait::async_trait;
-use parking_lot::RwLock;
 use serde_json::json;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_api::tool_attribution;
 use zeroclaw_config::dawn_task::DawnTaskExecutorConfig;
 use zeroclaw_config::schema::Config;
-
-// ── Bridge primitives ──────────────────────────────────────────────
-
-/// One message handed from a tool to the channel supervisor's bridge
-/// listener.
-///
-/// The `channel_alias` field is **required** in 0.8.0 because multiple
-/// DawnIM instances may be configured; the listener uses it to look up the
-/// concrete `DawnIMChannel` to forward through.
-#[derive(Debug, Clone)]
-pub struct TaskMessage {
-    /// DawnIM alias (`[channels.dawnim.<alias>]`) that should forward this
-    /// message. Sourced from the originating [`TaskContext`].
-    pub channel_alias: String,
-    /// Target Agent's DawnIM UID (e.g. `"1878_xuanji_agent"`).
-    pub recipient: String,
-    /// DawnIM channel type: `1` = personal/DM, `2` = group.
-    pub channel_type: u8,
-    /// Full message payload (typically `{type:2000, cmd:"...", param:{...}}`).
-    pub payload: serde_json::Value,
-}
-
-/// Global bridge sender. `None` until `set_channel_bridge` is called by the
-/// channel supervisor. Using `parking_lot::RwLock<Option<Sender>>` (rather
-/// than `OnceLock`) so the supervisor can swap in a fresh sender on
-/// `/admin/reload` without leaking a closed channel.
-static CHANNEL_BRIDGE: RwLock<Option<mpsc::UnboundedSender<TaskMessage>>> =
-    RwLock::new(None);
-
-/// Install (or replace) the bridge sender. Called once by the channel
-/// supervisor during startup, and again on every `/admin/reload` because
-/// the mpsc receiver is owned by a per-supervisor listener task.
-pub fn set_channel_bridge(tx: mpsc::UnboundedSender<TaskMessage>) {
-    *CHANNEL_BRIDGE.write() = Some(tx);
-}
-
-/// Take a cheap clone of the current sender. Returns `None` when no
-/// supervisor is running (e.g. CLI-only builds, or during shutdown).
-fn bridge_sender() -> Option<mpsc::UnboundedSender<TaskMessage>> {
-    CHANNEL_BRIDGE.read().clone()
-}
-
-// ── Task-local user context ────────────────────────────────────────
-
-/// Per-turn context populated by the orchestrator before invoking the agent
-/// loop. Carries the originating user identity and the channel alias the
-/// task should reply through.
-#[derive(Clone, Default, Debug)]
-pub struct TaskContext {
-    /// Originating user UID, sans any `_la_<bot_uid>` suffix.
-    pub from_uid: String,
-    /// Original `ChannelMessage.reply_target` (e.g. `"1:u_alice"`).
-    pub reply_target: String,
-    /// Alias of the DawnIM channel the user reached us on; used both for
-    /// resolving the bot's own UID (`la_id`) and for routing the bridge
-    /// message back through the same channel.
-    pub channel_alias: String,
-}
-
-tokio::task_local! {
-    pub static TASK_CONTEXT: TaskContext;
-}
-
-fn read_context() -> TaskContext {
-    TASK_CONTEXT.try_with(|c| c.clone()).unwrap_or_default()
-}
-
-/// Resolve `la_id` (the bot's own DawnIM UID) from the captured config
-/// snapshot by looking up the channel alias the user reached us through.
-/// Returns `None` if the alias is not configured. Snapshot semantics match
-/// the rest of the tool factory (other Dawn tools also cache config values
-/// at registration time; `/admin/reload` rebuilds the tools registry).
-fn resolve_la_id(config: &Arc<Config>, alias: &str) -> Option<String> {
-    config.channels.dawnim.get(alias).map(|c| c.uid.clone())
-}
 
 /// Resolve a single executor entry from canonical config. Cloning out is
 /// fine here — the entry is at most a few short strings.
@@ -513,27 +429,6 @@ description = "doc extraction"
             }
             other => panic!("expected TaskQuery, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn bridge_sender_none_when_unset() {
-        // Use a fresh lock guard; can't reset the static, but its initial
-        // state is None and nothing else in this test installs a sender.
-        // Skip when something else (e.g. another test) has populated it.
-        let installed_before = bridge_sender().is_some();
-        if installed_before {
-            return;
-        }
-        assert!(bridge_sender().is_none());
-    }
-
-    #[test]
-    fn bridge_sender_returns_clone_after_set() {
-        let (tx, _rx) = mpsc::unbounded_channel();
-        set_channel_bridge(tx.clone());
-        let got = bridge_sender().expect("sender installed");
-        // A clone of the sender should send onto the same channel.
-        assert!(!got.is_closed());
     }
 
     #[tokio::test]
