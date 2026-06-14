@@ -48,12 +48,27 @@ pub struct ProgressUpdate {
 /// variants the progress observer translates.
 #[derive(Debug, Clone)]
 pub enum ProgressPhase {
-    AgentStart { provider: String, model: String },
-    LlmRequest { messages_count: usize },
-    ToolStart { tool: String, tool_call_id: Option<String> },
-    ToolDone { tool: String, tool_call_id: Option<String>, success: bool, elapsed_ms: u64 },
+    AgentStart {
+        provider: String,
+        model: String,
+    },
+    LlmRequest {
+        messages_count: usize,
+    },
+    ToolStart {
+        tool: String,
+        tool_call_id: Option<String>,
+    },
+    ToolDone {
+        tool: String,
+        tool_call_id: Option<String>,
+        success: bool,
+        elapsed_ms: u64,
+    },
     AgentEnd,
-    Error { component: String },
+    Error {
+        component: String,
+    },
     /// Unstructured text with no specific phase (e.g. legacy streaming status).
     Generic,
 }
@@ -541,9 +556,7 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
 /// the `Arc<RwLock<_>>` outer wrapper means tool handles outlive any
 /// individual channel instance.
 pub type PerToolChannelHandle = std::sync::Arc<
-    parking_lot::RwLock<
-        std::collections::HashMap<String, std::sync::Arc<dyn Channel>>,
-    >,
+    parking_lot::RwLock<std::collections::HashMap<String, std::sync::Arc<dyn Channel>>>,
 >;
 
 #[cfg(test)]
@@ -709,7 +722,12 @@ mod progress_update_tests {
         };
         assert_eq!(u.text, "shell completed (5ms)");
         match u.clone().phase {
-            ProgressPhase::ToolDone { tool, success, elapsed_ms, tool_call_id } => {
+            ProgressPhase::ToolDone {
+                tool,
+                success,
+                elapsed_ms,
+                tool_call_id,
+            } => {
                 assert_eq!(tool, "shell");
                 assert!(success);
                 assert_eq!(elapsed_ms, 5);
@@ -738,7 +756,12 @@ mod send_kind_tests {
             params: serde_json::json!({"files": []}),
         };
         match kind {
-            SendKind::TaskSubmit { task_type, user_id, user_text, params } => {
+            SendKind::TaskSubmit {
+                task_type,
+                user_id,
+                user_text,
+                params,
+            } => {
                 assert_eq!(task_type, 7);
                 assert_eq!(user_id, "u_alice");
                 assert_eq!(user_text, "extract this pdf");
@@ -755,10 +778,7 @@ mod send_kind_tests {
             user_id: "u_alice".into(),
             task_id: "task_xyz".into(),
         };
-        assert!(matches!(
-            kind,
-            SendKind::TaskQuery { task_type: 7, .. }
-        ));
+        assert!(matches!(kind, SendKind::TaskQuery { task_type: 7, .. }));
     }
 }
 

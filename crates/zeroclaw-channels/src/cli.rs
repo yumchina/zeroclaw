@@ -100,9 +100,7 @@ mod tests {
     #[tokio::test]
     async fn cli_channel_send_empty_message() {
         let ch = CliChannel::new("cli");
-        let result = ch
-            .send(&SendMessage::default())
-            .await;
+        let result = ch.send(&SendMessage::default()).await;
         assert!(result.is_ok());
     }
 

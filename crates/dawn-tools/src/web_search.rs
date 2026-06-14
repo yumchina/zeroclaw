@@ -51,13 +51,12 @@ impl DawnWebSearchTool {
             )
         })?;
 
-        let config: zeroclaw_config::schema::Config =
-            toml::from_str(&contents).map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to parse config file {} for Dawn web search token: {e}",
-                    self.config_path.display()
-                )
-            })?;
+        let config: zeroclaw_config::schema::Config = toml::from_str(&contents).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse config file {} for Dawn web search token: {e}",
+                self.config_path.display()
+            )
+        })?;
 
         // Resolve: [dawn.web_search].token → [dawn].token
         let raw_key = config
@@ -84,12 +83,9 @@ impl DawnWebSearchTool {
     }
 
     fn parse_results(&self, json: &serde_json::Value, query: &str) -> anyhow::Result<String> {
-        let data = json
-            .get("data")
-            .and_then(|d| d.as_array())
-            .ok_or_else(|| {
-                anyhow::anyhow!("Invalid Yumc-Search API response: missing or invalid data field")
-            })?;
+        let data = json.get("data").and_then(|d| d.as_array()).ok_or_else(|| {
+            anyhow::anyhow!("Invalid Yumc-Search API response: missing or invalid data field")
+        })?;
 
         if data.is_empty() {
             return Ok(format!("No results found for: {}", query));
@@ -108,7 +104,10 @@ impl DawnWebSearchTool {
 
         let mut lines = vec![format!("Search results for: {} (via Yumc-Search)", query)];
         for (i, result) in results.iter().take(self.max_results).enumerate() {
-            let name = result.get("name").and_then(|n| n.as_str()).unwrap_or("No title");
+            let name = result
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("No title");
             let url = result.get("url").and_then(|u| u.as_str()).unwrap_or("");
             let snippet = result.get("snippet").and_then(|s| s.as_str()).unwrap_or("");
             lines.push(format!("{}. {}", i + 1, name));
@@ -157,7 +156,10 @@ impl DawnWebSearchTool {
     }
 }
 
-tool_attribution!(DawnWebSearchTool, ::zeroclaw_api::attribution::ToolKind::Search);
+tool_attribution!(
+    DawnWebSearchTool,
+    ::zeroclaw_api::attribution::ToolKind::Search
+);
 
 #[async_trait]
 impl Tool for DawnWebSearchTool {
@@ -271,7 +273,10 @@ mod tests {
         let tool = DawnWebSearchTool::new(
             Some("plain-key".into()),
             Some("http://example.com/search".into()),
-            3, 10, PathBuf::new(), false,
+            3,
+            10,
+            PathBuf::new(),
+            false,
         );
         assert_eq!(tool.resolve_token().unwrap(), "plain-key");
     }
@@ -281,7 +286,10 @@ mod tests {
         let tool = DawnWebSearchTool::new(
             None,
             Some("http://example.com/search".into()),
-            3, 10, PathBuf::new(), false,
+            3,
+            10,
+            PathBuf::new(),
+            false,
         );
         assert!(tool.resolve_token().is_err());
     }

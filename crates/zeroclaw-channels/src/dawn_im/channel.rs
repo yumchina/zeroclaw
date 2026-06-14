@@ -20,16 +20,16 @@ use zeroclaw_config::schema::DawnIMConfig;
 
 use super::approval::{PendingApprovals, WkApprovalAction, build_approval_card};
 use super::connection::{
-    ClearUnreadRequest, ConnectParams, HEARTBEAT_TIMEOUT, Header, JsonRpcNotification,
-    JsonRpcRequest, JsonRpcResponse, PING_INTERVAL, RecvAckParams, RecvNotificationParams,
-    SendParams, SyncRequest, SyncResponse, DAWN_IM_RPC_VERSION, WkChannelType, WkMessageType,
+    ClearUnreadRequest, ConnectParams, DAWN_IM_RPC_VERSION, HEARTBEAT_TIMEOUT, Header,
+    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, PING_INTERVAL, RecvAckParams,
+    RecvNotificationParams, SendParams, SyncRequest, SyncResponse, WkChannelType, WkMessageType,
     WsSink,
 };
 use super::exception_card::build_exception_card;
 use super::filter::{is_mentioned, is_user_allowed, parse_recipient};
 use super::messaging::{
-    download_file_to_workspace, download_image_as_base64, encode_text_payload,
-    encode_progress_payload, process_markdown_resources,
+    download_file_to_workspace, download_image_as_base64, encode_progress_payload,
+    encode_text_payload, process_markdown_resources,
 };
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -360,12 +360,7 @@ impl DawnIMChannel {
         if seq > mem_current {
             if let Err(e) = self
                 .memory
-                .store(
-                    &seq_key_mem,
-                    &seq.to_string(),
-                    MemoryCategory::Core,
-                    None,
-                )
+                .store(&seq_key_mem, &seq.to_string(), MemoryCategory::Core, None)
                 .await
             {
                 ::zeroclaw_log::record!(
@@ -858,8 +853,7 @@ impl DawnIMChannel {
         payload: serde_json::Value,
     ) -> anyhow::Result<()> {
         let payload_bytes = serde_json::to_vec(&payload)?;
-        let payload_b64 =
-            base64::engine::general_purpose::STANDARD.encode(&payload_bytes);
+        let payload_b64 = base64::engine::general_purpose::STANDARD.encode(&payload_bytes);
         let params = SendParams {
             from_uid: Some(self.uid.clone()),
             client_msg_no: Uuid::new_v4().to_string(),
@@ -1130,8 +1124,13 @@ impl Channel for DawnIMChannel {
                                 if let Err(e) = self.remove_from_pending_outbound(message).await {
                                     ::zeroclaw_log::record!(
                                         DEBUG,
-                                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_attrs(
+                                            ::serde_json::json!({"error": format!("{}", e)})
+                                        ),
                                         "DawnIM: remove_from_pending_outbound"
                                     );
                                 }
@@ -1140,9 +1139,12 @@ impl Channel for DawnIMChannel {
                             Err(err) => {
                                 ::zeroclaw_log::record!(
                                     WARN,
-                                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                        .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
                                     "DawnIM: WebSocket send failed. Clearing sink and buffering message."
                                 );
                                 *g = None;
@@ -1151,9 +1153,14 @@ impl Channel for DawnIMChannel {
                                 if let Err(e) = self.save_pending_outbound().await {
                                     ::zeroclaw_log::record!(
                                         WARN,
-                                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Save)
-                                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Save
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(
+                                            ::serde_json::json!({"error": format!("{}", e)})
+                                        ),
                                         "DawnIM: failed to persist pending outbound"
                                     );
                                 }
@@ -1167,9 +1174,12 @@ impl Channel for DawnIMChannel {
                         if let Err(e) = self.save_pending_outbound().await {
                             ::zeroclaw_log::record!(
                                 WARN,
-                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Save)
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Save
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                                 "DawnIM: failed to persist pending outbound"
                             );
                         }

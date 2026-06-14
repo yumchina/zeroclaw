@@ -31,6 +31,8 @@ pub use crate::amqp::AmqpChannel;
 pub use crate::bluesky::BlueskyChannel;
 #[cfg(feature = "channel-clawdtalk")]
 pub use crate::clawdtalk::ClawdTalkChannel;
+#[cfg(feature = "channel-dawnIM")]
+pub use crate::dawn_im::DawnIMChannel;
 #[cfg(feature = "channel-dingtalk")]
 pub use crate::dingtalk::DingTalkChannel;
 #[cfg(feature = "channel-discord")]
@@ -89,8 +91,6 @@ pub use crate::wecom::WeComChannel;
 pub use crate::wecom_ws::WeComWsChannel;
 #[cfg(feature = "channel-whatsapp-cloud")]
 pub use crate::whatsapp::WhatsAppChannel;
-#[cfg(feature = "channel-dawnIM")]
-pub use crate::dawn_im::DawnIMChannel;
 pub use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 // Local channel types (in misc, not zeroclaw-channels)
 pub use crate::cli::CliChannel;
@@ -598,7 +598,10 @@ fn resolve_session_key(
         None => msg.channel.clone(),
     };
     let is_master = channel_ref == identity.master_channel;
-    match identity.resolver.resolve(&channel_ref, &msg.sender, is_master) {
+    match identity
+        .resolver
+        .resolve(&channel_ref, &msg.sender, is_master)
+    {
         Some(master_id) => sanitize_session_key(&format!("unified_{master_id}")),
         None => base,
     }
@@ -2564,12 +2567,21 @@ async fn handle_runtime_command_if_needed(
                         ),
                         None => "你不是 superuser，无法发起绑定。".to_string(),
                     },
-                    None => "请先在主渠道发送 /bind 获取绑定码，再在此渠道发送 /bind <码>。".to_string(),
+                    None => {
+                        "请先在主渠道发送 /bind 获取绑定码，再在此渠道发送 /bind <码>。".to_string()
+                    }
                     Some(_) if is_master => "主渠道无需绑定。".to_string(),
-                    Some(code) => match identity.resolver.redeem_code(&code, &channel_ref, &msg.sender) {
-                        Ok(master_id) => format!("已绑定到 {master_id}，此后本渠道会话将与主渠道合并。"),
-                        Err(reason) => format!("绑定失败：{reason}"),
-                    },
+                    Some(code) => {
+                        match identity
+                            .resolver
+                            .redeem_code(&code, &channel_ref, &msg.sender)
+                        {
+                            Ok(master_id) => {
+                                format!("已绑定到 {master_id}，此后本渠道会话将与主渠道合并。")
+                            }
+                            Err(reason) => format!("绑定失败：{reason}"),
+                        }
+                    }
                 }
             }
         },
@@ -8471,7 +8483,8 @@ pub async fn start_channels(
         .filter(|s| !s.is_empty())
     {
         Some(master_channel) => {
-            match zeroclaw_infra::make_identity_store(&config.data_dir, &config.channels.superusers) {
+            match zeroclaw_infra::make_identity_store(&config.data_dir, &config.channels.superusers)
+            {
                 Ok(resolver) => {
                     ::zeroclaw_log::record!(
                         INFO,
@@ -20702,20 +20715,25 @@ mod error_code_tests {
             if is_master {
                 return self.whitelist.contains(sender).then(|| sender.to_string());
             }
-            let m = self.map.get(&(channel_ref.to_string(), sender.to_string()))?;
+            let m = self
+                .map
+                .get(&(channel_ref.to_string(), sender.to_string()))?;
             self.whitelist.contains(m).then(|| m.clone())
         }
-        fn issue_code(&self, _m: &str) -> Option<String> { None }
+        fn issue_code(&self, _m: &str) -> Option<String> {
+            None
+        }
         fn redeem_code(&self, _c: &str, _ch: &str, _s: &str) -> Result<String, String> {
             Err("stub".into())
         }
-        fn unbind(&self, _ch: &str, _s: &str) -> bool { false }
+        fn unbind(&self, _ch: &str, _s: &str) -> bool {
+            false
+        }
     }
 
     fn dm(channel: &str, alias: &str, sender: &str) -> zeroclaw_api::channel::ChannelMessage {
-        let mut m = zeroclaw_api::channel::ChannelMessage::new(
-            "id1", sender, sender, "hi", channel, 0,
-        );
+        let mut m =
+            zeroclaw_api::channel::ChannelMessage::new("id1", sender, sender, "hi", channel, 0);
         m.channel_alias = Some(alias.to_string());
         m
     }
@@ -20725,7 +20743,10 @@ mod error_code_tests {
         let mut whitelist = std::collections::HashSet::new();
         whitelist.insert("u_alice".to_string());
         let ident = IdentityRuntime {
-            resolver: Arc::new(StubResolver { map: Default::default(), whitelist }),
+            resolver: Arc::new(StubResolver {
+                map: Default::default(),
+                whitelist,
+            }),
             master_channel: "dawnim.work".to_string(),
         };
         let msg = dm("dawnim", "work", "u_alice");
@@ -20735,7 +20756,10 @@ mod error_code_tests {
     #[test]
     fn resolve_session_key_slave_uses_binding() {
         let mut map = std::collections::HashMap::new();
-        map.insert(("lark.work".to_string(), "ou_aaa".to_string()), "u_alice".to_string());
+        map.insert(
+            ("lark.work".to_string(), "ou_aaa".to_string()),
+            "u_alice".to_string(),
+        );
         let mut whitelist = std::collections::HashSet::new();
         whitelist.insert("u_alice".to_string());
         let ident = IdentityRuntime {
@@ -20749,17 +20773,26 @@ mod error_code_tests {
     #[test]
     fn resolve_session_key_unbound_falls_back_to_base() {
         let ident = IdentityRuntime {
-            resolver: Arc::new(StubResolver { map: Default::default(), whitelist: Default::default() }),
+            resolver: Arc::new(StubResolver {
+                map: Default::default(),
+                whitelist: Default::default(),
+            }),
             master_channel: "dawnim.work".to_string(),
         };
         let msg = dm("lark", "work", "ou_stranger");
-        assert_eq!(resolve_session_key(&msg, Some(&ident)), conversation_history_key(&msg));
+        assert_eq!(
+            resolve_session_key(&msg, Some(&ident)),
+            conversation_history_key(&msg)
+        );
     }
 
     #[test]
     fn resolve_session_key_none_identity_is_base() {
         let msg = dm("lark", "work", "ou_aaa");
-        assert_eq!(resolve_session_key(&msg, None), conversation_history_key(&msg));
+        assert_eq!(
+            resolve_session_key(&msg, None),
+            conversation_history_key(&msg)
+        );
     }
 
     #[test]
@@ -20767,24 +20800,33 @@ mod error_code_tests {
         let mut whitelist = std::collections::HashSet::new();
         whitelist.insert("u_alice".to_string());
         let ident = IdentityRuntime {
-            resolver: Arc::new(StubResolver { map: Default::default(), whitelist }),
+            resolver: Arc::new(StubResolver {
+                map: Default::default(),
+                whitelist,
+            }),
             master_channel: "dawnim.work".to_string(),
         };
         let mut msg = dm("dawnim", "work", "u_alice");
         msg.reply_target = "group:team".to_string(); // group → no unify
-        assert_eq!(resolve_session_key(&msg, Some(&ident)), conversation_history_key(&msg));
+        assert_eq!(
+            resolve_session_key(&msg, Some(&ident)),
+            conversation_history_key(&msg)
+        );
     }
 
     #[test]
     fn end_to_end_master_and_bound_slave_share_session_key() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let resolver = zeroclaw_infra::make_identity_store(tmp.path(), &["u_alice".to_string()])
-            .unwrap();
+        let resolver =
+            zeroclaw_infra::make_identity_store(tmp.path(), &["u_alice".to_string()]).unwrap();
         // Bind lark.work/ou_aaa -> u_alice via a real code.
         let code = resolver.issue_code("u_alice").unwrap();
         resolver.redeem_code(&code, "lark.work", "ou_aaa").unwrap();
 
-        let ident = IdentityRuntime { resolver, master_channel: "dawnim.work".to_string() };
+        let ident = IdentityRuntime {
+            resolver,
+            master_channel: "dawnim.work".to_string(),
+        };
 
         let master_msg = dm("dawnim", "work", "u_alice");
         let slave_msg = dm("lark", "work", "ou_aaa");
@@ -20795,7 +20837,10 @@ mod error_code_tests {
             resolve_session_key(&slave_msg, Some(&ident)),
             "master and bound slave must share the unified session_key"
         );
-        assert_eq!(resolve_session_key(&master_msg, Some(&ident)), "unified_u_alice");
+        assert_eq!(
+            resolve_session_key(&master_msg, Some(&ident)),
+            "unified_u_alice"
+        );
         assert_eq!(
             resolve_session_key(&stranger, Some(&ident)),
             conversation_history_key(&stranger),
@@ -20847,7 +20892,9 @@ mod group_detection_tests {
         assert!(is_group_reply_target("group:12345678"));
 
         // WeCom group format (NEW - needs to be added)
-        assert!(is_group_reply_target("group--wrjEwKDwAALbgnNSPHc1AsopD6TIvxxx"));
+        assert!(is_group_reply_target(
+            "group--wrjEwKDwAALbgnNSPHc1AsopD6TIvxxx"
+        ));
 
         // DawnIM group format (NEW - needs to be added)
         assert!(is_group_reply_target("2:channel_123"));
@@ -20861,4 +20908,3 @@ mod group_detection_tests {
         assert!(!is_group_reply_target("oc_chat123")); // Lark chat_id (cannot distinguish)
     }
 }
-

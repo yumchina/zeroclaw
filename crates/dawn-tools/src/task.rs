@@ -51,15 +51,15 @@ pub struct CreateTaskTool {
 }
 
 impl CreateTaskTool {
-    pub fn new(
-        config: Arc<Config>,
-        channels: zeroclaw_api::channel::PerToolChannelHandle,
-    ) -> Self {
+    pub fn new(config: Arc<Config>, channels: zeroclaw_api::channel::PerToolChannelHandle) -> Self {
         Self { config, channels }
     }
 }
 
-tool_attribution!(CreateTaskTool, ::zeroclaw_api::attribution::ToolKind::DawnTask);
+tool_attribution!(
+    CreateTaskTool,
+    ::zeroclaw_api::attribution::ToolKind::DawnTask
+);
 
 #[async_trait]
 impl Tool for CreateTaskTool {
@@ -123,7 +123,10 @@ impl Tool for CreateTaskTool {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let params = args.get("params").cloned().unwrap_or(serde_json::Value::Null);
+        let params = args
+            .get("params")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
 
         let msg = zeroclaw_api::channel::SendMessage {
             recipient: executor.recipient.clone(),
@@ -142,7 +145,10 @@ impl Tool for CreateTaskTool {
 
         Ok(ToolResult {
             success: true,
-            output: format!("已提交任务到 {}，等待处理，完成后会主动通知您", executor.name),
+            output: format!(
+                "已提交任务到 {}，等待处理，完成后会主动通知您",
+                executor.name
+            ),
             error: None,
         })
     }
@@ -161,15 +167,15 @@ pub struct QueryTaskTool {
 }
 
 impl QueryTaskTool {
-    pub fn new(
-        config: Arc<Config>,
-        channels: zeroclaw_api::channel::PerToolChannelHandle,
-    ) -> Self {
+    pub fn new(config: Arc<Config>, channels: zeroclaw_api::channel::PerToolChannelHandle) -> Self {
         Self { config, channels }
     }
 }
 
-tool_attribution!(QueryTaskTool, ::zeroclaw_api::attribution::ToolKind::DawnTask);
+tool_attribution!(
+    QueryTaskTool,
+    ::zeroclaw_api::attribution::ToolKind::DawnTask
+);
 
 #[async_trait]
 impl Tool for QueryTaskTool {
@@ -292,7 +298,10 @@ description = "doc extraction"
 
     impl RecordingChannel {
         fn new(name: &'static str) -> Self {
-            Self { name, recorded: StdMutex::new(Vec::new()) }
+            Self {
+                name,
+                recorded: StdMutex::new(Vec::new()),
+            }
         }
         fn take(&self) -> Vec<SendMessage> {
             std::mem::take(&mut *self.recorded.lock().unwrap())
@@ -301,32 +310,28 @@ description = "doc extraction"
 
     impl zeroclaw_api::attribution::Attributable for RecordingChannel {
         fn role(&self) -> zeroclaw_api::attribution::Role {
-            zeroclaw_api::attribution::Role::Channel(
-                zeroclaw_api::attribution::ChannelKind::Cli,
-            )
+            zeroclaw_api::attribution::Role::Channel(zeroclaw_api::attribution::ChannelKind::Cli)
         }
-        fn alias(&self) -> &str { self.name }
+        fn alias(&self) -> &str {
+            self.name
+        }
     }
 
     #[async_trait::async_trait]
     impl Channel for RecordingChannel {
-        fn name(&self) -> &str { self.name }
+        fn name(&self) -> &str {
+            self.name
+        }
         async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
             self.recorded.lock().unwrap().push(message.clone());
             Ok(())
         }
-        async fn listen(
-            &self,
-            _: tokio::sync::mpsc::Sender<ChannelMessage>,
-        ) -> anyhow::Result<()> {
+        async fn listen(&self, _: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {
             Ok(())
         }
     }
 
-    fn make_handle_with_channel(
-        alias: &str,
-        ch: Arc<RecordingChannel>,
-    ) -> PerToolChannelHandle {
+    fn make_handle_with_channel(alias: &str, ch: Arc<RecordingChannel>) -> PerToolChannelHandle {
         let map = std::collections::HashMap::from([(alias.to_string(), ch as Arc<dyn Channel>)]);
         Arc::new(parking_lot::RwLock::new(map))
     }
@@ -362,7 +367,10 @@ description = "doc extraction"
         assert_eq!(msg.recipient, "1878_xuanji_agent");
         match &msg.kind {
             zeroclaw_api::channel::SendKind::TaskSubmit {
-                task_type, user_id, user_text, params,
+                task_type,
+                user_id,
+                user_text,
+                params,
             } => {
                 assert_eq!(*task_type, 1);
                 assert_eq!(user_id, "u_alice");
@@ -421,7 +429,9 @@ description = "doc extraction"
         assert_eq!(recorded.len(), 1);
         match &recorded[0].kind {
             zeroclaw_api::channel::SendKind::TaskQuery {
-                task_type, user_id, task_id,
+                task_type,
+                user_id,
+                task_id,
             } => {
                 assert_eq!(*task_type, 1);
                 assert_eq!(user_id, "u_alice");
@@ -451,5 +461,4 @@ description = "doc extraction"
             .unwrap_err();
         assert!(err.to_string().contains("未配置 type=99"));
     }
-
 }
