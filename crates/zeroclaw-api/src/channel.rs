@@ -89,25 +89,26 @@ pub struct ChannelMessage {
     pub subject: Option<String>,
 }
 
-/// 消息类型分类。决定 `Channel::send` 实现走哪条编码路径。
+/// Message kind discriminator that selects which encoding path
+/// `Channel::send` takes.
 ///
-/// `Text` 是默认值,与 0.8.0 现有 30+ channel 行为一致。`TaskSubmit` /
-/// `TaskQuery` 用于通过 channel 把任务投递给外部 executor — 仅由
-/// `dawn_create_task` / `dawn_query_task` 工具构造,并由配置中
-/// `[dawn_task.<n>].channel` 显式指定目标 channel。
+/// `Text` is the default, matching every existing channel's current
+/// behaviour. `TaskSubmit` / `TaskQuery` are constructed only by the
+/// `dawn_create_task` / `dawn_query_task` tools and routed via the
+/// channel named in the matching `[dawn_task.<n>].channel` config entry.
 #[derive(Debug, Clone, Default)]
 pub enum SendKind {
-    /// 普通用户对话消息。
+    /// Plain user-facing conversational message.
     #[default]
     Text,
-    /// 提交任务给 channel 对端的外部 executor。
+    /// Submit a task to the external executor on the other side of this channel.
     TaskSubmit {
         task_type: u8,
         user_id: String,
         user_text: String,
         params: serde_json::Value,
     },
-    /// 查询任务状态。
+    /// Query the status of a previously submitted task.
     TaskQuery {
         task_type: u8,
         user_id: String,
