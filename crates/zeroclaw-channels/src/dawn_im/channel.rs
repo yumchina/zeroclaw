@@ -590,6 +590,8 @@ impl DawnIMChannel {
         params: RecvNotificationParams,
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> anyhow::Result<()> {
+        let topic_thread = topic_to_thread(params.topic.as_deref());
+
         if params.from_uid == self.uid {
             return Ok(());
         }
@@ -660,7 +662,7 @@ impl DawnIMChannel {
                     channel: "dawnim".to_string(),
                     channel_alias: Some(self.alias.clone()),
                     timestamp: u64::try_from(params.timestamp.max(0)).unwrap_or(0),
-                    thread_ts: None,
+                    thread_ts: topic_thread.clone(),
                     interruption_scope_id: None,
                     attachments: vec![],
                     subject: None,
@@ -796,7 +798,7 @@ impl DawnIMChannel {
             channel: "dawnim".to_string(),
             channel_alias: Some(self.alias.clone()),
             timestamp: u64::try_from(params.timestamp.max(0)).unwrap_or(0),
-            thread_ts: None,
+            thread_ts: topic_thread.clone(),
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
@@ -1633,5 +1635,78 @@ mod topic_to_thread_tests {
     #[test]
     fn real_topic_maps_to_some() {
         assert_eq!(topic_to_thread(Some("db_lock")), Some("db_lock".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod inbound_topic_mapping_tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    fn channel_with_test_state() -> DawnIMChannel {
+        let cfg = zeroclaw_config::schema::DawnIMConfig {
+            enabled: true,
+            ws_url: "ws://localhost:5200".into(),
+            uid: "bot_uid_1".into(),
+            token: String::new(),
+            device_id: "test-device".into(),
+            allowed_users: vec!["*".into()],
+            ..Default::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn zeroclaw_api::memory_traits::Memory> = Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", tmp.path(), "inbound_topic_test")
+                .unwrap(),
+        );
+        DawnIMChannel::from_config(&cfg, "test", tmp.path(), memory)
+    }
+
+    fn make_text_recv(topic: Option<&str>) -> RecvNotificationParams {
+        let payload = serde_json::json!({"type": 1, "content": "hello"});
+        let payload_b64 = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_string(&payload).unwrap());
+        RecvNotificationParams {
+            message_id: "m1".into(),
+            message_seq: 1,
+            from_uid: "u_alice".into(),
+            channel_id: "u_alice".into(),
+            channel_type: WkChannelType::PERSONAL,
+            payload: serde_json::Value::String(payload_b64),
+            timestamp: 1,
+            topic: topic.map(ToString::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_text_with_topic_sets_thread_ts() {
+        let ch = channel_with_test_state();
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(8);
+        ch.process_inbound_message(make_text_recv(Some("db_lock")), &tx)
+            .await
+            .unwrap();
+        let msg = rx.recv().await.expect("text message delivered");
+        assert_eq!(msg.thread_ts.as_deref(), Some("db_lock"));
+    }
+
+    #[tokio::test]
+    async fn inbound_text_without_topic_keeps_thread_ts_none() {
+        let ch = channel_with_test_state();
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(8);
+        ch.process_inbound_message(make_text_recv(None), &tx)
+            .await
+            .unwrap();
+        let msg = rx.recv().await.expect("text message delivered");
+        assert!(msg.thread_ts.is_none());
+    }
+
+    #[tokio::test]
+    async fn inbound_text_with_zero_sentinel_keeps_thread_ts_none() {
+        let ch = channel_with_test_state();
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(8);
+        ch.process_inbound_message(make_text_recv(Some("0")), &tx)
+            .await
+            .unwrap();
+        let msg = rx.recv().await.expect("text message delivered");
+        assert!(msg.thread_ts.is_none());
     }
 }
