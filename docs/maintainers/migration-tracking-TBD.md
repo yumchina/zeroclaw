@@ -38,7 +38,7 @@
 | **#42** | Implement macOS Seatbelt wildcard port mapping | 🔶 部分迁移 | P4 | `seatbelt.rs` 无 wildcard port 逻辑；该 PR 同时涉及旧 wukongim crate 的 approval/filter，需在 #41 完成后评估移植范围 | seatbelt 相关部分已迁移（`network_outbound_allow` 配置字段 + schema.rs），wukongim approval/filter 部分放弃 |
 | **#43** | Add environment info logging before command execution | ⏭️ 已撤销 | — | 被 #44 revert，功能已撤销，无需迁移 | 放弃 |
 | **#44** | Revert "feat(shell): 增加命令执行前的环境信息记录" | ⏭️ 已撤销 | — | revert 本身无功能内容 | 放弃 |
-| **#45** | Implement multi-topic mapping logic and refactor settings field | ❌ 未迁移 | P6 | 修改了旧 `zeroclaw-channel-wukongim` crate；需重新评估是否在 0.8.0 上以新方式实现，或待 dawn_im 架构稳定后统一处理 |  |
+| **#45** | Implement multi-topic mapping logic and refactor settings field | ✅ 已迁移 | P3 | 修改了旧 `zeroclaw-channel-wukongim` crate；需重新评估是否在 0.8.0 上以新方式实现，或待 dawn_im 架构稳定后统一处理 | 已通过 [DawnIM 多话题映射 thread 设计](../superpowers/specs/2026-06-14-dawn-im-multi-topic-design.md) + [实施计划](../superpowers/plans/2026-06-14-dawn-im-multi-topic.md)（方案 ζ）重新设计完成。**不照搬原 PR**：跳过 SettingFlags 重构；新增 `ChannelOrigin.topic` 暴露给工具栈；offline batch 按 topic 拆分；继续用 `setting: Option<u32>` + `Some(8u32)` |
 | **#46** | refactor: rename xuanji tools to generic dawn task tools | ✅ 已迁移 | P3 | `dawn_task.rs` / `dawn_agents.rs` 在 0.8.0 均不存在；需与 #39 捆绑，按 0.8.0 的 `dawn_im` + `dawn-tools` crate 架构重写 | 已迁移完成。`dawn_task.rs`（任务类型配置）进 zeroclaw-config；`task.rs`（工具实现 `CreateTaskTool` / `QueryTaskTool`）进 dawn-tools crate；新增 `ToolKind::DawnTask` 归属。**后续通过 [解耦设计](../superpowers/specs/2026-06-14-dawn-tools-channel-decoupling-design.md) + [实施计划](../superpowers/plans/2026-06-14-dawn-tools-channel-decoupling.md) 把配置项扩展为 `DawnTaskExecutorConfig` (channel + recipient)，允许任意 channel 充当 task executor** |
 
 ---
