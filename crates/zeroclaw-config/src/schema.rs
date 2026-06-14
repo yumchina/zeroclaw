@@ -148,7 +148,7 @@ pub struct Config {
     /// `dawn_create_task` / `dawn_query_task` tools to route tasks to the
     /// correct Agent on the Dawn platform.
     #[serde(default)]
-    pub dawn_task: crate::dawn_task::DawnTasks,
+    pub dawn_task: crate::dawn_task::DawnTaskExecutors,
 
     /// Trust scoring and regression detection configuration (`[trust]`).
     #[serde(default)]
@@ -14749,7 +14749,7 @@ impl Default for Config {
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             observability: ObservabilityConfig::default(),
-            dawn_task: crate::dawn_task::DawnTasks::default(),
+            dawn_task: crate::dawn_task::DawnTaskExecutors::default(),
             trust: crate::scattered_types::TrustConfig::default(),
             backup: BackupConfig::default(),
             data_retention: DataRetentionConfig::default(),
@@ -19369,7 +19369,7 @@ auto_save = true
                 backend: "log".into(),
                 ..ObservabilityConfig::default()
             },
-            dawn_task: crate::dawn_task::DawnTasks::default(),
+            dawn_task: crate::dawn_task::DawnTaskExecutors::default(),
             risk_profiles: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -20124,7 +20124,7 @@ default_temperature = 0.7
             data_dir: dir.join("workspace"),
             config_path: config_path.clone(),
             observability: ObservabilityConfig::default(),
-            dawn_task: crate::dawn_task::DawnTasks::default(),
+            dawn_task: crate::dawn_task::DawnTaskExecutors::default(),
             trust: crate::scattered_types::TrustConfig::default(),
             backup: BackupConfig::default(),
             data_retention: DataRetentionConfig::default(),

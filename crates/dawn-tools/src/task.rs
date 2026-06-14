@@ -33,7 +33,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use zeroclaw_api::tool::{Tool, ToolResult};
 use zeroclaw_api::tool_attribution;
-use zeroclaw_config::dawn_task::{DawnTaskConfig, DawnTasks};
+use zeroclaw_config::dawn_task::DawnTaskExecutorConfig;
 use zeroclaw_config::schema::Config;
 
 // ── Bridge primitives ──────────────────────────────────────────────
@@ -111,9 +111,9 @@ fn resolve_la_id(config: &Arc<Config>, alias: &str) -> Option<String> {
     config.channels.dawnim.get(alias).map(|c| c.uid.clone())
 }
 
-/// Resolve a single task entry from canonical config. Cloning out is
+/// Resolve a single executor entry from canonical config. Cloning out is
 /// fine here — the entry is at most a few short strings.
-fn resolve_task(config: &Arc<Config>, task_type: u8) -> Option<DawnTaskConfig> {
+fn resolve_executor(config: &Arc<Config>, task_type: u8) -> Option<DawnTaskExecutorConfig> {
     config.dawn_task.get_by_type(task_type).cloned()
 }
 
@@ -176,7 +176,7 @@ impl Tool for CreateTaskTool {
             .and_then(|v| v.as_u64())
             .ok_or_else(|| anyhow::anyhow!("缺少 type 参数"))? as u8;
 
-        let task = resolve_task(&self.config, task_type)
+        let task = resolve_executor(&self.config, task_type)
             .ok_or_else(|| anyhow::anyhow!("未配置 type={} 的 Dawn 任务", task_type))?;
 
         let ctx = read_context();
@@ -213,7 +213,7 @@ impl Tool for CreateTaskTool {
 
         let msg = TaskMessage {
             channel_alias: ctx.channel_alias.clone(),
-            recipient: task.uid.clone(),
+            recipient: task.recipient.clone(),
             channel_type: 1,
             payload,
         };
@@ -284,7 +284,7 @@ impl Tool for QueryTaskTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("缺少 task_id 参数"))?;
 
-        let task = resolve_task(&self.config, task_type)
+        let task = resolve_executor(&self.config, task_type)
             .ok_or_else(|| anyhow::anyhow!("未配置 type={} 的 Dawn 任务", task_type))?;
 
         let ctx = read_context();
@@ -311,7 +311,7 @@ impl Tool for QueryTaskTool {
 
         let msg = TaskMessage {
             channel_alias: ctx.channel_alias.clone(),
-            recipient: task.uid.clone(),
+            recipient: task.recipient.clone(),
             channel_type: 1,
             payload,
         };
@@ -346,7 +346,8 @@ token = ""
 device_id = "test-device"
 
 [dawn_task.1]
-uid = "1878_xuanji_agent"
+channel = "dawnim.work"
+recipient = "1878_xuanji_agent"
 name = "璇玑"
 description = "doc extraction"
 "#

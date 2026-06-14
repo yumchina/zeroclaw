@@ -886,7 +886,7 @@ pub fn all_tools_with_runtime(
     // build is harmless — the LLM just sees them and either picks a config'd
     // type or gets a clear error back.
     #[cfg(feature = "dawn-tools")]
-    if !root_config.dawn_task.tasks.is_empty() {
+    if !root_config.dawn_task.executors.is_empty() {
         let cfg_arc = Arc::new(root_config.clone());
         tool_arcs.push(Arc::new(CreateTaskTool::new(cfg_arc.clone())));
         tool_arcs.push(Arc::new(QueryTaskTool::new(cfg_arc)));
@@ -895,7 +895,7 @@ pub fn all_tools_with_runtime(
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Register)
                 .with_outcome(::zeroclaw_log::EventOutcome::Success)
                 .with_attrs(::serde_json::json!({
-                    "task_types": root_config.dawn_task.tasks.keys().collect::<Vec<_>>(),
+                    "task_types": root_config.dawn_task.executors.keys().collect::<Vec<_>>(),
                 })),
             "dawn_task: dawn_create_task / dawn_query_task registered"
         );
