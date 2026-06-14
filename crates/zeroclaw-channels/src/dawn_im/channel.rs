@@ -66,6 +66,16 @@ struct SyncState {
     channel_seqs: HashMap<String, u32>,
 }
 
+/// Normalise a DawnIM `topic` field into an Option<String> suitable for
+/// `ChannelMessage.thread_ts`. The DawnIM protocol uses `"0"` and `""`
+/// as sentinels for "no topic"; both map to `None` so historical
+/// single-thread conversations get the legacy session key unchanged.
+fn topic_to_thread(topic: Option<&str>) -> Option<String> {
+    topic
+        .filter(|t| !t.is_empty() && *t != "0")
+        .map(ToString::to_string)
+}
+
 #[derive(Clone)]
 #[allow(dead_code)]
 pub struct DawnIMChannel {
@@ -1598,5 +1608,30 @@ mod send_kind_dispatch_tests {
             err_str.contains("not connected") || err_str.contains("RPC"),
             "expected WS-layer error, got: {err_str}"
         );
+    }
+}
+
+#[cfg(test)]
+mod topic_to_thread_tests {
+    use super::topic_to_thread;
+
+    #[test]
+    fn none_maps_to_none() {
+        assert_eq!(topic_to_thread(None), None);
+    }
+
+    #[test]
+    fn empty_string_maps_to_none() {
+        assert_eq!(topic_to_thread(Some("")), None);
+    }
+
+    #[test]
+    fn zero_sentinel_maps_to_none() {
+        assert_eq!(topic_to_thread(Some("0")), None);
+    }
+
+    #[test]
+    fn real_topic_maps_to_some() {
+        assert_eq!(topic_to_thread(Some("db_lock")), Some("db_lock".to_string()));
     }
 }
