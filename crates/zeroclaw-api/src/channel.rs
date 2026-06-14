@@ -89,6 +89,32 @@ pub struct ChannelMessage {
     pub subject: Option<String>,
 }
 
+/// 消息类型分类。决定 `Channel::send` 实现走哪条编码路径。
+///
+/// `Text` 是默认值,与 0.8.0 现有 30+ channel 行为一致。`TaskSubmit` /
+/// `TaskQuery` 用于通过 channel 把任务投递给外部 executor — 仅由
+/// `dawn_create_task` / `dawn_query_task` 工具构造,并由配置中
+/// `[dawn_task.<n>].channel` 显式指定目标 channel。
+#[derive(Debug, Clone, Default)]
+pub enum SendKind {
+    /// 普通用户对话消息。
+    #[default]
+    Text,
+    /// 提交任务给 channel 对端的外部 executor。
+    TaskSubmit {
+        task_type: u8,
+        user_id: String,
+        user_text: String,
+        params: serde_json::Value,
+    },
+    /// 查询任务状态。
+    TaskQuery {
+        task_type: u8,
+        user_id: String,
+        task_id: String,
+    },
+}
+
 /// Message to send through a channel
 #[derive(Debug, Clone)]
 pub struct SendMessage {
@@ -626,5 +652,47 @@ mod progress_update_tests {
             }
             _ => panic!("expected ToolDone phase"),
         }
+    }
+}
+
+#[cfg(test)]
+mod send_kind_tests {
+    use super::*;
+
+    #[test]
+    fn send_kind_default_is_text() {
+        assert!(matches!(SendKind::default(), SendKind::Text));
+    }
+
+    #[test]
+    fn send_kind_task_submit_holds_fields() {
+        let kind = SendKind::TaskSubmit {
+            task_type: 7,
+            user_id: "u_alice".into(),
+            user_text: "extract this pdf".into(),
+            params: serde_json::json!({"files": []}),
+        };
+        match kind {
+            SendKind::TaskSubmit { task_type, user_id, user_text, params } => {
+                assert_eq!(task_type, 7);
+                assert_eq!(user_id, "u_alice");
+                assert_eq!(user_text, "extract this pdf");
+                assert_eq!(params["files"], serde_json::json!([]));
+            }
+            _ => panic!("expected TaskSubmit"),
+        }
+    }
+
+    #[test]
+    fn send_kind_task_query_holds_fields() {
+        let kind = SendKind::TaskQuery {
+            task_type: 7,
+            user_id: "u_alice".into(),
+            task_id: "task_xyz".into(),
+        };
+        assert!(matches!(
+            kind,
+            SendKind::TaskQuery { task_type: 7, .. }
+        ));
     }
 }
