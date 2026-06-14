@@ -17,6 +17,7 @@ zeroclaw-providers.workspace = true
 zeroclaw-runtime.workspace = true
 zeroclaw-tool-call-parser.workspace = true
 zeroclaw-tools.workspace = true
+dawn-tools.workspace = true
 anyhow = "1.0"
 lru = "0.16"
 rumqttc = { version = "0.25", optional = true }

@@ -842,6 +842,43 @@ impl DawnIMChannel {
         Ok(())
     }
 
+    /// Send a structured CMD payload (typically `{type: 2000, cmd, param}`)
+    /// to another DawnIM Agent.
+    ///
+    /// Used by the `dawn_create_task` / `dawn_query_task` tools via the
+    /// channel bridge: the tools push a [`crate::dawn_im::channel::DawnIMChannel`]-
+    /// agnostic message onto an mpsc, and the bridge listener picks the
+    /// right channel by alias and calls this method.
+    ///
+    /// The `payload` is serialised to JSON, base64-encoded (DawnIM
+    /// `SendParams.payload` contract), and shipped via `send_rpc("send")`
+    /// — no extra encapsulation, no reply correlation.
+    pub async fn send_status_message(
+        &self,
+        recipient: &str,
+        channel_type: u8,
+        payload: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let payload_bytes = serde_json::to_vec(&payload)?;
+        let payload_b64 =
+            base64::engine::general_purpose::STANDARD.encode(&payload_bytes);
+        let params = SendParams {
+            from_uid: Some(self.uid.clone()),
+            client_msg_no: Uuid::new_v4().to_string(),
+            channel_id: recipient.to_string(),
+            channel_type,
+            payload: serde_json::Value::String(payload_b64),
+            header: None,
+            setting: None,
+            msg_key: None,
+            expire: None,
+            stream_no: None,
+            topic: None,
+        };
+        let _: serde_json::Value = self.send_rpc("send", params).await?;
+        Ok(())
+    }
+
     async fn process_offline_batch(
         &self,
         messages: Vec<RecvNotificationParams>,

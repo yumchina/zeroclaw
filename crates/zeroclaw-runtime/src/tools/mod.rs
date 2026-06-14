@@ -119,11 +119,15 @@ pub use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
 
 // Optional Dawn SaaS integration tools (separate crate, feature-gated).
 #[cfg(feature = "dawn-tools")]
+pub use dawn_tools::CreateTaskTool;
+#[cfg(feature = "dawn-tools")]
 pub use dawn_tools::DawnCrawlTool;
 #[cfg(feature = "dawn-tools")]
 pub use dawn_tools::DawnS3Tool;
 #[cfg(feature = "dawn-tools")]
 pub use dawn_tools::DawnWebSearchTool;
+#[cfg(feature = "dawn-tools")]
+pub use dawn_tools::QueryTaskTool;
 
 // Traits from zeroclaw-api
 pub use zeroclaw_api::schema::{CleaningStrategy, SchemaCleanr};
@@ -873,6 +877,28 @@ pub fn all_tools_with_runtime(
                 "dawn.crawl: tool registered"
             );
         }
+    }
+
+    // ── Dawn task tools (dawn_create_task / dawn_query_task) ──
+    // Always registered when the dawn-tools feature is on; gating per-task-type
+    // happens in `[dawn_task.<n>]` config. Tools refuse to execute outside a
+    // DawnIM context (channel_alias empty), so registering them in a non-DawnIM
+    // build is harmless — the LLM just sees them and either picks a config'd
+    // type or gets a clear error back.
+    #[cfg(feature = "dawn-tools")]
+    if !root_config.dawn_task.tasks.is_empty() {
+        let cfg_arc = Arc::new(root_config.clone());
+        tool_arcs.push(Arc::new(CreateTaskTool::new(cfg_arc.clone())));
+        tool_arcs.push(Arc::new(QueryTaskTool::new(cfg_arc)));
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Register)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({
+                    "task_types": root_config.dawn_task.tasks.keys().collect::<Vec<_>>(),
+                })),
+            "dawn_task: dawn_create_task / dawn_query_task registered"
+        );
     }
 
     if web_fetch_config.enabled {

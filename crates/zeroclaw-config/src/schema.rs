@@ -144,6 +144,12 @@ pub struct Config {
     #[nested]
     pub observability: ObservabilityConfig,
 
+    /// Dawn task type configuration (`[dawn_task]`). Used by the
+    /// `dawn_create_task` / `dawn_query_task` tools to route tasks to the
+    /// correct Agent on the Dawn platform.
+    #[serde(default)]
+    pub dawn_task: crate::dawn_task::DawnTasks,
+
     /// Trust scoring and regression detection configuration (`[trust]`).
     #[serde(default)]
     #[nested]
@@ -9735,6 +9741,7 @@ impl RiskProfileConfig {
             enabled: self.sandbox_enabled,
             backend,
             firejail_args: self.firejail_args.clone(),
+            network_outbound_allow: Vec::new(),
         }
     }
 }
@@ -13664,6 +13671,21 @@ pub struct SandboxConfig {
     /// Custom Firejail arguments (when backend = firejail)
     #[serde(default)]
     pub firejail_args: Vec<String>,
+
+    /// Trusted outbound network hosts to allow from sandboxed child processes,
+    /// in `host:port` form. macOS Seatbelt denies all network by default, so
+    /// any skill that needs to talk to a real API must be allow-listed here.
+    /// Each entry is rendered as a `(allow network-outbound (remote tcp
+    /// "host:port"))` rule in the generated seatbelt policy. Leave empty to
+    /// keep the default localhost-only outbound.
+    ///
+    /// **Platform caveats**: macOS `sandbox-exec` only accepts
+    /// `(remote ip "localhost:port")` or `(remote ip "*:port")` — per-host
+    /// allow lists are not supported; this field is a no-op on macOS.
+    /// Linux Landlock ignores it. Linux Firejail/Bubblewrap/Docker pass the
+    /// entries to the backend's network filter where supported.
+    #[serde(default)]
+    pub network_outbound_allow: Vec<String>,
 }
 
 impl Default for SandboxConfig {
@@ -13672,6 +13694,7 @@ impl Default for SandboxConfig {
             enabled: None, // Auto-detect
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            network_outbound_allow: Vec::new(),
         }
     }
 }
@@ -14726,6 +14749,7 @@ impl Default for Config {
             model_routes: Vec::new(),
             embedding_routes: Vec::new(),
             observability: ObservabilityConfig::default(),
+            dawn_task: crate::dawn_task::DawnTasks::default(),
             trust: crate::scattered_types::TrustConfig::default(),
             backup: BackupConfig::default(),
             data_retention: DataRetentionConfig::default(),
@@ -19345,6 +19369,7 @@ auto_save = true
                 backend: "log".into(),
                 ..ObservabilityConfig::default()
             },
+            dawn_task: crate::dawn_task::DawnTasks::default(),
             risk_profiles: {
                 let mut m = HashMap::new();
                 m.insert(
@@ -20099,6 +20124,7 @@ default_temperature = 0.7
             data_dir: dir.join("workspace"),
             config_path: config_path.clone(),
             observability: ObservabilityConfig::default(),
+            dawn_task: crate::dawn_task::DawnTasks::default(),
             trust: crate::scattered_types::TrustConfig::default(),
             backup: BackupConfig::default(),
             data_retention: DataRetentionConfig::default(),

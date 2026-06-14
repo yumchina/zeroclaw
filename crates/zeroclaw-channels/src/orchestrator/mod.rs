@@ -4645,6 +4645,22 @@ async fn process_channel_message_body(
             collector: std::sync::Arc::clone(&tool_receipts_collector),
         }
     });
+    // Per-turn context for Dawn task tools (dawn_create_task /
+    // dawn_query_task). Parsed from the inbound message's sender + channel
+    // metadata so the tool can both identify the originating user and route
+    // the task message back through the same DawnIM channel alias.
+    // For non-DawnIM channels, `channel_alias` is empty and the tools
+    // refuse to execute — matches the original PR's tool-availability scope.
+    let task_ctx = dawn_tools::TaskContext {
+        from_uid: msg
+            .sender
+            .split("_la_")
+            .next()
+            .unwrap_or(msg.sender.as_str())
+            .to_string(),
+        reply_target: msg.reply_target.clone(),
+        channel_alias: msg.channel_alias.clone().unwrap_or_default(),
+    };
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {
             let loop_result = tokio::select! {
@@ -4661,6 +4677,8 @@ async fn process_channel_message_body(
                             cost_tracking_context.clone(),
                         zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT.scope(
                             receipt_scope.clone(),
+                        dawn_tools::TASK_CONTEXT.scope(
+                            task_ctx.clone(),
                         run_tool_call_loop(
                         active_model_provider.as_ref(),
                         &mut history,
@@ -4706,6 +4724,7 @@ async fn process_channel_message_body(
                         ctx.receipt_generator
                             .as_ref()
                             .map(|_| tool_receipts_collector.as_ref()),
+                    ),
                     ),
                     ),
                     ),
@@ -6640,6 +6659,7 @@ pub fn build_channel_map(
 ) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
     let config_arc = Arc::new(RwLock::new(config.clone()));
     collect_configured_channels(&config_arc, "", &[])
+        .channels
         .into_iter()
         .map(|ch| {
             let key = composite_channel_key(ch.channel.name(), ch.alias.as_deref());
@@ -6663,7 +6683,7 @@ pub fn register_channels_for_tools(
     escalate_handle: &Option<tools::PerToolChannelHandle>,
 ) -> Vec<String> {
     let config_arc = Arc::new(RwLock::new(config.clone()));
-    let configured = collect_configured_channels(&config_arc, "", &[]);
+    let configured = collect_configured_channels(&config_arc, "", &[]).channels;
 
     let handles = [
         ask_user_handle.as_ref(),
@@ -6695,15 +6715,32 @@ fn matrix_state_dir(config_path: &std::path::Path, alias: &str) -> std::path::Pa
         .unwrap_or_else(|| std::path::PathBuf::from(".zeroclaw/state/matrix").join(alias))
 }
 
+/// Output of [`collect_configured_channels`]. `dawn_im_channels` carries
+/// concretely-typed clones of every active DawnIM channel keyed by alias,
+/// so the channel supervisor can wire a tool→channel bridge listener
+/// against the same `Arc` instances that ship to the supervisor — no
+/// second `from_config` call (which would open a duplicate WebSocket).
+/// Empty when no DawnIM channels are configured.
+#[cfg_attr(not(feature = "channel-dawnIM"), allow(dead_code))]
+#[derive(Default)]
+struct CollectedChannels {
+    channels: Vec<ConfiguredChannel>,
+    #[cfg(feature = "channel-dawnIM")]
+    dawn_im_channels: HashMap<String, Arc<crate::dawn_im::DawnIMChannel>>,
+}
+
 fn collect_configured_channels(
     config_arc: &Arc<RwLock<Config>>,
     matrix_skip_context: &str,
     tool_specs: &[(String, String)],
-) -> Vec<ConfiguredChannel> {
+) -> CollectedChannels {
     let _ = matrix_skip_context;
     let _ = tool_specs;
     #[allow(unused_mut)]
     let mut channels = Vec::new();
+    #[cfg(feature = "channel-dawnIM")]
+    let mut dawn_im_channels: HashMap<String, Arc<crate::dawn_im::DawnIMChannel>> =
+        HashMap::new();
 
     // Shadow `config` with a read guard so the existing body keeps
     // working via `Deref<Target = Config>`. Resolver closures that
@@ -6957,15 +6994,17 @@ fn collect_configured_channels(
                     continue;
                 }
             };
+        let dawn_arc = Arc::new(DawnIMChannel::from_config(
+            wk,
+            alias.clone(),
+            &config.data_dir,
+            memory,
+        ));
+        dawn_im_channels.insert(alias.clone(), dawn_arc.clone());
         channels.push(ConfiguredChannel {
             display_name: "DawnIM",
             alias: Some(alias.clone()),
-            channel: Arc::new(DawnIMChannel::from_config(
-                wk,
-                alias.clone(),
-                &config.data_dir,
-                memory,
-            )),
+            channel: dawn_arc,
         });
     }
 
@@ -8153,7 +8192,11 @@ fn collect_configured_channels(
         );
     }
 
-    channels
+    CollectedChannels {
+        channels,
+        #[cfg(feature = "channel-dawnIM")]
+        dawn_im_channels,
+    }
 }
 
 fn no_real_time_channels_message() -> &'static str {
@@ -8164,7 +8207,7 @@ fn no_real_time_channels_message() -> &'static str {
 pub async fn doctor_channels(config: Config) -> Result<()> {
     let config_arc = Arc::new(RwLock::new(config));
     #[allow(unused_mut)]
-    let mut channels = collect_configured_channels(&config_arc, "health check", &[]);
+    let mut channels = collect_configured_channels(&config_arc, "health check", &[]).channels;
 
     #[cfg(feature = "channel-nostr")]
     {
@@ -8903,8 +8946,11 @@ pub async fn start_channels(
             }
 
             #[allow(unused_mut)]
-            let mut configured_channels: Vec<ConfiguredChannel> =
-                collect_configured_channels(&config_arc, "runtime startup", &tool_specs);
+            let CollectedChannels {
+                channels: mut configured_channels,
+                #[cfg(feature = "channel-dawnIM")]
+                    dawn_im_channels: dawn_im_channels_for_bridge,
+            } = collect_configured_channels(&config_arc, "runtime startup", &tool_specs);
 
             #[cfg(feature = "channel-nostr")]
             if let Some((alias, ns)) = config.channels.nostr.iter().next() {
@@ -8950,6 +8996,90 @@ pub async fn start_channels(
                 );
                 cancel.cancelled().await;
                 return Ok(());
+            }
+
+            // ── Tool → DawnIM bridge ───────────────────────────────
+            // Spawn a listener that consumes TaskMessages pushed by the
+            // dawn_create_task / dawn_query_task tools and forwards them
+            // through the correct DawnIMChannel by alias. The mpsc sender
+            // is installed via dawn_tools::set_channel_bridge; on
+            // /admin/reload this whole start_channels body re-runs, so
+            // set_channel_bridge swaps in the fresh sender — old listener
+            // exits when its rx drops.
+            #[cfg(feature = "channel-dawnIM")]
+            if !dawn_im_channels_for_bridge.is_empty() {
+                let (bridge_tx, mut bridge_rx) =
+                    tokio::sync::mpsc::unbounded_channel::<dawn_tools::TaskMessage>();
+                dawn_tools::set_channel_bridge(bridge_tx);
+                let channels_by_alias = dawn_im_channels_for_bridge.clone();
+                tokio::spawn(async move {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::Note,
+                        )
+                        .with_attrs(::serde_json::json!({
+                            "aliases": channels_by_alias.keys().collect::<Vec<_>>(),
+                        })),
+                        "Bridge listener started (Tool → DawnIM)"
+                    );
+                    while let Some(msg) = bridge_rx.recv().await {
+                        let Some(channel) = channels_by_alias.get(&msg.channel_alias) else {
+                            ::zeroclaw_log::record!(
+                                WARN,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Note,
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({
+                                    "alias": msg.channel_alias,
+                                    "recipient": msg.recipient,
+                                })),
+                                "Bridge: no DawnIM channel for alias, dropping message"
+                            );
+                            continue;
+                        };
+                        // Per-message spawn isolates failures: a stuck
+                        // send_status_message on one message doesn't block
+                        // the listener loop from processing the next.
+                        let channel = channel.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = channel
+                                .send_status_message(
+                                    &msg.recipient,
+                                    msg.channel_type,
+                                    msg.payload,
+                                )
+                                .await
+                            {
+                                ::zeroclaw_log::record!(
+                                    ERROR,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail,
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                    .with_attrs(::serde_json::json!({
+                                        "alias": msg.channel_alias,
+                                        "recipient": msg.recipient,
+                                        "error": e.to_string(),
+                                    })),
+                                    "Bridge: forward to DawnIM failed"
+                                );
+                            }
+                        });
+                    }
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::Note,
+                        ),
+                        "Bridge listener stopped (rx closed)"
+                    );
+                });
             }
 
             println!("🦀 ZeroClaw Channel Server");
@@ -17814,7 +17944,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[]);
+        let channels = collect_configured_channels(&config_arc, "test", &[]).channels;
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Email"),
             "email with no agent reference should not be collected"

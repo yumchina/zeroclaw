@@ -280,6 +280,7 @@ mod tests {
             enabled: Some(false),
             backend: SandboxBackend::None,
             firejail_args: Vec::new(),
+            network_outbound_allow: Vec::new(),
         };
         let sandbox = create_sandbox(&sandbox_cfg, "", None);
         assert_eq!(sandbox.name(), "none");
@@ -291,6 +292,7 @@ mod tests {
             enabled: None, // Auto-detect
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            network_outbound_allow: Vec::new(),
         };
         let sandbox = create_sandbox(&sandbox_cfg, "", None);
         // Should return some sandbox (at least NoopSandbox)
@@ -314,6 +316,7 @@ mod tests {
             enabled: None,
             backend: SandboxBackend::Docker,
             firejail_args: Vec::new(),
+            network_outbound_allow: Vec::new(),
         };
         let sandbox = create_sandbox(&sandbox_cfg, "native", None);
         // If Docker is available, it will be selected; if not, NoopSandbox fallback.
