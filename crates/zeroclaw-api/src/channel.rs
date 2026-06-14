@@ -116,6 +116,32 @@ pub enum SendKind {
     },
 }
 
+/// Per-turn origin context for an agent invocation: identifies which user
+/// from which channel instance triggered the current `run_tool_call_loop`.
+/// Constructed by the orchestrator when an inbound `ChannelMessage` is
+/// processed, scoped via [`CHANNEL_ORIGIN`], and read by channel-aware
+/// tools (e.g. `dawn_create_task`) via `try_with`.
+#[derive(Clone, Default, Debug)]
+pub struct ChannelOrigin {
+    /// Originating user id, with any channel-specific suffix (e.g.
+    /// `_la_<bot_uid>` on DawnIM) already stripped.
+    pub from_uid: String,
+    /// Composite channel ref `"<type>.<alias>"`, e.g. `"dawnim.work"`.
+    pub channel_ref: String,
+    /// Original `ChannelMessage.reply_target` value, preserved verbatim
+    /// so reply paths reconstruct correctly.
+    pub reply_target: String,
+}
+
+tokio::task_local! {
+    /// Per-turn channel origin. The orchestrator's
+    /// `process_channel_message_body` calls `CHANNEL_ORIGIN.scope(...)`
+    /// around `run_tool_call_loop`; tools that need to know where the
+    /// inbound message came from read it with
+    /// `CHANNEL_ORIGIN.try_with(|o| o.clone()).unwrap_or_default()`.
+    pub static CHANNEL_ORIGIN: ChannelOrigin;
+}
+
 /// Message to send through a channel
 #[derive(Debug, Clone)]
 pub struct SendMessage {
@@ -695,5 +721,41 @@ mod send_kind_tests {
             kind,
             SendKind::TaskQuery { task_type: 7, .. }
         ));
+    }
+}
+
+#[cfg(test)]
+mod channel_origin_tests {
+    use super::*;
+
+    #[test]
+    fn channel_origin_default_is_empty() {
+        let o = ChannelOrigin::default();
+        assert!(o.from_uid.is_empty());
+        assert!(o.channel_ref.is_empty());
+        assert!(o.reply_target.is_empty());
+    }
+
+    #[tokio::test]
+    async fn channel_origin_scope_round_trip() {
+        let origin = ChannelOrigin {
+            from_uid: "u_alice".into(),
+            channel_ref: "dawnim.work".into(),
+            reply_target: "1:u_alice".into(),
+        };
+        let read_back = CHANNEL_ORIGIN
+            .scope(origin.clone(), async {
+                CHANNEL_ORIGIN.try_with(|o| o.clone()).unwrap()
+            })
+            .await;
+        assert_eq!(read_back.from_uid, "u_alice");
+        assert_eq!(read_back.channel_ref, "dawnim.work");
+        assert_eq!(read_back.reply_target, "1:u_alice");
+    }
+
+    #[tokio::test]
+    async fn channel_origin_outside_scope_is_default() {
+        let result = CHANNEL_ORIGIN.try_with(|o| o.clone()).unwrap_or_default();
+        assert!(result.from_uid.is_empty());
     }
 }
