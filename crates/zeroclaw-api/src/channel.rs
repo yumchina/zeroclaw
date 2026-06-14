@@ -529,6 +529,23 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
     }
 }
 
+/// Late-bound channel registry handle: `Arc<RwLock<HashMap<channel_key, Arc<dyn Channel>>>>`.
+///
+/// Tools that need to send outbound messages take an `Arc` clone of this
+/// at construction. The orchestrator populates the inner `HashMap` after
+/// channels start up (`register_channels_for_tools`), so tools resolve a
+/// concrete `Arc<dyn Channel>` by composite key (`"<type>.<alias>"`,
+/// e.g. `"dawnim.work"`) at execute time.
+///
+/// Reload-safe: `/admin/reload` rebuilds tools and channels in lockstep;
+/// the `Arc<RwLock<_>>` outer wrapper means tool handles outlive any
+/// individual channel instance.
+pub type PerToolChannelHandle = std::sync::Arc<
+    parking_lot::RwLock<
+        std::collections::HashMap<String, std::sync::Arc<dyn Channel>>,
+    >,
+>;
+
 #[cfg(test)]
 mod tests {
     use super::*;

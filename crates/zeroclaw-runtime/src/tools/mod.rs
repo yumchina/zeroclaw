@@ -173,13 +173,8 @@ use std::sync::Arc;
 use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 use zeroclaw_memory::Memory;
 
-/// Per-tool channel-map handle — `Arc<RwLock<HashMap<channel_name, channel>>>`.
-///
-/// Each channel-driven tool owns its own handle so callers can populate it
-/// independently (late-bound registration). Shared alias of the same
-/// underlying type formerly known as `ChannelMapHandle`.
-pub type PerToolChannelHandle =
-    Arc<RwLock<HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>>>;
+/// Late-bound channel registry handle (re-exported from `zeroclaw-api`).
+pub use zeroclaw_api::channel::PerToolChannelHandle;
 
 /// Shared handle to the delegate tool's parent-tools list.
 /// Callers can push additional tools (e.g. MCP wrappers) after construction.
@@ -425,6 +420,11 @@ pub struct AllToolsResult {
     pub reaction_handle: PerToolChannelHandle,
     pub poll_handle: Option<PerToolChannelHandle>,
     pub escalate_handle: Option<PerToolChannelHandle>,
+    /// Late-bound channel registry for dawn-tools task submission.
+    /// Populated by `orchestrator::register_channels_for_tools` after
+    /// channels start; `CreateTaskTool` and `QueryTaskTool` resolve the
+    /// `Arc<dyn Channel>` from here at execute time.
+    pub task_channel_handle: PerToolChannelHandle,
     /// Pre-boxed Arcs of every tool (before policy filter). Used by
     /// skill-scoped builtin elevation to resolve targets at registration.
     pub unfiltered_tool_arcs: Vec<Arc<dyn Tool>>,
@@ -602,6 +602,12 @@ pub fn all_tools_with_runtime(
         Arc::new(WeatherTool::new()),
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
     ];
+
+    // Task channel handle for dawn-tools; always created (even without
+    // dawn-tools feature) so AllToolsResult always returns it. Created early
+    // so the dawn-tools block (which comes before the ask_user/reaction handles)
+    // can reference it.
+    let task_channel_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
 
     // A SubAgent runs as an ephemeral clone of its parent and inherits the
     // parent's model verbatim; it must not be able to switch the active
@@ -888,8 +894,14 @@ pub fn all_tools_with_runtime(
     #[cfg(feature = "dawn-tools")]
     if !root_config.dawn_task.executors.is_empty() {
         let cfg_arc = Arc::new(root_config.clone());
-        tool_arcs.push(Arc::new(CreateTaskTool::new(cfg_arc.clone())));
-        tool_arcs.push(Arc::new(QueryTaskTool::new(cfg_arc)));
+        tool_arcs.push(Arc::new(CreateTaskTool::new(
+            cfg_arc.clone(),
+            task_channel_handle.clone(),
+        )));
+        tool_arcs.push(Arc::new(QueryTaskTool::new(
+            cfg_arc,
+            task_channel_handle.clone(),
+        )));
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Register)
@@ -1319,6 +1331,7 @@ pub fn all_tools_with_runtime(
                     reaction_handle,
                     poll_handle: Some(poll_handle),
                     escalate_handle,
+                    task_channel_handle,
                 };
             }
 
@@ -1517,6 +1530,7 @@ pub fn all_tools_with_runtime(
         reaction_handle,
         poll_handle: Some(poll_handle),
         escalate_handle,
+        task_channel_handle,
     }
 }
 

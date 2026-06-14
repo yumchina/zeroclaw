@@ -127,11 +127,24 @@ fn resolve_executor(config: &Arc<Config>, task_type: u8) -> Option<DawnTaskExecu
 /// `dawn-tools` tools (`DawnS3Tool`, `DawnWebSearchTool`, `DawnCrawlTool`).
 pub struct CreateTaskTool {
     config: Arc<Config>,
+    /// Late-bound channel registry; populated by
+    /// `orchestrator::register_channels_for_tools` at startup. Used by
+    /// `execute` to look up the `Arc<dyn Channel>` named in the matching
+    /// `[dawn_task.<n>].channel` config entry.
+    ///
+    /// Unused until Task 8 swaps the legacy bridge call path for the
+    /// channel-handle call path; suppressed warning lets the field land
+    /// in T6 without touching execute().
+    #[allow(dead_code)]
+    channels: zeroclaw_api::channel::PerToolChannelHandle,
 }
 
 impl CreateTaskTool {
-    pub fn new(config: Arc<Config>) -> Self {
-        Self { config }
+    pub fn new(
+        config: Arc<Config>,
+        channels: zeroclaw_api::channel::PerToolChannelHandle,
+    ) -> Self {
+        Self { config, channels }
     }
 }
 
@@ -236,11 +249,24 @@ impl Tool for CreateTaskTool {
 /// Tool: query the status of a previously-submitted Dawn task.
 pub struct QueryTaskTool {
     config: Arc<Config>,
+    /// Late-bound channel registry; populated by
+    /// `orchestrator::register_channels_for_tools` at startup. Used by
+    /// `execute` to look up the `Arc<dyn Channel>` named in the matching
+    /// `[dawn_task.<n>].channel` config entry.
+    ///
+    /// Unused until Task 8 swaps the legacy bridge call path for the
+    /// channel-handle call path; suppressed warning lets the field land
+    /// in T6 without touching execute().
+    #[allow(dead_code)]
+    channels: zeroclaw_api::channel::PerToolChannelHandle,
 }
 
 impl QueryTaskTool {
-    pub fn new(config: Arc<Config>) -> Self {
-        Self { config }
+    pub fn new(
+        config: Arc<Config>,
+        channels: zeroclaw_api::channel::PerToolChannelHandle,
+    ) -> Self {
+        Self { config, channels }
     }
 }
 
@@ -356,6 +382,10 @@ description = "doc extraction"
         Arc::new(cfg)
     }
 
+    fn make_empty_channel_handle() -> zeroclaw_api::channel::PerToolChannelHandle {
+        std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new()))
+    }
+
     #[test]
     fn bridge_sender_none_when_unset() {
         // Use a fresh lock guard; can't reset the static, but its initial
@@ -380,7 +410,7 @@ description = "doc extraction"
     #[tokio::test]
     async fn create_task_errors_without_context() {
         let cfg = make_config_with_dawnim("work", "bot_uid_1");
-        let tool = CreateTaskTool::new(cfg);
+        let tool = CreateTaskTool::new(cfg, make_empty_channel_handle());
         // Don't scope TASK_CONTEXT — execute should bail.
         let result = tool
             .execute(json!({"type": 1, "user_text": "hi", "params": {}}))
@@ -392,7 +422,7 @@ description = "doc extraction"
     #[tokio::test]
     async fn create_task_unknown_type_errors() {
         let cfg = make_config_with_dawnim("work", "bot_uid_1");
-        let tool = CreateTaskTool::new(cfg);
+        let tool = CreateTaskTool::new(cfg, make_empty_channel_handle());
         let ctx = TaskContext {
             from_uid: "u_alice".into(),
             reply_target: "1:u_alice".into(),
@@ -411,7 +441,7 @@ description = "doc extraction"
     #[tokio::test]
     async fn create_task_unknown_alias_errors() {
         let cfg = make_config_with_dawnim("work", "bot_uid_1");
-        let tool = CreateTaskTool::new(cfg);
+        let tool = CreateTaskTool::new(cfg, make_empty_channel_handle());
         let ctx = TaskContext {
             from_uid: "u_alice".into(),
             reply_target: "1:u_alice".into(),
@@ -439,7 +469,7 @@ description = "doc extraction"
         let (tx, mut rx) = mpsc::unbounded_channel();
         set_channel_bridge(tx);
 
-        let create = CreateTaskTool::new(cfg.clone());
+        let create = CreateTaskTool::new(cfg.clone(), make_empty_channel_handle());
         let ctx = TaskContext {
             from_uid: "u_alice".into(),
             reply_target: "1:u_alice".into(),
@@ -470,7 +500,7 @@ description = "doc extraction"
         assert_eq!(msg.payload["param"]["reply_to"], "bot_uid_1");
         assert_eq!(msg.payload["param"]["reply_target"], "1:u_alice");
 
-        let query = QueryTaskTool::new(cfg);
+        let query = QueryTaskTool::new(cfg, make_empty_channel_handle());
         let query_result = TASK_CONTEXT
             .scope(ctx, async {
                 query
