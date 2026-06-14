@@ -91,11 +91,7 @@ mod tests {
             .send(&SendMessage {
                 content: "hello".into(),
                 recipient: "user".into(),
-                subject: None,
-                thread_ts: None,
-                cancellation_token: None,
-                attachments: vec![],
-                in_reply_to: None,
+                ..Default::default()
             })
             .await;
         assert!(result.is_ok());
@@ -105,15 +101,7 @@ mod tests {
     async fn cli_channel_send_empty_message() {
         let ch = CliChannel::new("cli");
         let result = ch
-            .send(&SendMessage {
-                content: String::new(),
-                recipient: String::new(),
-                subject: None,
-                thread_ts: None,
-                cancellation_token: None,
-                attachments: vec![],
-                in_reply_to: None,
-            })
+            .send(&SendMessage::default())
             .await;
         assert!(result.is_ok());
     }

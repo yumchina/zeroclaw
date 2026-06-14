@@ -143,7 +143,7 @@ tokio::task_local! {
 }
 
 /// Message to send through a channel
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SendMessage {
     pub content: String,
     pub recipient: String,
@@ -157,6 +157,11 @@ pub struct SendMessage {
     pub attachments: Vec<MediaAttachment>,
     /// Message-ID to set as In-Reply-To header (email threading).
     pub in_reply_to: Option<String>,
+    /// Message kind discriminator. Defaults to `SendKind::Text` so
+    /// existing callers that don't set this field get conversational
+    /// semantics. Task tools (`dawn_create_task` / `dawn_query_task`)
+    /// explicitly set this to `TaskSubmit` / `TaskQuery`.
+    pub kind: SendKind,
 }
 
 impl SendMessage {
@@ -170,6 +175,7 @@ impl SendMessage {
             cancellation_token: None,
             attachments: vec![],
             in_reply_to: None,
+            kind: SendKind::Text,
         }
     }
 
@@ -187,6 +193,7 @@ impl SendMessage {
             cancellation_token: None,
             attachments: vec![],
             in_reply_to: None,
+            kind: SendKind::Text,
         }
     }
 
@@ -218,6 +225,20 @@ impl SendMessage {
     pub fn with_attachments(mut self, attachments: Vec<MediaAttachment>) -> Self {
         self.attachments = attachments;
         self
+    }
+
+    /// Helper for channel implementations that only support [`SendKind::Text`]:
+    /// call this at the top of `Channel::send` to reject non-Text kinds
+    /// with a readable error that names the channel.
+    pub fn ensure_text_kind(&self, channel_name: &str) -> anyhow::Result<()> {
+        if !matches!(self.kind, SendKind::Text) {
+            anyhow::bail!(
+                "channel '{}' does not support kind={:?}",
+                channel_name,
+                self.kind,
+            );
+        }
+        Ok(())
     }
 }
 
@@ -757,5 +778,45 @@ mod channel_origin_tests {
     async fn channel_origin_outside_scope_is_default() {
         let result = CHANNEL_ORIGIN.try_with(|o| o.clone()).unwrap_or_default();
         assert!(result.from_uid.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod send_message_kind_tests {
+    use super::*;
+
+    #[test]
+    fn send_message_new_defaults_to_text_kind() {
+        let m = SendMessage::new("hello", "user");
+        assert!(matches!(m.kind, SendKind::Text));
+    }
+
+    #[test]
+    fn send_message_default_is_text_kind() {
+        let m = SendMessage::default();
+        assert!(matches!(m.kind, SendKind::Text));
+        assert!(m.content.is_empty());
+        assert!(m.recipient.is_empty());
+    }
+
+    #[test]
+    fn ensure_text_kind_accepts_text() {
+        let m = SendMessage::new("hi", "user");
+        assert!(m.ensure_text_kind("test_channel").is_ok());
+    }
+
+    #[test]
+    fn ensure_text_kind_rejects_task_submit() {
+        let mut m = SendMessage::new("", "executor_uid");
+        m.kind = SendKind::TaskSubmit {
+            task_type: 1,
+            user_id: "u".into(),
+            user_text: "x".into(),
+            params: serde_json::Value::Null,
+        };
+        let err = m.ensure_text_kind("wechat.main").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("wechat.main"), "got: {msg}");
+        assert!(msg.contains("does not support kind"), "got: {msg}");
     }
 }
