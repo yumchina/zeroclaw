@@ -1662,7 +1662,10 @@ mod topic_to_thread_tests {
 
     #[test]
     fn real_topic_maps_to_some() {
-        assert_eq!(topic_to_thread(Some("db_lock")), Some("db_lock".to_string()));
+        assert_eq!(
+            topic_to_thread(Some("db_lock")),
+            Some("db_lock".to_string())
+        );
     }
 }
 
@@ -1823,7 +1826,7 @@ mod offline_batch_topic_grouping_tests {
             token: String::new(),
             device_id: "test-device".into(),
             allowed_users: vec!["*".into()],
-            dawn_url: "http://localhost:8080".into(),  // prevent reqwest "relative URL" error
+            dawn_url: "http://localhost:8080".into(), // prevent reqwest "relative URL" error
             dawn_token: "test-token".into(),
             ..Default::default()
         };
@@ -1859,7 +1862,7 @@ mod offline_batch_topic_grouping_tests {
         // → expect 3 ChannelMessages (one per topic, no-topic counted once)
         let batch = vec![
             make_recv(1, 1, Some("A"), "a1"),
-            make_recv(2, 2, None,      "n1"),
+            make_recv(2, 2, None, "n1"),
             make_recv(3, 3, Some("A"), "a2"),
             make_recv(4, 4, Some("0"), "n2"), // sentinel — same group as None
             make_recv(5, 5, Some("B"), "b1"),
