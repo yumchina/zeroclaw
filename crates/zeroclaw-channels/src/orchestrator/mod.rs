@@ -604,7 +604,6 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
 ///
 /// Centralises the "what topic should this message belong to" decision so
 /// `resolve_session_key` and `ChannelOrigin.topic` stay consistent.
-#[allow(dead_code)] // wired into process_channel_message_body in Task 9
 fn resolve_effective_topic(
     msg: &zeroclaw_api::channel::ChannelMessage,
     channel_ref: &str,
@@ -621,13 +620,19 @@ fn resolve_effective_topic(
 
 /// Wrap `conversation_history_key` with cross-channel identity merging.
 /// Returns `unified_<master_id>` (or `unified_<master_id>_<topic>` when
-/// the inbound message carries a `thread_ts`) for 1:1 messages whose
+/// `effective_topic` is supplied) for 1:1 messages whose
 /// (channel_ref, sender) resolves to a whitelisted master id; otherwise
 /// the base key (unchanged per-channel isolation). Group chats and
 /// unconfigured identity always use the base key.
+///
+/// `effective_topic` is the topic that should drive session isolation
+/// for this message. Callers should compute it via `resolve_effective_topic`
+/// so master channels keep using `msg.thread_ts` while slave channels can
+/// fall back to a `/topic` binding when no native thread is present.
 fn resolve_session_key(
     msg: &zeroclaw_api::channel::ChannelMessage,
     identity: Option<&IdentityRuntime>,
+    effective_topic: Option<&str>,
 ) -> String {
     let base = conversation_history_key(msg);
     let Some(identity) = identity else {
@@ -645,19 +650,17 @@ fn resolve_session_key(
         .resolver
         .resolve(&channel_ref, &msg.sender, is_master)
     {
-        Some(master_id) => {
-            // Compose unified key with topic suffix when the inbound
-            // message carries `thread_ts`, so multi-topic isolation
-            // (introduced for DawnIM) continues to work for master /
-            // superuser identities. Without this suffix, all topics for
-            // a master user would flatten into the same unified session.
-            match msg.thread_ts.as_deref() {
-                Some(topic) if !topic.is_empty() => {
-                    sanitize_session_key(&format!("unified_{master_id}_{topic}"))
-                }
-                _ => sanitize_session_key(&format!("unified_{master_id}")),
+        Some(master_id) => match effective_topic {
+            // Compose unified key with topic suffix when an effective topic
+            // is present, so multi-topic isolation (introduced for DawnIM
+            // and extended to bound slave channels) continues to work for
+            // master / superuser identities. Without this suffix, all topics
+            // for a master user would flatten into the same unified session.
+            Some(topic) if !topic.is_empty() => {
+                sanitize_session_key(&format!("unified_{master_id}_{topic}"))
             }
-        }
+            _ => sanitize_session_key(&format!("unified_{master_id}")),
+        },
         None => base,
     }
 }
@@ -2650,7 +2653,10 @@ async fn handle_runtime_command_if_needed(
         return true;
     };
 
-    let sender_key = resolve_session_key(msg, ctx.identity.as_deref());
+    // Command handlers compute the session key for "this message's home";
+    // use the message's literal thread_ts. The `/topic` binding override
+    // applies to user-content messages, not command echoes.
+    let sender_key = resolve_session_key(msg, ctx.identity.as_deref(), msg.thread_ts.as_deref());
     let defaults_snapshot = runtime_defaults_snapshot(ctx);
     let mut current = get_route_selection(ctx, &sender_key, &defaults_snapshot);
 
@@ -4229,7 +4235,22 @@ async fn process_channel_message_body(
         return;
     }
 
-    let history_key = resolve_session_key(&msg, ctx.identity.as_deref());
+    // Compute the effective topic once: master channels keep using
+    // `msg.thread_ts`, slave channels fall back to a `/topic` binding
+    // when no native thread is present. Reused for both the session key
+    // and the ChannelOrigin so routing and downstream tool dispatch agree.
+    let channel_ref_for_msg = match &msg.channel_alias {
+        Some(alias) => format!("{}.{}", msg.channel, alias),
+        None => msg.channel.clone(),
+    };
+    let effective_topic = resolve_effective_topic(
+        &msg,
+        &channel_ref_for_msg,
+        ctx.identity.as_ref().map(|i| i.master_channel.as_str()),
+        ctx.topic_binding.as_deref(),
+    );
+    let history_key =
+        resolve_session_key(&msg, ctx.identity.as_deref(), effective_topic.as_deref());
     if let Some(ref store) = ctx.session_store {
         let channel_id = msg
             .channel_alias
@@ -4891,12 +4912,8 @@ async fn process_channel_message_body(
             .unwrap_or(msg.sender.as_str())
             .to_string(),
         reply_target: msg.reply_target.clone(),
-        channel_ref: msg
-            .channel_alias
-            .as_ref()
-            .map(|a| format!("{}.{}", msg.channel, a))
-            .unwrap_or_else(|| msg.channel.clone()),
-        topic: msg.thread_ts.clone(),
+        channel_ref: channel_ref_for_msg.clone(),
+        topic: effective_topic.clone(),
     };
     let loop_knobs = LoopKnobs::default();
     let (llm_result, fallback_info) = scope_provider_fallback(async {
@@ -21334,7 +21351,10 @@ mod error_code_tests {
             master_channel: "dawnim.work".to_string(),
         };
         let msg = dm("dawnim", "work", "u_alice");
-        assert_eq!(resolve_session_key(&msg, Some(&ident)), "unified_u_alice");
+        assert_eq!(
+            resolve_session_key(&msg, Some(&ident), msg.thread_ts.as_deref()),
+            "unified_u_alice"
+        );
     }
 
     #[test]
@@ -21351,7 +21371,10 @@ mod error_code_tests {
             master_channel: "dawnim.work".to_string(),
         };
         let msg = dm("lark", "work", "ou_aaa");
-        assert_eq!(resolve_session_key(&msg, Some(&ident)), "unified_u_alice");
+        assert_eq!(
+            resolve_session_key(&msg, Some(&ident), msg.thread_ts.as_deref()),
+            "unified_u_alice"
+        );
     }
 
     #[test]
@@ -21365,7 +21388,7 @@ mod error_code_tests {
         };
         let msg = dm("lark", "work", "ou_stranger");
         assert_eq!(
-            resolve_session_key(&msg, Some(&ident)),
+            resolve_session_key(&msg, Some(&ident), msg.thread_ts.as_deref()),
             conversation_history_key(&msg)
         );
     }
@@ -21374,7 +21397,7 @@ mod error_code_tests {
     fn resolve_session_key_none_identity_is_base() {
         let msg = dm("lark", "work", "ou_aaa");
         assert_eq!(
-            resolve_session_key(&msg, None),
+            resolve_session_key(&msg, None, None),
             conversation_history_key(&msg)
         );
     }
@@ -21393,7 +21416,7 @@ mod error_code_tests {
         let mut msg = dm("dawnim", "work", "u_alice");
         msg.reply_target = "group:team".to_string(); // group → no unify
         assert_eq!(
-            resolve_session_key(&msg, Some(&ident)),
+            resolve_session_key(&msg, Some(&ident), msg.thread_ts.as_deref()),
             conversation_history_key(&msg)
         );
     }
@@ -21414,7 +21437,7 @@ mod error_code_tests {
         };
         let mut msg = dm("dawnim", "work", "u_alice");
         msg.thread_ts = Some("db_lock".to_string());
-        let key = resolve_session_key(&msg, Some(&ident));
+        let key = resolve_session_key(&msg, Some(&ident), msg.thread_ts.as_deref());
         assert!(
             key.contains("unified_u_alice") && key.contains("db_lock"),
             "expected unified+topic key, got: {key}"
@@ -21436,8 +21459,62 @@ mod error_code_tests {
         };
         let msg = dm("dawnim", "work", "u_alice");
         // thread_ts is None
-        let key = resolve_session_key(&msg, Some(&ident));
+        let key = resolve_session_key(&msg, Some(&ident), msg.thread_ts.as_deref());
         assert_eq!(key, "unified_u_alice");
+    }
+
+    #[test]
+    fn resolve_session_key_uses_effective_topic_over_thread_ts() {
+        // When the caller supplies an `effective_topic` distinct from
+        // `msg.thread_ts`, the session key honours the caller-supplied
+        // topic. This is the path that wires `/topic` bindings into
+        // session routing for slave channels.
+        let identity = IdentityRuntime {
+            resolver: Arc::new(AlwaysResolves),
+            master_channel: "dawnim.work".to_string(),
+        };
+        let msg = test_msg("feishu", Some("work"), Some("ignored_native"), "u_alice");
+        let key = resolve_session_key(&msg, Some(&identity), Some("bound_topic"));
+        assert_eq!(
+            key,
+            zeroclaw_api::session_keys::sanitize_session_key("unified_u_alice_bound_topic")
+        );
+    }
+
+    #[test]
+    fn resolve_session_key_unified_no_topic_when_effective_topic_none() {
+        // When the caller passes `None` for `effective_topic`, the key
+        // collapses to `unified_<master_id>` even if `msg.thread_ts` is
+        // populated. Callers are responsible for choosing the right topic.
+        let identity = IdentityRuntime {
+            resolver: Arc::new(AlwaysResolves),
+            master_channel: "dawnim.work".to_string(),
+        };
+        let msg = test_msg("feishu", Some("work"), None, "u_alice");
+        let key = resolve_session_key(&msg, Some(&identity), None);
+        assert_eq!(
+            key,
+            zeroclaw_api::session_keys::sanitize_session_key("unified_u_alice")
+        );
+    }
+
+    /// Identity resolver that always returns `Some(sender)` as the master id.
+    /// Used by tests that need to exercise the unified-session path without
+    /// configuring whitelists or bindings.
+    struct AlwaysResolves;
+    impl zeroclaw_infra::identity_store::IdentityResolver for AlwaysResolves {
+        fn resolve(&self, _ch: &str, sender: &str, _m: bool) -> Option<String> {
+            Some(sender.to_string())
+        }
+        fn issue_code(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn redeem_code(&self, _: &str, _: &str, _: &str) -> Result<String, String> {
+            Err("n/a".into())
+        }
+        fn unbind(&self, _: &str, _: &str) -> bool {
+            false
+        }
     }
 
     fn test_msg(
@@ -21560,16 +21637,16 @@ mod error_code_tests {
         let stranger = dm("lark", "work", "ou_zzz");
 
         assert_eq!(
-            resolve_session_key(&master_msg, Some(&ident)),
-            resolve_session_key(&slave_msg, Some(&ident)),
+            resolve_session_key(&master_msg, Some(&ident), master_msg.thread_ts.as_deref()),
+            resolve_session_key(&slave_msg, Some(&ident), slave_msg.thread_ts.as_deref()),
             "master and bound slave must share the unified session_key"
         );
         assert_eq!(
-            resolve_session_key(&master_msg, Some(&ident)),
+            resolve_session_key(&master_msg, Some(&ident), master_msg.thread_ts.as_deref()),
             "unified_u_alice"
         );
         assert_eq!(
-            resolve_session_key(&stranger, Some(&ident)),
+            resolve_session_key(&stranger, Some(&ident), stranger.thread_ts.as_deref()),
             conversation_history_key(&stranger),
             "unbound stranger stays isolated"
         );
