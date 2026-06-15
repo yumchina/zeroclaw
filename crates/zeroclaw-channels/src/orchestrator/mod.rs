@@ -499,7 +499,6 @@ struct ChannelRuntimeContext {
     /// present (same gate: `[channels].master_channel` configured).
     /// Read by `process_channel_message_body` to compute effective_topic;
     /// mutated by the `/topic` command handler.
-    #[allow(dead_code)] // wired in Task 8 (`/topic` handler) and Task 9 (effective_topic).
     topic_binding: Option<Arc<zeroclaw_infra::topic_binding::TopicBindingRegistry>>,
     /// Non-interactive approval manager for channel-driven runs.
     /// Enforces `auto_approve` / `always_ask` / supervised policy from
@@ -2503,6 +2502,127 @@ fn build_config_block_kit(
     blocks.to_string()
 }
 
+fn build_topic_help_response() -> String {
+    "用法：\n  /topic list        查看 master 渠道上的所有话题\n  /topic <名称>      把当前渠道绑定到指定话题\n  /topic reset       解除绑定，恢复独立会话\n\n仅 superuser 可用。"
+        .to_string()
+}
+
+fn build_topic_list_response(
+    master_channel: &str,
+    topics: &[String],
+    current: Option<&str>,
+) -> String {
+    if topics.is_empty() {
+        return format!(
+            "你在 {master_channel} 尚无任何话题。请先在 dawnim 客户端创建话题并发送消息。"
+        );
+    }
+    let mut s = format!("你在 {master_channel} 的话题（共 {} 个）：\n", topics.len());
+    for t in topics {
+        if Some(t.as_str()) == current {
+            s.push_str(&format!("  • {t}         ← 当前绑定\n"));
+        } else {
+            s.push_str(&format!("  • {t}\n"));
+        }
+    }
+    s.push_str("\n用法：/topic <名称> 绑定，/topic reset 解绑");
+    s
+}
+
+/// Query the master DawnIM channel's SqliteMemory for topics belonging
+/// to `master_id`. Parses `[channels].master_channel` (form
+/// `<type>.<alias>`) to derive the per-alias memory db name
+/// (`dawn_im_<alias>`). Returns empty + warning on any failure so
+/// the caller can still reply gracefully.
+fn list_master_topics(ctx: &ChannelRuntimeContext, master_id: &str) -> anyhow::Result<Vec<String>> {
+    let Some(identity) = ctx.identity.as_deref() else {
+        return Ok(Vec::new());
+    };
+    // master_channel example: "dawnim.work" -> alias "work"
+    let alias = identity
+        .master_channel
+        .rsplit('.')
+        .next()
+        .ok_or_else(|| anyhow::Error::msg("master_channel has no alias suffix"))?;
+    let db_name = format!("dawn_im_{alias}");
+    let mem = zeroclaw_memory::SqliteMemory::new_named(
+        "topic_list",
+        ctx.workspace_dir.as_ref(),
+        &db_name,
+    )?;
+    mem.list_unified_topics(master_id)
+}
+
+async fn topic_handler_response(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    action: TopicAction,
+) -> String {
+    let identity = match ctx.identity.as_deref() {
+        Some(i) => i,
+        None => return "/topic 仅 superuser 可用。".to_string(),
+    };
+    let channel_ref = match &msg.channel_alias {
+        Some(alias) => format!("{}.{}", msg.channel, alias),
+        None => msg.channel.clone(),
+    };
+    let is_master = channel_ref == identity.master_channel;
+    let master_id = match identity
+        .resolver
+        .resolve(&channel_ref, &msg.sender, is_master)
+    {
+        Some(id) => id,
+        None => return "/topic 仅 superuser 可用。".to_string(),
+    };
+    let binding_reg = match ctx.topic_binding.as_deref() {
+        Some(r) => r,
+        None => return "/topic 未启用。".to_string(),
+    };
+
+    match action {
+        TopicAction::Help => build_topic_help_response(),
+        TopicAction::Reset => {
+            if binding_reg.clear(&channel_ref, &msg.sender) {
+                "已清除话题绑定。本渠道恢复独立会话。".to_string()
+            } else {
+                "当前没有话题绑定。".to_string()
+            }
+        }
+        TopicAction::List => {
+            let topics = match list_master_topics(ctx, &master_id) {
+                Ok(v) => v,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "topic list query failed; returning empty"
+                    );
+                    Vec::new()
+                }
+            };
+            let current = binding_reg.get(&channel_ref, &msg.sender);
+            build_topic_list_response(&identity.master_channel, &topics, current.as_deref())
+        }
+        TopicAction::Set(id) => {
+            let id = id.trim().to_string();
+            if id.is_empty() {
+                return build_topic_help_response();
+            }
+            let topics = list_master_topics(ctx, &master_id).unwrap_or_default();
+            if !topics.iter().any(|t| t == &id) {
+                format!("话题 \"{id}\" 不存在。运行 /topic list 查看可用话题。")
+            } else if binding_reg.get(&channel_ref, &msg.sender).as_deref() == Some(id.as_str()) {
+                format!("已绑定到话题 \"{id}\"（无变化）。")
+            } else {
+                binding_reg.set(&channel_ref, &msg.sender, &id);
+                format!("已绑定到话题 \"{id}\"。本渠道后续消息将归入该话题的对话历史。")
+            }
+        }
+    }
+}
+
 async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
@@ -2673,10 +2793,7 @@ async fn handle_runtime_command_if_needed(
                 }
             }
         },
-        ChannelRuntimeCommand::Topic(_) => {
-            // Implemented in Task 8.
-            "TODO: /topic handler".to_string()
-        }
+        ChannelRuntimeCommand::Topic(action) => topic_handler_response(ctx, msg, action).await,
     };
 
     if let Err(err) = channel
@@ -21379,6 +21496,35 @@ mod error_code_tests {
         let msg = test_msg("feishu", Some("work"), Some("native_topic"), "u_alice");
         let result = resolve_effective_topic(&msg, "feishu.work", None, None);
         assert_eq!(result, Some("native_topic".to_string()));
+    }
+
+    #[test]
+    fn topic_help_response_lists_subcommands() {
+        let body = build_topic_help_response();
+        assert!(body.contains("/topic list"));
+        assert!(body.contains("/topic <"));
+        assert!(body.contains("/topic reset"));
+        assert!(body.contains("superuser"));
+    }
+
+    #[test]
+    fn topic_list_response_with_entries_marks_current_binding() {
+        let body = build_topic_list_response(
+            "dawnim.work",
+            &["db_lock".to_string(), "migrations".to_string()],
+            Some("db_lock"),
+        );
+        assert!(body.contains("dawnim.work"));
+        assert!(body.contains("db_lock"));
+        assert!(body.contains("当前绑定"));
+        assert!(body.contains("migrations"));
+    }
+
+    #[test]
+    fn topic_list_response_empty_explains_how_to_create() {
+        let body = build_topic_list_response("dawnim.work", &[], None);
+        assert!(body.contains("dawnim.work"));
+        assert!(body.contains("尚无") || body.contains("没有"));
     }
 
     #[test]
