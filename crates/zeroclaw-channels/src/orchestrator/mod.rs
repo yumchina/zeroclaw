@@ -306,6 +306,20 @@ enum ChannelRuntimeCommand {
     Bind(Option<String>),
     /// `/unbind` — remove the current slave-channel binding.
     Unbind,
+    /// `/topic` — cross-channel topic binding for superusers.
+    Topic(TopicAction),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TopicAction {
+    /// `/topic` (no arg) — show usage.
+    Help,
+    /// `/topic list` — list available topics on the master channel.
+    List,
+    /// `/topic reset` — clear the binding for this (channel, sender) pair.
+    Reset,
+    /// `/topic <id>` — bind the current (channel, sender) to topic `<id>`.
+    Set(String),
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1275,6 +1289,24 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
             parts.next().map(|s| s.trim().to_string()),
         )),
         "/unbind" => Some(ChannelRuntimeCommand::Unbind),
+        "/topic" => {
+            // Collect remaining tokens; 0 -> Help, 1 -> List/Reset/Set, 2+ -> Help (invalid args).
+            let rest: Vec<&str> = parts.collect();
+            match rest.len() {
+                0 => Some(ChannelRuntimeCommand::Topic(TopicAction::Help)),
+                1 => {
+                    let token = rest[0].trim();
+                    let action = match token.to_ascii_lowercase().as_str() {
+                        "list" => TopicAction::List,
+                        "reset" => TopicAction::Reset,
+                        "help" => TopicAction::Help,
+                        _ => TopicAction::Set(token.to_string()),
+                    };
+                    Some(ChannelRuntimeCommand::Topic(action))
+                }
+                _ => Some(ChannelRuntimeCommand::Topic(TopicAction::Help)),
+            }
+        }
         // Model/model_provider switching is channel-gated.
         "/models" if supports_runtime_model_switch(channel_name) => {
             if let Some(model_provider) = parts.next() {
@@ -2635,6 +2667,10 @@ async fn handle_runtime_command_if_needed(
                 }
             }
         },
+        ChannelRuntimeCommand::Topic(_) => {
+            // Implemented in Task 8.
+            "TODO: /topic handler".to_string()
+        }
     };
 
     if let Err(err) = channel
@@ -16423,6 +16459,60 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(matches!(
             parse_runtime_command("lark", "/unbind"),
             Some(ChannelRuntimeCommand::Unbind)
+        ));
+    }
+
+    #[test]
+    fn parse_runtime_command_recognizes_topic_help() {
+        assert!(matches!(
+            parse_runtime_command("feishu", "/topic"),
+            Some(ChannelRuntimeCommand::Topic(TopicAction::Help))
+        ));
+    }
+
+    #[test]
+    fn parse_runtime_command_recognizes_topic_list() {
+        assert!(matches!(
+            parse_runtime_command("feishu", "/topic list"),
+            Some(ChannelRuntimeCommand::Topic(TopicAction::List))
+        ));
+    }
+
+    #[test]
+    fn parse_runtime_command_recognizes_topic_reset() {
+        assert!(matches!(
+            parse_runtime_command("feishu", "/topic reset"),
+            Some(ChannelRuntimeCommand::Topic(TopicAction::Reset))
+        ));
+    }
+
+    #[test]
+    fn parse_runtime_command_recognizes_topic_set() {
+        match parse_runtime_command("feishu", "/topic db_lock") {
+            Some(ChannelRuntimeCommand::Topic(TopicAction::Set(id))) => {
+                assert_eq!(id, "db_lock");
+            }
+            other => panic!("expected Topic(Set), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_runtime_command_topic_set_rejects_extra_tokens() {
+        assert!(matches!(
+            parse_runtime_command("feishu", "/topic db_lock extra"),
+            Some(ChannelRuntimeCommand::Topic(TopicAction::Help))
+        ));
+    }
+
+    #[test]
+    fn parse_runtime_command_topic_keywords_case_insensitive() {
+        assert!(matches!(
+            parse_runtime_command("feishu", "/topic LIST"),
+            Some(ChannelRuntimeCommand::Topic(TopicAction::List))
+        ));
+        assert!(matches!(
+            parse_runtime_command("feishu", "/topic Reset"),
+            Some(ChannelRuntimeCommand::Topic(TopicAction::Reset))
         ));
     }
 
