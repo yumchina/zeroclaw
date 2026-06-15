@@ -578,6 +578,28 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
     sanitize_session_key(&raw)
 }
 
+/// Resolve the *effective* topic for an inbound channel message:
+/// `msg.thread_ts` always wins on the master channel; on slave channels,
+/// `thread_ts` (if set) wins, else the `topic_binding` registry fills in.
+/// Returns `None` when neither source has a topic.
+///
+/// Centralises the "what topic should this message belong to" decision so
+/// `resolve_session_key` and `ChannelOrigin.topic` stay consistent.
+#[allow(dead_code)] // wired into process_channel_message_body in Task 9
+fn resolve_effective_topic(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    channel_ref: &str,
+    master_channel_ref: Option<&str>,
+    topic_binding: Option<&zeroclaw_infra::topic_binding::TopicBindingRegistry>,
+) -> Option<String> {
+    if master_channel_ref == Some(channel_ref) {
+        return msg.thread_ts.clone();
+    }
+    msg.thread_ts
+        .clone()
+        .or_else(|| topic_binding.and_then(|reg| reg.get(channel_ref, &msg.sender)))
+}
+
 /// Wrap `conversation_history_key` with cross-channel identity merging.
 /// Returns `unified_<master_id>` (or `unified_<master_id>_<topic>` when
 /// the inbound message carries a `thread_ts`) for 1:1 messages whose
@@ -21127,6 +21149,78 @@ mod error_code_tests {
         // thread_ts is None
         let key = resolve_session_key(&msg, Some(&ident));
         assert_eq!(key, "unified_u_alice");
+    }
+
+    fn test_msg(
+        channel: &str,
+        alias: Option<&str>,
+        thread_ts: Option<&str>,
+        sender: &str,
+    ) -> zeroclaw_api::channel::ChannelMessage {
+        let mut m =
+            zeroclaw_api::channel::ChannelMessage::new("m1", sender, "r1", "hi", channel, 0);
+        m.channel_alias = alias.map(|s| s.to_string());
+        m.thread_ts = thread_ts.map(|s| s.to_string());
+        m
+    }
+
+    fn test_topic_registry() -> zeroclaw_infra::topic_binding::TopicBindingRegistry {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("tb.json");
+        let _ = Box::leak(Box::new(tmp));
+        zeroclaw_infra::topic_binding::TopicBindingRegistry::load(path).unwrap()
+    }
+
+    #[test]
+    fn resolve_effective_topic_master_uses_thread_ts_only() {
+        let msg = test_msg("dawnim", Some("work"), Some("topic_A"), "u_alice");
+        let result = resolve_effective_topic(&msg, "dawnim.work", Some("dawnim.work"), None);
+        assert_eq!(result, Some("topic_A".to_string()));
+    }
+
+    #[test]
+    fn resolve_effective_topic_master_ignores_binding_even_when_set() {
+        let msg = test_msg("dawnim", Some("work"), Some("topic_A"), "u_alice");
+        let reg = test_topic_registry();
+        reg.set("dawnim.work", "u_alice", "binding_topic");
+        let result = resolve_effective_topic(&msg, "dawnim.work", Some("dawnim.work"), Some(&reg));
+        assert_eq!(
+            result,
+            Some("topic_A".to_string()),
+            "master must ignore binding"
+        );
+    }
+
+    #[test]
+    fn resolve_effective_topic_slave_prefers_thread_ts_over_binding() {
+        let msg = test_msg("feishu", Some("work"), Some("native_topic"), "u_alice");
+        let reg = test_topic_registry();
+        reg.set("feishu.work", "u_alice", "bound_topic");
+        let result = resolve_effective_topic(&msg, "feishu.work", Some("dawnim.work"), Some(&reg));
+        assert_eq!(result, Some("native_topic".to_string()));
+    }
+
+    #[test]
+    fn resolve_effective_topic_slave_uses_binding_when_no_thread_ts() {
+        let msg = test_msg("feishu", Some("work"), None, "u_alice");
+        let reg = test_topic_registry();
+        reg.set("feishu.work", "u_alice", "bound_topic");
+        let result = resolve_effective_topic(&msg, "feishu.work", Some("dawnim.work"), Some(&reg));
+        assert_eq!(result, Some("bound_topic".to_string()));
+    }
+
+    #[test]
+    fn resolve_effective_topic_returns_none_when_neither_set() {
+        let msg = test_msg("feishu", Some("work"), None, "u_alice");
+        let result = resolve_effective_topic(&msg, "feishu.work", Some("dawnim.work"), None);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn resolve_effective_topic_no_master_config_falls_to_thread_ts() {
+        let msg = test_msg("feishu", Some("work"), Some("native_topic"), "u_alice");
+        let result = resolve_effective_topic(&msg, "feishu.work", None, None);
+        assert_eq!(result, Some("native_topic".to_string()));
     }
 
     #[test]
