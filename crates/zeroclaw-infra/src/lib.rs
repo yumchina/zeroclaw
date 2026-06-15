@@ -10,6 +10,7 @@ pub mod session_queue;
 pub mod session_sqlite;
 pub mod session_store;
 pub mod stall_watchdog;
+pub mod topic_binding;
 
 use std::path::Path;
 use std::sync::Arc;
