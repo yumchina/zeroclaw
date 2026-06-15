@@ -2558,6 +2558,12 @@ async fn topic_handler_response(
     msg: &zeroclaw_api::channel::ChannelMessage,
     action: TopicAction,
 ) -> String {
+    // Check deployment-level enablement first to avoid leaking
+    // superuser status to users when /topic is disabled.
+    let binding_reg = match ctx.topic_binding.as_deref() {
+        Some(r) => r,
+        None => return "/topic 未启用。".to_string(),
+    };
     let identity = match ctx.identity.as_deref() {
         Some(i) => i,
         None => return "/topic 仅 superuser 可用。".to_string(),
@@ -2573,10 +2579,6 @@ async fn topic_handler_response(
     {
         Some(id) => id,
         None => return "/topic 仅 superuser 可用。".to_string(),
-    };
-    let binding_reg = match ctx.topic_binding.as_deref() {
-        Some(r) => r,
-        None => return "/topic 未启用。".to_string(),
     };
 
     match action {
@@ -2610,7 +2612,19 @@ async fn topic_handler_response(
             if id.is_empty() {
                 return build_topic_help_response();
             }
-            let topics = list_master_topics(ctx, &master_id).unwrap_or_default();
+            let topics = match list_master_topics(ctx, &master_id) {
+                Ok(v) => v,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "topic list query failed during /topic set"
+                    );
+                    return "话题查询失败，请稍后重试。".to_string();
+                }
+            };
             if !topics.iter().any(|t| t == &id) {
                 format!("话题 \"{id}\" 不存在。运行 /topic list 查看可用话题。")
             } else if binding_reg.get(&channel_ref, &msg.sender).as_deref() == Some(id.as_str()) {
