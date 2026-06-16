@@ -47,7 +47,6 @@ struct ConversationSyncUpdate {
     version: i64,
 }
 
-
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
 struct PendingMessage {
     content: String,
@@ -151,6 +150,25 @@ impl WuKongIMChannel {
         }
     }
 
+    async fn send_ws_frame(&self, frame: WsMsg) -> anyhow::Result<()> {
+        let mut g = self.ws_sink.write().await;
+        if let Some(s) = g.as_mut() {
+            match tokio::time::timeout(Duration::from_secs(5), s.send(frame)).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(e)) => {
+                    *g = None;
+                    anyhow::bail!("WebSocket send failed: {}", e);
+                }
+                Err(_) => {
+                    *g = None;
+                    anyhow::bail!("WebSocket send timed out");
+                }
+            }
+        } else {
+            anyhow::bail!("WebSocket not connected")
+        }
+    }
+
     async fn send_rpc<P: serde::Serialize, R: serde::de::DeserializeOwned>(
         &self,
         method: &str,
@@ -165,22 +183,11 @@ impl WuKongIMChannel {
             params,
         };
         self.pending_responses.write().await.insert(id.clone(), tx);
-        let send_result: anyhow::Result<()> = async {
-            let msg = serde_json::to_string(&req)?;
-            let mut g = self.ws_sink.write().await;
-            match g.as_mut() {
-                Some(s) => {
-                    tracing::info!("WuKongIM: RPC {} id={}", method, id);
-                    if let Err(e) = s.send(WsMsg::Text(msg.into())).await {
-                        *g = None;
-                        return Err(anyhow::anyhow!("WuKongIM RPC send failed: {}", e));
-                    }
-                    Ok(())
-                }
-                None => anyhow::bail!("WuKongIM: WebSocket not connected"),
-            }
-        }
-        .await;
+
+        let msg = serde_json::to_string(&req)?;
+        tracing::info!("WuKongIM: RPC {} id={}", method, id);
+        let send_result = self.send_ws_frame(WsMsg::Text(msg.into())).await;
+
         if let Err(e) = send_result {
             self.pending_responses.write().await.remove(&id);
             return Err(e);
@@ -216,14 +223,7 @@ impl WuKongIMChannel {
             },
         };
         let msg = serde_json::to_string(&req)?;
-        let mut g = self.ws_sink.write().await;
-        if let Some(s) = g.as_mut()
-            && let Err(e) = s.send(WsMsg::Text(msg.into())).await
-        {
-            *g = None;
-            return Err(anyhow::anyhow!("WuKongIM ACK send failed: {}", e));
-        }
-        Ok(())
+        self.send_ws_frame(WsMsg::Text(msg.into())).await
     }
 
     fn get_sync_state_path(&self) -> PathBuf {
@@ -313,7 +313,10 @@ impl WuKongIMChannel {
     ) -> anyhow::Result<()> {
         let _lock = self.sync_state_lock.lock().await;
 
-        let allow_disk_commit = timestamp_ns == 0 || self.history_sync_complete.load(std::sync::atomic::Ordering::Relaxed);
+        let allow_disk_commit = timestamp_ns == 0
+            || self
+                .history_sync_complete
+                .load(std::sync::atomic::Ordering::Relaxed);
 
         let mut state = self.load_sync_state().await;
         let mut changed = false;
@@ -404,7 +407,9 @@ impl WuKongIMChannel {
         Ok(())
     }
 
-    async fn sync_history(&self) -> anyhow::Result<(Vec<RecvNotificationParams>, Vec<ConversationSyncUpdate>)> {
+    async fn sync_history(
+        &self,
+    ) -> anyhow::Result<(Vec<RecvNotificationParams>, Vec<ConversationSyncUpdate>)> {
         // 1. Load sync state from file
         let state = self.load_sync_state().await;
         let version = state.max_version;
@@ -1345,12 +1350,8 @@ impl WuKongIMChannel {
             is_silent
         );
 
-        self.send_offline_batch_as_single_message(
-            filtered_messages,
-            is_silent,
-            tx,
-        )
-        .await?;
+        self.send_offline_batch_as_single_message(filtered_messages, is_silent, tx)
+            .await?;
 
         Ok(())
     }
@@ -1496,7 +1497,9 @@ fn calculate_safe_watermark(
     } else {
         for m in conv_messages {
             if m.message_seq > current_seq {
-                if let Some(&true) = processed_messages.get(&(m.channel_id.clone(), m.channel_type, m.message_seq)) {
+                if let Some(&true) =
+                    processed_messages.get(&(m.channel_id.clone(), m.channel_type, m.message_seq))
+                {
                     safe_seq = m.message_seq;
                 } else {
                     all_succeeded = false;
@@ -1549,54 +1552,31 @@ impl Channel for WuKongIMChannel {
             topic,
         };
 
-        let mut g = self.ws_sink.write().await;
-        match g.as_mut() {
-            Some(s) => {
-                let req = JsonRpcRequest {
-                    jsonrpc: WUKONGIM_RPC_VERSION.to_string(),
-                    method: "send".to_string(),
-                    id: Uuid::new_v4().to_string(),
-                    params,
-                };
-                let msg = serde_json::to_string(&req)?;
-                match s.send(WsMsg::Text(msg.into())).await {
-                    Ok(_) => {
-                        drop(g);
-                        if let Err(e) = self.remove_from_pending_outbound(message).await {
-                            tracing::debug!("WuKongIM: remove_from_pending_outbound: {}", e);
-                        }
-                        Ok(())
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            "WuKongIM: WebSocket send failed: {}. Clearing sink and buffering message.",
-                            err
-                        );
-                        *g = None;
-                        drop(g);
-
-                        let mut pending = self.pending_outbound.lock().await;
-                        pending.push(message.clone());
-                        drop(pending);
-                        if let Err(e) = self.save_pending_outbound().await {
-                            tracing::warn!("WuKongIM: failed to persist pending outbound: {}", e);
-                        }
-                        Ok(())
-                    }
+        let req = JsonRpcRequest {
+            jsonrpc: WUKONGIM_RPC_VERSION.to_string(),
+            method: "send".to_string(),
+            id: Uuid::new_v4().to_string(),
+            params,
+        };
+        let msg = serde_json::to_string(&req)?;
+        match self.send_ws_frame(WsMsg::Text(msg.into())).await {
+            Ok(_) => {
+                if let Err(e) = self.remove_from_pending_outbound(message).await {
+                    tracing::debug!("WuKongIM: remove_from_pending_outbound: {}", e);
                 }
+                Ok(())
             }
-            None => {
-                drop(g);
+            Err(err) => {
+                tracing::warn!(
+                    "WuKongIM: WebSocket send failed: {}. Buffering message.",
+                    err
+                );
                 let mut pending = self.pending_outbound.lock().await;
                 pending.push(message.clone());
                 drop(pending);
                 if let Err(e) = self.save_pending_outbound().await {
                     tracing::warn!("WuKongIM: failed to persist pending outbound: {}", e);
                 }
-                tracing::warn!(
-                    "WuKongIM: not connected, buffered message ({} pending)",
-                    self.pending_outbound.lock().await.len()
-                );
                 Ok(())
             }
         }
@@ -1704,9 +1684,7 @@ impl Channel for WuKongIMChannel {
                 },
             };
             let msg = serde_json::to_string(&req)?;
-            if let Some(s) = self.ws_sink.write().await.as_mut() {
-                s.send(WsMsg::Text(msg.into())).await?;
-            }
+            self.send_ws_frame(WsMsg::Text(msg.into())).await?;
             let connack = tokio::time::timeout(Duration::from_secs(15), read.next())
                 .await
                 .map_err(|_| anyhow::anyhow!("WuKongIM: connect timeout"))?
@@ -1871,14 +1849,10 @@ impl Channel for WuKongIMChannel {
                         id: Uuid::new_v4().to_string(),
                         params: serde_json::json!({}),
                     };
-                    if let Ok(msg) = serde_json::to_string(&ping)
-                        && let Some(s) = self.ws_sink.write().await.as_mut()
-                    {
-                        let _ = s.send(WsMsg::Text(msg.into())).await;
+                    if let Ok(msg) = serde_json::to_string(&ping) {
+                        self.send_ws_frame(WsMsg::Text(msg.into())).await?;
                     }
-                    if let Some(s) = self.ws_sink.write().await.as_mut() {
-                        let _ = s.send(WsMsg::Ping(Default::default())).await;
-                    }
+                    self.send_ws_frame(WsMsg::Ping(Default::default())).await?;
                 }
                 frame = read.next() => {
                     let frame = frame.ok_or_else(|| anyhow::anyhow!("WuKongIM: stream closed"))??;
@@ -2347,7 +2321,8 @@ mod tests {
         processed.insert(("c".to_string(), 2, 13), true);
         processed.insert(("c".to_string(), 2, 14), true);
 
-        let (safe, all_ok) = calculate_safe_watermark(current_seq, &conv_messages, &processed, last_msg_seq);
+        let (safe, all_ok) =
+            calculate_safe_watermark(current_seq, &conv_messages, &processed, last_msg_seq);
         assert_eq!(safe, 14);
         assert!(all_ok);
 
@@ -2359,7 +2334,8 @@ mod tests {
         processed.insert(("c".to_string(), 2, 13), true);
         processed.insert(("c".to_string(), 2, 14), false);
 
-        let (safe, all_ok) = calculate_safe_watermark(current_seq, &conv_messages, &processed, last_msg_seq);
+        let (safe, all_ok) =
+            calculate_safe_watermark(current_seq, &conv_messages, &processed, last_msg_seq);
         assert_eq!(safe, 9); // Stops before seq 10
         assert!(!all_ok);
 
@@ -2371,13 +2347,15 @@ mod tests {
         processed.insert(("c".to_string(), 2, 13), false);
         processed.insert(("c".to_string(), 2, 14), true);
 
-        let (safe, all_ok) = calculate_safe_watermark(current_seq, &conv_messages, &processed, last_msg_seq);
+        let (safe, all_ok) =
+            calculate_safe_watermark(current_seq, &conv_messages, &processed, last_msg_seq);
         assert_eq!(safe, 10); // Stops at 10 (since 11 failed)
         assert!(!all_ok);
 
         // Scenario D: Empty list (no messages)
         let empty_messages = vec![];
-        let (safe, all_ok) = calculate_safe_watermark(current_seq, &empty_messages, &processed, 100);
+        let (safe, all_ok) =
+            calculate_safe_watermark(current_seq, &empty_messages, &processed, 100);
         assert_eq!(safe, 100);
         assert!(all_ok);
     }
