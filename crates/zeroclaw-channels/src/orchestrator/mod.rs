@@ -475,7 +475,7 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
 }
 
 fn followup_thread_id(msg: &zeroclaw_api::channel::ChannelMessage) -> Option<String> {
-    if is_matrix_channel_name(&msg.channel) {
+    if is_matrix_channel_name(&msg.channel) || msg.channel == "wukongim" {
         msg.thread_ts.clone()
     } else {
         msg.thread_ts.clone().or_else(|| Some(msg.id.clone()))
@@ -2880,7 +2880,12 @@ async fn process_channel_message(
 
     // Parse sender UID for dawn context (102535169_la_1780499236481 → 102535169).
     let dawn_ctx = zeroclaw_runtime::tools::dawn_task::DawnContext {
-        from_uid: msg.sender.split("_la_").next().unwrap_or(&msg.sender).to_string(),
+        from_uid: msg
+            .sender
+            .split("_la_")
+            .next()
+            .unwrap_or(&msg.sender)
+            .to_string(),
         reply_target: msg.reply_target.clone(),
     };
 
@@ -5930,8 +5935,9 @@ pub async fn doctor_channels(config: Config) -> Result<()> {
 pub async fn start_channels(
     config: Config,
     canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
-    #[allow(unused)]
-    channel_msg_rx: Option<tokio::sync::mpsc::UnboundedReceiver<(String, u8, serde_json::Value)>>,
+    #[allow(unused)] channel_msg_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<(String, u8, serde_json::Value)>,
+    >,
 ) -> Result<()> {
     // No model resolves yet — the user has channels configured but hasn't
     // finished onboarding their provider. Returning Ok() here lets the
@@ -11555,6 +11561,23 @@ BTC is currently around $65,000 based on latest tool output."#
         };
 
         assert_eq!(followup_thread_id(&msg).as_deref(), Some("msg_abc123"));
+    }
+
+    #[test]
+    fn followup_thread_id_does_not_open_wukongim_thread_for_root_message() {
+        let msg = zeroclaw_api::channel::ChannelMessage {
+            id: "msg_abc123".into(),
+            sender: "U123".into(),
+            reply_target: "C456".into(),
+            content: "hello".into(),
+            channel: "wukongim".into(),
+            timestamp: 1,
+            thread_ts: None,
+            interruption_scope_id: None,
+            attachments: vec![],
+        };
+
+        assert_eq!(followup_thread_id(&msg), None);
     }
 
     #[test]
