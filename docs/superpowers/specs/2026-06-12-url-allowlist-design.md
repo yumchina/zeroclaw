@@ -166,6 +166,8 @@ pub struct SecurityConfig {
 
 ### 3. leak_detector.rs 修改
 
+规则在构造时一次性编译为正则，匹配期不再重复编译。
+
 ```rust
 #[derive(Debug, Clone)]
 pub struct LeakDetector {
@@ -173,69 +175,71 @@ pub struct LeakDetector {
     url_allowlist: Vec<AllowlistRule>,
 }
 
+/// 域名/路径 glob 在构造时编译为锚定正则，匹配只用 `is_match`。
 #[derive(Debug, Clone)]
-struct AllowlistRule {
-    domain_pattern: String,
-    url_pattern: Option<String>,
+pub struct AllowlistRule {
+    domain_re: Regex,
+    path_re: Option<Regex>,
+}
+
+impl AllowlistRule {
+    fn new(domain_pattern: &str, url_pattern: Option<&str>) -> Option<Self> {
+        let domain_re = compile_glob(domain_pattern)?;
+        let path_re = match url_pattern {
+            Some(p) => Some(compile_glob(p)?),
+            None => None,
+        };
+        Some(Self { domain_re, path_re })
+    }
+}
+
+/// glob (`*` → `.*`) → 锚定正则；非法模式返回 `None`。
+fn compile_glob(pattern: &str) -> Option<Regex> {
+    let re_str = regex::escape(pattern).replace(r"\*", ".*");
+    Regex::new(&format!("^{}$", re_str)).ok()
+}
+
+/// 唯一的规则构建入口：`from_config` 与 tool loop 共用，避免两处重复构造。
+/// 非法 glob 条目记 warn 并跳过，不中断检测。
+pub fn allowlist_from_config(config: &LeakDetectorConfig) -> Vec<AllowlistRule> {
+    config.url_allowlist.iter()
+        .filter_map(|entry| AllowlistRule::new(&entry.domain, entry.url_pattern.as_deref()))
+        .collect()
 }
 
 impl LeakDetector {
-    /// 从配置创建
     pub fn from_config(config: &LeakDetectorConfig) -> Self {
-        let rules = config.url_allowlist.iter().map(|entry| {
-            AllowlistRule {
-                domain_pattern: entry.domain.clone(),
-                url_pattern: entry.url_pattern.clone(),
-            }
-        }).collect();
-
         Self {
             sensitivity: config.sensitivity.clamp(0.0, 1.0),
-            url_allowlist: rules,
+            url_allowlist: allowlist_from_config(config),
         }
-    }
-
-    /// 将内容中的白名单 URL 替换为占位符，供检测使用
-    fn strip_whitelist_urls(&self, content: &str) -> String {
-        static URL_RE: OnceLock<Regex> = OnceLock::new();
-        let url_re = URL_RE.get_or_init(|| Regex::new(r"https?://[^\s]+").unwrap());
-
-        let mut result = content.to_string();
-        // 从后往前替换，避免偏移问题
-        let mut replacements: Vec<(usize, usize)> = Vec::new();
-
-        for url_match in url_re.find_iter(content) {
-            let url = url_match.as_str();
-            for rule in &self.url_allowlist {
-                if self.url_matches_rule(url, rule) {
-                    replacements.push((url_match.start(), url_match.end()));
-                    break;
-                }
-            }
-        }
-
-        // 从后往前替换，保持索引有效
-        replacements.sort_by_key(|(s, _)| std::cmp::Reverse(*s));
-        for (start, end) in replacements {
-            result.replace_range(start..end, "");
-        }
-
-        result
-    }
-
-    fn url_matches_rule(&self, url: &str, rule: &AllowlistRule) -> bool {
-        if !glob_match(&rule.domain_pattern, extract_domain(url)) {
-            return false;
-        }
-        if let Some(ref path_pattern) = rule.url_pattern {
-            if !glob_match(path_pattern, extract_path(url)) {
-                return false;
-            }
-        }
-        true
     }
 }
+
+/// mask/restore 为公共函数：`scan` 与 `scrub_credentials_with_allowlist` 共用，
+/// 占位符格式与正则只存在一处。
+pub(crate) const URL_PLACEHOLDER_PREFIX: &str = "\u{0}ZCWLU_";
+pub(crate) const URL_PLACEHOLDER_SUFFIX: &str = "\u{0}";
+
+pub fn mask_allowlist_urls(content: &str, allowlist: &[AllowlistRule]) -> (String, Vec<String>) { /* … */ }
+pub fn restore_allowlist_urls(content: &str, preserved_urls: &[String]) -> String { /* restore_re 用 OnceLock 缓存 */ }
+
+fn url_matches_rule(url: &str, rule: &AllowlistRule) -> bool {
+    if !rule.domain_re.is_match(extract_domain(url)) {
+        return false;
+    }
+    if let Some(ref path_re) = rule.path_re {
+        if !path_re.is_match(extract_path(url)) {
+            return false;
+        }
+    }
+    true
+}
 ```
+
+> 注：`glob_match` 已删除——glob → regex 的编译在 `AllowlistRule::new` / `compile_glob` 中一次性完成，匹配阶段不再编译正则。
+
+> 注：`extract_domain` 对 `user:pass@host` 形式的 URL 提取出 `user` 段，故白名单域名规则不豁免此类 URL（它们通常由 `check_database_urls` 捕获）。
 
 ### 4. scan() 修改
 
@@ -337,17 +341,33 @@ fn non_whitelist_url_still_detected() {
 }
 
 #[test]
-fn domain_pattern_matches_subdomains() {
-    assert!(glob_match("*.lkcoffee.com", "open.lkcoffee.com"));
-    assert!(glob_match("*.lkcoffee.com", "api.lkcoffee.com"));
-    assert!(!glob_match("*.lkcoffee.com", "example.com"));
+fn domain_url_pattern_match() {
+    let config = LeakDetectorConfig {
+        url_allowlist: vec![UrlAllowlistEntry {
+            domain: "open.example.com".into(),
+            url_pattern: Some("/transfer/qrcode*".into()),
+            description: None,
+        }],
+        ..Default::default()
+    };
+    let rules = allowlist_from_config(&config);
+    let rule = &rules[0];
+    assert!(url_matches_rule("https://open.example.com/transfer/qrcode?token=xxx", rule));
+    assert!(!url_matches_rule("https://open.example.com/api/order?token=xxx", rule));
+    assert!(!url_matches_rule("https://other.example.com/transfer/qrcode", rule));
 }
 
 #[test]
-fn url_pattern_matches_path() {
-    assert!(glob_match("/transfer/qrcode*", "/transfer/qrcode"));
-    assert!(glob_match("/transfer/qrcode*", "/transfer/qrcode/123"));
-    assert!(!glob_match("/transfer/qrcode*", "/api/order"));
+fn allowlist_from_config_skips_invalid_pattern() {
+    // 非法 glob（如未闭合的 `[`）编译失败被跳过，有效条目保留
+    let config = LeakDetectorConfig {
+        url_allowlist: vec![
+            UrlAllowlistEntry { domain: "valid.example.com".into(), url_pattern: None, description: None },
+            UrlAllowlistEntry { domain: "[invalid".into(), url_pattern: None, description: None },
+        ],
+        ..Default::default()
+    };
+    assert_eq!(allowlist_from_config(&config).len(), 1);
 }
 ```
 
@@ -424,9 +444,9 @@ fn whitelist_url_token_preserved_when_same_token_detected_elsewhere() {
 | 风险 | 概率 | 影响 | 缓解 |
 |------|------|------|------|
 | 白名单域名被恶意利用 | 低 | 中 | 白名单域名由运维控制，仅允许已知安全域名 |
-| 默认 skip_checks 过于宽松 | 低 | 中 | API key 等关键检测始终执行，不受白名单影响 |
+| 非法 glob 配置条目 | 低 | 低 | `allowlist_from_config` 记 warn 并跳过，其余规则照常生效 |
 | 配置加载失败导致白名单丢失 | 低 | 高 | `Default::default()` 空白名单，降级为全量检测 |
-| 性能影响（每次 scan 都要匹配白名单） | 极低 | 极低 | 仅正则匹配 URL + glob，开销可忽略 |
+| 性能影响（每次 scan 匹配白名单） | 极低 | 极低 | 正则在构造时编译一次，匹配只做 `is_match`，开销可忽略 |
 
 ---
 
@@ -434,5 +454,4 @@ fn whitelist_url_token_preserved_when_same_token_detected_elsewhere() {
 
 - **默认配置**：`url_allowlist = []`（空白名单），行为与旧版完全一致
 - **sensitivity 默认值**：`0.7`，与旧版 `LeakDetector::new()` 一致
-- **skip_checks 默认值**：`["generic_secrets", "high_entropy_tokens"]`，仅白名单 URL 生效
 - **旧版 `LeakDetector::new()` 保留**：测试代码仍可使用

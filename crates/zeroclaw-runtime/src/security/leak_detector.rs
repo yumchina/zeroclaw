@@ -40,10 +40,38 @@ pub struct LeakDetector {
 }
 
 /// URL allowlist rule for matching and excluding URLs.
+///
+/// Domain and path globs are compiled to anchored regexes once at
+/// construction time, so matching never recompiles a regex.
 #[derive(Debug, Clone)]
 pub struct AllowlistRule {
-    pub domain_pattern: String,
-    pub url_pattern: Option<String>,
+    domain_re: Regex,
+    path_re: Option<Regex>,
+}
+
+impl AllowlistRule {
+    fn new(domain_pattern: &str, url_pattern: Option<&str>) -> Self {
+        let domain_re = compile_glob(domain_pattern);
+        let path_re = url_pattern.map(compile_glob);
+        Self { domain_re, path_re }
+    }
+}
+
+/// Compile a glob (`*` → `.*`) into an anchored regex.
+///
+/// `regex::escape` guarantees a valid regex literal, so this never fails.
+fn compile_glob(pattern: &str) -> Regex {
+    let re_str = regex::escape(pattern).replace(r"\*", ".*");
+    Regex::new(&format!("^{}$", re_str)).expect("regex::escape output is always valid")
+}
+
+/// Build allowlist rules from configuration.
+pub fn allowlist_from_config(config: &LeakDetectorConfig) -> Vec<AllowlistRule> {
+    config
+        .url_allowlist
+        .iter()
+        .map(|entry| AllowlistRule::new(&entry.domain, entry.url_pattern.as_deref()))
+        .collect()
 }
 
 impl Default for LeakDetector {
@@ -53,11 +81,11 @@ impl Default for LeakDetector {
 }
 
 /// URL placeholder marker for preserving allowlisted URLs during scanning.
-const URL_PLACEHOLDER_PREFIX: &str = "\u{0}ZCWLU_";
-const URL_PLACEHOLDER_SUFFIX: &str = "\u{0}";
+pub(crate) const URL_PLACEHOLDER_PREFIX: &str = "\u{0}ZCWLU_";
+pub(crate) const URL_PLACEHOLDER_SUFFIX: &str = "\u{0}";
 
 /// Mask allowlisted URLs and return masked content + preserved URL list.
-fn mask_allowlist_urls(content: &str, allowlist: &[AllowlistRule]) -> (String, Vec<String>) {
+pub fn mask_allowlist_urls(content: &str, allowlist: &[AllowlistRule]) -> (String, Vec<String>) {
     if allowlist.is_empty() {
         return (content.to_string(), Vec::new());
     }
@@ -87,17 +115,20 @@ fn mask_allowlist_urls(content: &str, allowlist: &[AllowlistRule]) -> (String, V
 }
 
 /// Restore previously masked allowlisted URLs.
-fn restore_allowlist_urls(content: &str, preserved_urls: &[String]) -> String {
+pub fn restore_allowlist_urls(content: &str, preserved_urls: &[String]) -> String {
     if preserved_urls.is_empty() {
         return content.to_string();
     }
 
-    let restore_re = Regex::new(&format!(
-        "{}(\\d+){}",
-        regex::escape(URL_PLACEHOLDER_PREFIX),
-        regex::escape(URL_PLACEHOLDER_SUFFIX)
-    ))
-    .unwrap();
+    static RESTORE_RE: OnceLock<Regex> = OnceLock::new();
+    let restore_re = RESTORE_RE.get_or_init(|| {
+        Regex::new(&format!(
+            "{}(\\d+){}",
+            regex::escape(URL_PLACEHOLDER_PREFIX),
+            regex::escape(URL_PLACEHOLDER_SUFFIX)
+        ))
+        .expect("restore regex is a valid static pattern")
+    });
 
     restore_re
         .replace_all(content, |caps: &regex::Captures| {
@@ -126,18 +157,9 @@ impl LeakDetector {
 
     /// Create a detector from configuration.
     pub fn from_config(config: &LeakDetectorConfig) -> Self {
-        let rules = config
-            .url_allowlist
-            .iter()
-            .map(|entry| AllowlistRule {
-                domain_pattern: entry.domain.clone(),
-                url_pattern: entry.url_pattern.clone(),
-            })
-            .collect();
-
         Self {
             sensitivity: config.sensitivity.clamp(0.0, 1.0),
-            url_allowlist: rules,
+            url_allowlist: allowlist_from_config(config),
         }
     }
 
@@ -477,22 +499,20 @@ fn has_mixed_alpha_digit(s: &str) -> bool {
 // ── URL allowlist helpers ──────────────────────────────────────────
 
 fn url_matches_rule(url: &str, rule: &AllowlistRule) -> bool {
-    if !glob_match(&rule.domain_pattern, extract_domain(url)) {
+    if !rule.domain_re.is_match(extract_domain(url)) {
         return false;
     }
-    if let Some(ref path_pattern) = rule.url_pattern {
-        if !glob_match(path_pattern, extract_path(url)) {
-            return false;
-        }
+    match &rule.path_re {
+        Some(re) => re.is_match(extract_path(url)),
+        None => true,
     }
-    true
 }
 
-fn glob_match(pattern: &str, input: &str) -> bool {
-    let re_str = regex::escape(pattern).replace(r"\*", ".*");
-    Regex::new(&format!("^{}$", re_str)).map_or(false, |re| re.is_match(input))
-}
-
+/// Extract the host portion of a URL.
+///
+/// Note: for `user:pass@host` authority URLs the extracted value is the
+/// `user` segment, so allowlist domain rules do not exempt such URLs (they
+/// are typically caught by `check_database_urls` instead).
 fn extract_domain(url: &str) -> &str {
     url.trim_start_matches("https://")
         .trim_start_matches("http://")
@@ -867,32 +887,58 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
     }
 
     #[test]
-    fn glob_match_tests() {
-        assert!(glob_match("*.lkcoffee.com", "open.lkcoffee.com"));
-        assert!(glob_match("*.lkcoffee.com", "api.lkcoffee.com"));
-        assert!(!glob_match("*.lkcoffee.com", "example.com"));
-        assert!(glob_match("/transfer/qrcode*", "/transfer/qrcode"));
-        assert!(glob_match("/transfer/qrcode*", "/transfer/qrcode/123"));
-        assert!(!glob_match("/transfer/qrcode*", "/api/order"));
-    }
-
-    #[test]
     fn domain_url_pattern_match() {
-        let rule = AllowlistRule {
-            domain_pattern: "open.example.com".into(),
-            url_pattern: Some("/transfer/qrcode*".into()),
+        let config = LeakDetectorConfig {
+            url_allowlist: vec![UrlAllowlistEntry {
+                domain: "open.example.com".into(),
+                url_pattern: Some("/transfer/qrcode*".into()),
+                description: None,
+            }],
+            ..Default::default()
         };
+        let rules = allowlist_from_config(&config);
+        assert_eq!(rules.len(), 1);
+        let rule = &rules[0];
         assert!(url_matches_rule(
             "https://open.example.com/transfer/qrcode?token=xxx",
-            &rule
+            rule
         ));
         assert!(!url_matches_rule(
             "https://open.example.com/api/order?token=xxx",
-            &rule
+            rule
         ));
         assert!(!url_matches_rule(
             "https://other.example.com/transfer/qrcode",
-            &rule
+            rule
+        ));
+    }
+
+    #[test]
+    fn allowlist_from_config_builds_rules() {
+        let config = LeakDetectorConfig {
+            url_allowlist: vec![
+                UrlAllowlistEntry {
+                    domain: "*.lkcoffee.com".into(),
+                    url_pattern: None,
+                    description: None,
+                },
+                UrlAllowlistEntry {
+                    domain: "api.example.com".into(),
+                    url_pattern: Some("/v1/*".into()),
+                    description: None,
+                },
+            ],
+            ..Default::default()
+        };
+        let rules = allowlist_from_config(&config);
+        assert_eq!(rules.len(), 2);
+        assert!(url_matches_rule(
+            "https://open.lkcoffee.com/x?token=t",
+            &rules[0]
+        ));
+        assert!(url_matches_rule(
+            "https://api.example.com/v1/anything",
+            &rules[1]
         ));
     }
 }

@@ -304,8 +304,9 @@ tokio::task_local! {
 }
 
 /// Scrub credentials while preserving whitelisted URL parameters.
-/// Temporarily masks whitelisted URLs with placeholders, runs the normal
-/// scrub, then restores the original URLs so their query params survive.
+///
+/// Delegates the mask/restore dance to [`crate::security`] so the
+/// placeholder format and URL/restore regexes live in one place.
 pub fn scrub_credentials_with_allowlist(
     input: &str,
     allowlist: &[crate::security::AllowlistRule],
@@ -314,36 +315,9 @@ pub fn scrub_credentials_with_allowlist(
         return scrub_credentials(input);
     }
 
-    // 1. Mask whitelisted URLs with unique placeholders
-    static URL_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
-    let url_re = URL_RE.get_or_init(|| Regex::new(r"https?://[^\s]+").unwrap());
-
-    let mut masked = String::with_capacity(input.len());
-    let mut preserved_urls: Vec<String> = Vec::new();
-    let mut last_end = 0;
-
-    for url_match in url_re.find_iter(input) {
-        let url = url_match.as_str();
-        if crate::security::url_matches_any_rule(url, allowlist) {
-            masked.push_str(&input[last_end..url_match.start()]);
-            preserved_urls.push(url.to_string());
-            masked.push_str(&format!("\u{0}ZCWLU_{}\u{0}", preserved_urls.len() - 1));
-            last_end = url_match.end();
-        }
-    }
-    masked.push_str(&input[last_end..]);
-
-    // 2. Scrub credentials on the masked content
+    let (masked, preserved_urls) = crate::security::mask_allowlist_urls(input, allowlist);
     let scrubbed = scrub_credentials(&masked);
-
-    // 3. Restore original URLs
-    let restore_re = Regex::new(r"\u{0}ZCWLU_(\d+)\u{0}").unwrap();
-    restore_re
-        .replace_all(&scrubbed, |caps: &regex::Captures| {
-            let idx: usize = caps[1].parse().unwrap_or(usize::MAX);
-            preserved_urls.get(idx).cloned().unwrap_or_default()
-        })
-        .to_string()
+    crate::security::restore_allowlist_urls(&scrubbed, &preserved_urls)
 }
 
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
@@ -952,15 +926,7 @@ pub async fn run_tool_call_loop(
         std::sync::Arc::new(
             leak_detector_config
                 .as_ref()
-                .map(|c| {
-                    c.url_allowlist
-                        .iter()
-                        .map(|e| crate::security::AllowlistRule {
-                            domain_pattern: e.domain.clone(),
-                            url_pattern: e.url_pattern.clone(),
-                        })
-                        .collect()
-                })
+                .map(|c| crate::security::allowlist_from_config(c))
                 .unwrap_or_default(),
         );
 
@@ -4201,6 +4167,59 @@ mod tests {
         let scrubbed = scrub_credentials(input);
         assert!(scrubbed.contains("\"api_key\": \"sk-1*[REDACTED]\""));
         assert!(scrubbed.contains("public"));
+    }
+
+    fn lkcoffee_allowlist_rules() -> Vec<crate::security::AllowlistRule> {
+        let config = zeroclaw_config::schema::LeakDetectorConfig {
+            url_allowlist: vec![zeroclaw_config::schema::UrlAllowlistEntry {
+                domain: "*.lkcoffee.com".into(),
+                url_pattern: None,
+                description: None,
+            }],
+            ..Default::default()
+        };
+        crate::security::allowlist_from_config(&config)
+    }
+
+    #[test]
+    fn scrub_credentials_with_allowlist_preserves_whitelist_url() {
+        let rules = lkcoffee_allowlist_rules();
+        let url = "https://open.lkcoffee.com/transfer/qrcode?token=hgnD0jgCF63vmdtP0ITJsnMYdQpvX3TE8q";
+        let out = scrub_credentials_with_allowlist(url, &rules);
+        assert_eq!(out, url, "allowlisted URL must survive scrubbing intact");
+    }
+
+    #[test]
+    fn scrub_credentials_with_allowlist_redacts_credential_outside_url() {
+        let rules = lkcoffee_allowlist_rules();
+        let input = "token=hgnD0jgCF63vmdtP0ITJsnMYdQpvX3TE8q";
+        let out = scrub_credentials_with_allowlist(input, &rules);
+        assert!(out.contains("[REDACTED]"), "non-url token must be scrubbed: {out}");
+        assert!(!out.contains("vmdtP0ITJsnMYdQpvX3TE8q"));
+    }
+
+    #[test]
+    fn scrub_credentials_with_allowlist_empty_falls_back() {
+        let rules: Vec<crate::security::AllowlistRule> = Vec::new();
+        let input = "token=hgnD0jgCF63vmdtP0ITJsnMYdQpvX3TE8q";
+        let out = scrub_credentials_with_allowlist(input, &rules);
+        assert_eq!(out, scrub_credentials(input));
+    }
+
+    #[test]
+    fn scrub_credentials_with_allowlist_same_token_in_text_and_url() {
+        let rules = lkcoffee_allowlist_rules();
+        let token = "hgnD0jgCF63vmdtP0ITJsnMYdQpvX3TE8q";
+        let input = format!(
+            "token={token} https://open.lkcoffee.com/transfer/qrcode?token={token}"
+        );
+        let out = scrub_credentials_with_allowlist(&input, &rules);
+        // Whitelisted URL survives intact, including its token param.
+        assert!(out.contains(&format!(
+            "https://open.lkcoffee.com/transfer/qrcode?token={token}"
+        )));
+        // The bare-text token is still scrubbed.
+        assert!(out.contains("[REDACTED]"));
     }
 
     #[tokio::test]

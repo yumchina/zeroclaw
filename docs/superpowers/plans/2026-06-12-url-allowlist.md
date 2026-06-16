@@ -17,7 +17,7 @@
 | 文件 | 职责 | 状态 |
 |------|------|------|
 | `crates/zeroclaw-config/src/schema.rs` | `LeakDetectorConfig`、`UrlAllowlistEntry` 结构体 | ✅ 已完成 |
-| `crates/zeroclaw-runtime/src/security/leak_detector.rs` | `from_config()`、`strip_whitelist_urls()`、辅助函数 | ✅ 已完成 |
+| `crates/zeroclaw-runtime/src/security/leak_detector.rs` | `from_config()`、`allowlist_from_config()`、`mask_allowlist_urls()`/`restore_allowlist_urls()`、预编译 `AllowlistRule` | ✅ 已完成 |
 | `crates/zeroclaw-channels/src/orchestrator/mod.rs` | `LeakDetector::from_config()` | ✅ 已完成 |
 | `crates/zeroclaw-runtime/src/agent/loop_.rs` | `scrub_credentials()` 添加白名单支持 | 🔲 TODO |
 
@@ -25,7 +25,7 @@
 
 ## 已完成 (Task 1-5)
 
-LeakDetector 修改已完成：schema 结构体、from_config、strip_whitelist_urls、scan 修改、orchestrator 调用点。
+LeakDetector 修改已完成：schema 结构体、from_config、allowlist_from_config、mask/restore（掩码-还原）、scan 修改、orchestrator 调用点。
 
 ---
 
