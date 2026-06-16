@@ -24,7 +24,7 @@ pub struct DawnAgentConfig {
 ///
 /// The key is the task type number (1, 2, 3, etc.) as a string.
 /// TOML table keys are always strings, so the numeric type is parsed at usage time.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
 pub struct DawnAgents {
     #[serde(flatten)]
@@ -39,13 +39,5 @@ impl DawnAgents {
     /// Look up an agent by numeric task type.
     pub fn get_by_type(&self, task_type: u8) -> Option<&DawnAgentConfig> {
         self.agents.get(&task_type.to_string())
-    }
-}
-
-impl Default for DawnAgents {
-    fn default() -> Self {
-        Self {
-            agents: HashMap::new(),
-        }
     }
 }
