@@ -50,8 +50,6 @@ fn compile_glob(pattern: &str, anchor: bool) -> Option<Regex> {
         match ch {
             '*' => out.push_str(".*"),
             '?' => out.push('.'),
-            // Pass through brackets unescaped for regex character classes
-            '[' | ']' => out.push(ch),
             c if c.is_ascii_alphanumeric() => out.push(c),
             c => {
                 out.push('\\');
@@ -742,7 +740,15 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
 
     #[test]
     fn allowlist_rule_invalid_pattern_returns_none() {
-        // Trailing backslash creates an invalid regex after escape.
-        assert!(AllowlistRule::new("[", None).is_none());
+        // After `compile_glob` escapes every non-glob character, normal
+        // patterns always produce valid regex. The contract this test
+        // pins is the no-panic / Option-returning behavior on adversarial
+        // input. Force regex compile to fail by exceeding its compile
+        // size limit with a huge glob expansion.
+        let huge = "*".repeat(100_000);
+        assert!(
+            AllowlistRule::new(&huge, None).is_none(),
+            "an oversize compiled regex must yield None, not panic"
+        );
     }
 }
