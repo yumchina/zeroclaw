@@ -77,6 +77,76 @@ fn split_url(url: &str) -> Option<(&str, &str)> {
     Some((host, path_query))
 }
 
+const PLACEHOLDER_PREFIX: &str = "\u{00AB}URL_ALLOWLIST_PLACEHOLDER_";
+const PLACEHOLDER_SUFFIX: &str = "\u{00BB}";
+
+static URL_FINDER_RE: std::sync::LazyLock<Regex> = std::sync::LazyLock::new(|| {
+    // Greedy URL scan. Stops at whitespace, quotes, angle brackets, or backticks.
+    Regex::new(r#"https?://[^\s"'<>`]+"#).unwrap()
+});
+
+/// Replace every URL matching any rule with a placeholder, returning the
+/// rewritten text plus a mapping the caller passes back to
+/// `restore_allowlist_urls`. Non-matching URLs are left untouched.
+pub fn mask_allowlist_urls(
+    input: &str,
+    rules: &[AllowlistRule],
+) -> (String, Vec<(String, String)>) {
+    if rules.is_empty() {
+        return (input.to_string(), Vec::new());
+    }
+    let mut mapping = Vec::new();
+    let mut idx: usize = 0;
+    let out = URL_FINDER_RE
+        .replace_all(input, |caps: &regex::Captures| {
+            let url = caps.get(0).unwrap().as_str();
+            if url_matches_any_rule(url, rules) {
+                let ph = format!("{PLACEHOLDER_PREFIX}{idx}{PLACEHOLDER_SUFFIX}");
+                mapping.push((ph.clone(), url.to_string()));
+                idx += 1;
+                ph
+            } else {
+                url.to_string()
+            }
+        })
+        .into_owned();
+    (out, mapping)
+}
+
+/// Inverse of `mask_allowlist_urls`. Cheap literal `replace` per pair —
+/// placeholders are guaranteed unique by construction.
+pub fn restore_allowlist_urls(masked: &str, mapping: &[(String, String)]) -> String {
+    if mapping.is_empty() {
+        return masked.to_string();
+    }
+    let mut out = masked.to_string();
+    for (ph, original) in mapping {
+        out = out.replace(ph, original);
+    }
+    out
+}
+
+/// Compile every `UrlAllowlistEntry` in `cfg` to an `AllowlistRule`. Rows
+/// that fail to compile are dropped after a single `warn!` so a bad config
+/// row doesn't disable the rest.
+pub fn allowlist_from_config(
+    cfg: &zeroclaw_config::schema::LeakDetectorConfig,
+) -> Vec<AllowlistRule> {
+    cfg.url_allowlist
+        .iter()
+        .filter_map(|e| {
+            AllowlistRule::new(&e.domain, e.url_pattern.as_deref()).or_else(|| {
+                zeroclaw_log::__private::tracing::warn!(
+                    domain = %e.domain,
+                    url_pattern = ?e.url_pattern,
+                    "leak_detector: dropping invalid allowlist entry"
+                );
+                None
+            })
+        })
+        .collect()
+}
+
 /// Minimum token length considered for high-entropy detection.
 const ENTROPY_TOKEN_MIN_LEN: usize = 24;
 
@@ -117,6 +187,14 @@ impl LeakDetector {
     pub fn with_sensitivity(sensitivity: f64) -> Self {
         Self {
             sensitivity: sensitivity.clamp(0.0, 1.0),
+        }
+    }
+
+    pub fn from_config(cfg: &zeroclaw_config::schema::LeakDetectorConfig) -> Self {
+        // Same logical shape as `new()` but uses configured sensitivity.
+        // The detector does NOT own the allowlist — callers mask first.
+        Self {
+            sensitivity: cfg.sensitivity,
         }
     }
 
@@ -750,5 +828,57 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
             AllowlistRule::new(&huge, None).is_none(),
             "an oversize compiled regex must yield None, not panic"
         );
+    }
+
+    use zeroclaw_config::schema::{LeakDetectorConfig, UrlAllowlistEntry};
+
+    #[test]
+    fn mask_and_restore_roundtrips_to_original() {
+        let rules = vec![AllowlistRule::new("api.example.com", None).unwrap()];
+        let input = "Visit https://api.example.com/o?token=hgnD0jgCF63abc for QR.";
+        let (masked, mapping) = mask_allowlist_urls(input, &rules);
+        assert!(!masked.contains("hgnD0jgCF63abc"), "token leaked in masked text");
+        assert_eq!(mapping.len(), 1);
+        let restored = restore_allowlist_urls(&masked, &mapping);
+        assert_eq!(restored, input);
+    }
+
+    #[test]
+    fn scan_with_masked_allowlist_preserves_token() {
+        let rules = vec![AllowlistRule::new("api.example.com", None).unwrap()];
+        let input = "QR url: https://api.example.com/o?token=hgnD0jgCF63abcdefghij";
+        let (masked, mapping) = mask_allowlist_urls(input, &rules);
+        let detector = LeakDetector::from_config(&LeakDetectorConfig::default());
+        let scan_result = detector.scan(&masked);
+        let final_text = match scan_result {
+            LeakResult::Clean => masked,
+            LeakResult::Detected { redacted, .. } => redacted,
+        };
+        let restored = restore_allowlist_urls(&final_text, &mapping);
+        assert!(
+            restored.contains("token=hgnD0jgCF63abcdefghij"),
+            "allowlisted URL token must survive scan: {restored}"
+        );
+    }
+
+    #[test]
+    fn allowlist_from_config_skips_invalid_rows() {
+        let cfg = LeakDetectorConfig {
+            sensitivity: 0.7,
+            url_allowlist: vec![
+                UrlAllowlistEntry {
+                    domain: "*".repeat(100_000), // invalid - exceeds regex compile size limit
+                    url_pattern: None,
+                    description: None,
+                },
+                UrlAllowlistEntry {
+                    domain: "api.example.com".into(),
+                    url_pattern: None,
+                    description: None,
+                },
+            ],
+        };
+        let rules = allowlist_from_config(&cfg);
+        assert_eq!(rules.len(), 1, "invalid entry must be dropped");
     }
 }

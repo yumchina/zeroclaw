@@ -71,7 +71,10 @@ pub use iam_policy::{IamPolicy, PolicyDecision};
 pub use nevis::{NevisAuthProvider, NevisIdentity};
 // Prompt injection defense exports
 #[allow(unused_imports)]
-pub use leak_detector::{LeakDetector, LeakResult};
+pub use leak_detector::{
+    AllowlistRule, LeakDetector, LeakResult, allowlist_from_config, mask_allowlist_urls,
+    restore_allowlist_urls, url_matches_any_rule,
+};
 #[allow(unused_imports)]
 pub use prompt_guard::{GuardAction, GuardResult, PromptGuard};
 
