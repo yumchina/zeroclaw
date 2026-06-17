@@ -10,6 +10,75 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
+/// One compiled allowlist entry. Use `AllowlistRule::new` to build, then
+/// pass slices to `url_matches_any_rule` / `mask_allowlist_urls`.
+#[derive(Debug, Clone)]
+pub struct AllowlistRule {
+    domain_re: Regex,
+    path_re: Option<Regex>,
+}
+
+impl AllowlistRule {
+    pub fn new(domain_glob: &str, url_pattern: Option<&str>) -> Option<Self> {
+        let domain_re = compile_glob(domain_glob, true)?;
+        let path_re = match url_pattern {
+            Some(p) => Some(compile_glob(p, true)?),
+            None => None,
+        };
+        Some(Self { domain_re, path_re })
+    }
+}
+
+/// True iff `url` matches any rule in `rules`. A rule with no `path_re`
+/// matches the whole URL on host alone; with `path_re` set, both must match.
+pub fn url_matches_any_rule(url: &str, rules: &[AllowlistRule]) -> bool {
+    let Some((host, path_query)) = split_url(url) else {
+        return false;
+    };
+    rules.iter().any(|r| {
+        r.domain_re.is_match(host)
+            && r.path_re.as_ref().map_or(true, |p| p.is_match(path_query))
+    })
+}
+
+fn compile_glob(pattern: &str, anchor: bool) -> Option<Regex> {
+    let mut out = String::with_capacity(pattern.len() * 2 + 2);
+    if anchor {
+        out.push('^');
+    }
+    for ch in pattern.chars() {
+        match ch {
+            '*' => out.push_str(".*"),
+            '?' => out.push('.'),
+            // Pass through brackets unescaped for regex character classes
+            '[' | ']' => out.push(ch),
+            c if c.is_ascii_alphanumeric() => out.push(c),
+            c => {
+                out.push('\\');
+                out.push(c);
+            }
+        }
+    }
+    if anchor {
+        out.push('$');
+    }
+    Regex::new(&out).ok()
+}
+
+/// Hand-rolled URL split avoiding a new dep. Returns (host, path_query) or None.
+fn split_url(url: &str) -> Option<(&str, &str)> {
+    let rest = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://"))?;
+    let (host, path_query) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    // Strip user-info `user@host`
+    let host = host.rsplit_once('@').map(|(_, h)| h).unwrap_or(host);
+    // Strip `:port`
+    let host = host.split(':').next().unwrap_or(host);
+    Some((host, path_query))
+}
+
 /// Minimum token length considered for high-entropy detection.
 const ENTROPY_TOKEN_MIN_LEN: usize = 24;
 
@@ -625,5 +694,55 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
         // "ab" repeated: entropy = 1.0 bit
         let e = shannon_entropy("abab");
         assert!((e - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn allowlist_rule_matches_exact_domain() {
+        let rule = AllowlistRule::new("api.example.com", None).unwrap();
+        assert!(url_matches_any_rule(
+            "https://api.example.com/v1/orders?token=abc",
+            &[rule.clone()]
+        ));
+        assert!(!url_matches_any_rule("https://evil.com/x?token=abc", &[rule]));
+    }
+
+    #[test]
+    fn allowlist_rule_wildcard_subdomain_matches() {
+        let rule = AllowlistRule::new("*.lkcoffee.com", None).unwrap();
+        assert!(url_matches_any_rule(
+            "https://open.lkcoffee.com/x?token=abc",
+            &[rule.clone()]
+        ));
+        assert!(url_matches_any_rule(
+            "https://order.api.lkcoffee.com/x?token=abc",
+            &[rule.clone()]
+        ));
+        assert!(!url_matches_any_rule(
+            "https://lkcoffee.com.evil.com/x",
+            &[rule]
+        ));
+    }
+
+    #[test]
+    fn allowlist_rule_path_filter_narrows_match() {
+        let rule = AllowlistRule::new(
+            "*.lkcoffee.com",
+            Some("/transfer/qrcode*"),
+        )
+        .unwrap();
+        assert!(url_matches_any_rule(
+            "https://open.lkcoffee.com/transfer/qrcode?token=abc",
+            &[rule.clone()]
+        ));
+        assert!(!url_matches_any_rule(
+            "https://open.lkcoffee.com/admin/login?token=abc",
+            &[rule]
+        ));
+    }
+
+    #[test]
+    fn allowlist_rule_invalid_pattern_returns_none() {
+        // Trailing backslash creates an invalid regex after escape.
+        assert!(AllowlistRule::new("[", None).is_none());
     }
 }
