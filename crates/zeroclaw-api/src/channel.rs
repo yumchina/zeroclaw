@@ -48,12 +48,27 @@ pub struct ProgressUpdate {
 /// variants the progress observer translates.
 #[derive(Debug, Clone)]
 pub enum ProgressPhase {
-    AgentStart { provider: String, model: String },
-    LlmRequest { messages_count: usize },
-    ToolStart { tool: String, tool_call_id: Option<String> },
-    ToolDone { tool: String, tool_call_id: Option<String>, success: bool, elapsed_ms: u64 },
+    AgentStart {
+        provider: String,
+        model: String,
+    },
+    LlmRequest {
+        messages_count: usize,
+    },
+    ToolStart {
+        tool: String,
+        tool_call_id: Option<String>,
+    },
+    ToolDone {
+        tool: String,
+        tool_call_id: Option<String>,
+        success: bool,
+        elapsed_ms: u64,
+    },
     AgentEnd,
-    Error { component: String },
+    Error {
+        component: String,
+    },
     /// Unstructured text with no specific phase (e.g. legacy streaming status).
     Generic,
 }
@@ -89,8 +104,73 @@ pub struct ChannelMessage {
     pub subject: Option<String>,
 }
 
+/// Message kind discriminator that selects which encoding path
+/// `Channel::send` takes.
+///
+/// `Text` is the default, matching every existing channel's current
+/// behaviour. `TaskSubmit` / `TaskQuery` are constructed only by the
+/// `dawn_create_task` / `dawn_query_task` tools and routed via the
+/// channel named in the matching `[dawn_task.<n>].channel` config entry.
+#[derive(Debug, Clone, Default)]
+pub enum SendKind {
+    /// Plain user-facing conversational message.
+    #[default]
+    Text,
+    /// Submit a task to the external executor on the other side of this channel.
+    TaskSubmit {
+        task_type: u8,
+        user_id: String,
+        user_text: String,
+        params: serde_json::Value,
+    },
+    /// Query the status of a previously submitted task.
+    TaskQuery {
+        task_type: u8,
+        user_id: String,
+        task_id: String,
+    },
+}
+
+/// Per-turn origin context for an agent invocation: identifies which user
+/// from which channel instance triggered the current `run_tool_call_loop`.
+/// Constructed by the orchestrator when an inbound `ChannelMessage` is
+/// processed, scoped via [`CHANNEL_ORIGIN`], and read by channel-aware
+/// tools (e.g. `dawn_create_task`) via `try_with`.
+#[derive(Clone, Default, Debug)]
+pub struct ChannelOrigin {
+    /// Originating user id, with any channel-specific suffix (e.g.
+    /// `_la_<bot_uid>` on DawnIM) already stripped.
+    pub from_uid: String,
+    /// Composite channel ref `"<type>.<alias>"`, e.g. `"dawnim.work"`.
+    pub channel_ref: String,
+    /// Original `ChannelMessage.reply_target` value, preserved verbatim
+    /// so reply paths reconstruct correctly.
+    pub reply_target: String,
+    /// Per-turn topic identifier. `None` means "no topic" (default
+    /// behaviour, equivalent to pre-multi-topic single-thread session).
+    /// `Some(t)` means the current turn lives in the isolated topic `t`
+    /// — its conversation history and memory are scoped separately from
+    /// other topics under the same (channel, user) pair.
+    ///
+    /// Sourced from the inbound `ChannelMessage.thread_ts` by the
+    /// orchestrator. Channel-aware tools read this to make topic-aware
+    /// decisions; the default tools (e.g. `dawn_create_task`) currently
+    /// ignore it (task messages route to external agent UIDs, not topic-
+    /// scoped user sessions).
+    pub topic: Option<String>,
+}
+
+tokio::task_local! {
+    /// Per-turn channel origin. The orchestrator's
+    /// `process_channel_message_body` calls `CHANNEL_ORIGIN.scope(...)`
+    /// around `run_tool_call_loop`; tools that need to know where the
+    /// inbound message came from read it with
+    /// `CHANNEL_ORIGIN.try_with(|o| o.clone()).unwrap_or_default()`.
+    pub static CHANNEL_ORIGIN: ChannelOrigin;
+}
+
 /// Message to send through a channel
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SendMessage {
     pub content: String,
     pub recipient: String,
@@ -104,6 +184,11 @@ pub struct SendMessage {
     pub attachments: Vec<MediaAttachment>,
     /// Message-ID to set as In-Reply-To header (email threading).
     pub in_reply_to: Option<String>,
+    /// Message kind discriminator. Defaults to `SendKind::Text` so
+    /// existing callers that don't set this field get conversational
+    /// semantics. Task tools (`dawn_create_task` / `dawn_query_task`)
+    /// explicitly set this to `TaskSubmit` / `TaskQuery`.
+    pub kind: SendKind,
 }
 
 impl SendMessage {
@@ -117,6 +202,7 @@ impl SendMessage {
             cancellation_token: None,
             attachments: vec![],
             in_reply_to: None,
+            kind: SendKind::Text,
         }
     }
 
@@ -134,6 +220,7 @@ impl SendMessage {
             cancellation_token: None,
             attachments: vec![],
             in_reply_to: None,
+            kind: SendKind::Text,
         }
     }
 
@@ -165,6 +252,20 @@ impl SendMessage {
     pub fn with_attachments(mut self, attachments: Vec<MediaAttachment>) -> Self {
         self.attachments = attachments;
         self
+    }
+
+    /// Helper for channel implementations that only support [`SendKind::Text`]:
+    /// call this at the top of `Channel::send` to reject non-Text kinds
+    /// with a readable error that names the channel.
+    pub fn ensure_text_kind(&self, channel_name: &str) -> anyhow::Result<()> {
+        if !matches!(self.kind, SendKind::Text) {
+            anyhow::bail!(
+                "channel '{}' does not support kind={:?}",
+                channel_name,
+                self.kind,
+            );
+        }
+        Ok(())
     }
 }
 
@@ -313,6 +414,19 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         !handle_norm.is_empty() && handle_norm == sender_norm
     }
 
+    /// Whether an inbound message is a direct, one-to-one conversation
+    /// with the bot (a DM/IM), as opposed to a group or broadcast
+    /// channel. A direct message is definitionally addressed to the
+    /// bot, so the orchestrator skips the reply-intent classifier and
+    /// goes straight to the tool-capable agent turn.
+    ///
+    /// Default `false`: channels that cannot prove a one-to-one context
+    /// keep the classifier precheck. Channels that distinguish DMs from
+    /// group traffic override this.
+    fn is_direct_message(&self, _msg: &ChannelMessage) -> bool {
+        false
+    }
+
     /// Whether this channel supports multi-message streaming delivery.
     fn supports_multi_message_streaming(&self) -> bool {
         false
@@ -426,6 +540,18 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(None)
     }
 
+    /// The name of the back-channel that produced the most recent
+    /// [`Channel::request_approval`] decision, when this channel fans a single
+    /// request out to several registered back-channels (the agent's approval
+    /// bridge does this so an ACP editor and a WebSocket dashboard can both
+    /// answer). Ordinary single channels return `None` — their own
+    /// [`Channel::name`] already identifies the deciding surface — so the
+    /// approval audit trail can record the channel that actually decided
+    /// instead of the turn loop's static channel name.
+    fn last_decision_channel(&self) -> Option<String> {
+        None
+    }
+
     /// Ask the user a multiple-choice question and return the chosen option's text.
     ///
     /// Returns `Ok(Some(answer))` if the channel handled the question natively
@@ -454,6 +580,21 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         true
     }
 }
+
+/// Late-bound channel registry handle: `Arc<RwLock<HashMap<channel_key, Arc<dyn Channel>>>>`.
+///
+/// Tools that need to send outbound messages take an `Arc` clone of this
+/// at construction. The orchestrator populates the inner `HashMap` after
+/// channels start up (`register_channels_for_tools`), so tools resolve a
+/// concrete `Arc<dyn Channel>` by composite key (`"<type>.<alias>"`,
+/// e.g. `"dawnim.work"`) at execute time.
+///
+/// Reload-safe: `/admin/reload` rebuilds tools and channels in lockstep;
+/// the `Arc<RwLock<_>>` outer wrapper means tool handles outlive any
+/// individual channel instance.
+pub type PerToolChannelHandle = std::sync::Arc<
+    parking_lot::RwLock<std::collections::HashMap<String, std::sync::Arc<dyn Channel>>>,
+>;
 
 #[cfg(test)]
 mod tests {
@@ -618,7 +759,12 @@ mod progress_update_tests {
         };
         assert_eq!(u.text, "shell completed (5ms)");
         match u.clone().phase {
-            ProgressPhase::ToolDone { tool, success, elapsed_ms, tool_call_id } => {
+            ProgressPhase::ToolDone {
+                tool,
+                success,
+                elapsed_ms,
+                tool_call_id,
+            } => {
                 assert_eq!(tool, "shell");
                 assert!(success);
                 assert_eq!(elapsed_ms, 5);
@@ -626,5 +772,148 @@ mod progress_update_tests {
             }
             _ => panic!("expected ToolDone phase"),
         }
+    }
+}
+
+#[cfg(test)]
+mod send_kind_tests {
+    use super::*;
+
+    #[test]
+    fn send_kind_default_is_text() {
+        assert!(matches!(SendKind::default(), SendKind::Text));
+    }
+
+    #[test]
+    fn send_kind_task_submit_holds_fields() {
+        let kind = SendKind::TaskSubmit {
+            task_type: 7,
+            user_id: "u_alice".into(),
+            user_text: "extract this pdf".into(),
+            params: serde_json::json!({"files": []}),
+        };
+        match kind {
+            SendKind::TaskSubmit {
+                task_type,
+                user_id,
+                user_text,
+                params,
+            } => {
+                assert_eq!(task_type, 7);
+                assert_eq!(user_id, "u_alice");
+                assert_eq!(user_text, "extract this pdf");
+                assert_eq!(params["files"], serde_json::json!([]));
+            }
+            _ => panic!("expected TaskSubmit"),
+        }
+    }
+
+    #[test]
+    fn send_kind_task_query_holds_fields() {
+        let kind = SendKind::TaskQuery {
+            task_type: 7,
+            user_id: "u_alice".into(),
+            task_id: "task_xyz".into(),
+        };
+        assert!(matches!(kind, SendKind::TaskQuery { task_type: 7, .. }));
+    }
+}
+
+#[cfg(test)]
+mod channel_origin_tests {
+    use super::*;
+
+    #[test]
+    fn channel_origin_default_is_empty() {
+        let o = ChannelOrigin::default();
+        assert!(o.from_uid.is_empty());
+        assert!(o.channel_ref.is_empty());
+        assert!(o.reply_target.is_empty());
+    }
+
+    #[tokio::test]
+    async fn channel_origin_scope_round_trip() {
+        let origin = ChannelOrigin {
+            from_uid: "u_alice".into(),
+            channel_ref: "dawnim.work".into(),
+            reply_target: "1:u_alice".into(),
+            topic: None,
+        };
+        let read_back = CHANNEL_ORIGIN
+            .scope(origin.clone(), async {
+                CHANNEL_ORIGIN.try_with(|o| o.clone()).unwrap()
+            })
+            .await;
+        assert_eq!(read_back.from_uid, "u_alice");
+        assert_eq!(read_back.channel_ref, "dawnim.work");
+        assert_eq!(read_back.reply_target, "1:u_alice");
+    }
+
+    #[tokio::test]
+    async fn channel_origin_outside_scope_is_default() {
+        let result = CHANNEL_ORIGIN.try_with(|o| o.clone()).unwrap_or_default();
+        assert!(result.from_uid.is_empty());
+    }
+
+    #[test]
+    fn channel_origin_default_topic_is_none() {
+        let o = ChannelOrigin::default();
+        assert!(o.topic.is_none());
+    }
+
+    #[tokio::test]
+    async fn channel_origin_scope_carries_topic() {
+        let origin = ChannelOrigin {
+            from_uid: "u_alice".into(),
+            channel_ref: "dawnim.work".into(),
+            reply_target: "1:u_alice".into(),
+            topic: Some("db_lock".into()),
+        };
+        let read_back = CHANNEL_ORIGIN
+            .scope(origin.clone(), async {
+                CHANNEL_ORIGIN.try_with(|o| o.topic.clone()).unwrap()
+            })
+            .await;
+        assert_eq!(read_back, Some("db_lock".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod send_message_kind_tests {
+    use super::*;
+
+    #[test]
+    fn send_message_new_defaults_to_text_kind() {
+        let m = SendMessage::new("hello", "user");
+        assert!(matches!(m.kind, SendKind::Text));
+    }
+
+    #[test]
+    fn send_message_default_is_text_kind() {
+        let m = SendMessage::default();
+        assert!(matches!(m.kind, SendKind::Text));
+        assert!(m.content.is_empty());
+        assert!(m.recipient.is_empty());
+    }
+
+    #[test]
+    fn ensure_text_kind_accepts_text() {
+        let m = SendMessage::new("hi", "user");
+        assert!(m.ensure_text_kind("test_channel").is_ok());
+    }
+
+    #[test]
+    fn ensure_text_kind_rejects_task_submit() {
+        let mut m = SendMessage::new("", "executor_uid");
+        m.kind = SendKind::TaskSubmit {
+            task_type: 1,
+            user_id: "u".into(),
+            user_text: "x".into(),
+            params: serde_json::Value::Null,
+        };
+        let err = m.ensure_text_kind("wechat.main").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("wechat.main"), "got: {msg}");
+        assert!(msg.contains("does not support kind"), "got: {msg}");
     }
 }

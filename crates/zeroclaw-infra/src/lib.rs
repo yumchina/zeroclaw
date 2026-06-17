@@ -10,6 +10,7 @@ pub mod session_queue;
 pub mod session_sqlite;
 pub mod session_store;
 pub mod stall_watchdog;
+pub mod topic_binding;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -67,6 +68,19 @@ pub fn make_identity_store(
         .seed_superusers(superusers)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     Ok(Arc::new(store))
+}
+
+/// Construct the cross-channel topic binding registry.
+///
+/// Opens (or creates on first mutation) `{workspace}/sessions/topic_binding.json`.
+/// Call only when `[channels].master_channel` is configured (same gate as
+/// `make_identity_store`).
+pub fn make_topic_binding_registry(
+    workspace_dir: &Path,
+) -> std::io::Result<Arc<topic_binding::TopicBindingRegistry>> {
+    let path = workspace_dir.join("sessions").join("topic_binding.json");
+    let reg = topic_binding::TopicBindingRegistry::load(path)?;
+    Ok(Arc::new(reg))
 }
 
 /// Open the SQLite backend and, on first open, import any pre-existing
@@ -190,5 +204,23 @@ mod tests {
         );
         let db = tmp.path().join("sessions").join("identity.db");
         assert!(db.exists(), "identity.db must be created under sessions/");
+    }
+
+    #[test]
+    fn make_topic_binding_registry_creates_under_sessions() {
+        let tmp = TempDir::new().unwrap();
+        let reg = make_topic_binding_registry(tmp.path()).unwrap();
+        reg.set("feishu.work", "u_alice", "db_lock");
+        let json_path = tmp.path().join("sessions").join("topic_binding.json");
+        assert!(
+            json_path.exists(),
+            "topic_binding.json must persist under sessions/"
+        );
+        // Round-trip via a fresh registry.
+        let reg2 = make_topic_binding_registry(tmp.path()).unwrap();
+        assert_eq!(
+            reg2.get("feishu.work", "u_alice"),
+            Some("db_lock".to_string())
+        );
     }
 }

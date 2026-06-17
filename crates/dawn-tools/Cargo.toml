@@ -20,6 +20,7 @@ urlencoding = "2.1"
 uuid = { version = "1.22", default-features = false, features = ["v4", "std"] }
 
 [dev-dependencies]
+parking_lot = "0.12"
 tempfile = "3.26"
 tokio = { version = "1.50", features = ["rt-multi-thread", "macros"] }
 wiremock = "0.6"

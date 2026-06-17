@@ -695,6 +695,33 @@ impl SqliteMemory {
         })
         .await?
     }
+
+    /// List distinct topic suffixes of session_ids matching
+    /// `unified_<master_id>_<topic>`. Returns the topic portion only.
+    ///
+    /// Used by the `/topic list` slash command to enumerate topics a
+    /// superuser has accumulated on the master (DawnIM) channel.
+    pub fn list_unified_topics(&self, master_id: &str) -> anyhow::Result<Vec<String>> {
+        let prefix = format!("unified_{master_id}_");
+        let pattern = format!("{prefix}%");
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT session_id
+               FROM memories
+              WHERE session_id LIKE ?1",
+        )?;
+        let rows = stmt.query_map(params![pattern], |row| row.get::<_, String>(0))?;
+        let mut topics = Vec::new();
+        for row in rows {
+            let sid = row?;
+            if let Some(topic) = sid.strip_prefix(&prefix)
+                && !topic.is_empty()
+            {
+                topics.push(topic.to_string());
+            }
+        }
+        Ok(topics)
+    }
 }
 
 #[async_trait]
@@ -3495,5 +3522,53 @@ mod tests {
         let mem = SqliteMemory::new("test", tmp.path()).unwrap();
         let entry = mem.get("global").await.unwrap().expect("row should exist");
         assert!(entry.session_id.is_none());
+    }
+
+    // ── list_unified_topics ───────────────────────────────────────
+
+    #[tokio::test]
+    async fn list_unified_topics_returns_distinct_topic_suffixes() {
+        let (_tmp, mem) = temp_sqlite();
+        for (sid, key, content) in [
+            ("unified_u_alice_db_lock", "k1", "msg1"),
+            // Different key so the upsert doesn't collapse the two
+            // "db_lock" rows into one (uniqueness is per (agent_id, key)).
+            ("unified_u_alice_db_lock", "k2", "msg2"),
+            ("unified_u_alice_migrations", "k3", "msg3"),
+            ("unified_u_alice_casual", "k4", "msg4"),
+            ("unified_u_alice", "k5", "msg5"),
+            ("unified_u_bob_other_topic", "k6", "msg6"),
+            ("dawnim_x_y_z", "k7", "msg7"),
+        ] {
+            mem.store(key, content, MemoryCategory::Core, Some(sid))
+                .await
+                .unwrap();
+        }
+
+        let mut topics = mem.list_unified_topics("u_alice").unwrap();
+        topics.sort();
+        assert_eq!(topics, vec!["casual", "db_lock", "migrations"]);
+    }
+
+    #[tokio::test]
+    async fn list_unified_topics_empty_when_no_match() {
+        let (_tmp, mem) = temp_sqlite();
+        let topics = mem.list_unified_topics("u_nobody").unwrap();
+        assert!(topics.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_unified_topics_does_not_leak_other_master_ids() {
+        let (_tmp, mem) = temp_sqlite();
+        mem.store(
+            "k",
+            "x",
+            MemoryCategory::Core,
+            Some("unified_u_alice_secret"),
+        )
+        .await
+        .unwrap();
+        let topics = mem.list_unified_topics("u_bob").unwrap();
+        assert!(topics.is_empty(), "u_bob must not see u_alice's topics");
     }
 }

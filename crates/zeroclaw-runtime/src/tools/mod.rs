@@ -32,6 +32,7 @@ pub mod security_ops;
 pub mod send_message_to_peer;
 pub mod shell;
 pub mod skill_http;
+pub mod skill_manage;
 pub mod skill_tool;
 pub mod sop_advance;
 pub mod sop_approve;
@@ -61,6 +62,8 @@ pub use zeroclaw_tools::composio::ComposioTool;
 pub use zeroclaw_tools::content_search::ContentSearchTool;
 pub use zeroclaw_tools::data_management::DataManagementTool;
 pub use zeroclaw_tools::discord_search::DiscordSearchTool;
+pub use zeroclaw_tools::email_read::EmailReadTool;
+pub use zeroclaw_tools::email_search::EmailSearchTool;
 pub use zeroclaw_tools::escalate::EscalateToHumanTool;
 pub use zeroclaw_tools::file_download::FileDownloadTool;
 pub use zeroclaw_tools::file_edit::FileEditTool;
@@ -119,11 +122,15 @@ pub use zeroclaw_tools::wrappers::{PathGuardedTool, RateLimitedTool};
 
 // Optional Dawn SaaS integration tools (separate crate, feature-gated).
 #[cfg(feature = "dawn-tools")]
+pub use dawn_tools::CreateTaskTool;
+#[cfg(feature = "dawn-tools")]
 pub use dawn_tools::DawnCrawlTool;
 #[cfg(feature = "dawn-tools")]
 pub use dawn_tools::DawnS3Tool;
 #[cfg(feature = "dawn-tools")]
 pub use dawn_tools::DawnWebSearchTool;
+#[cfg(feature = "dawn-tools")]
+pub use dawn_tools::QueryTaskTool;
 
 // Traits from zeroclaw-api
 pub use zeroclaw_api::schema::{CleaningStrategy, SchemaCleanr};
@@ -169,13 +176,8 @@ use std::sync::Arc;
 use zeroclaw_config::schema::{AliasedAgentConfig, Config};
 use zeroclaw_memory::Memory;
 
-/// Per-tool channel-map handle — `Arc<RwLock<HashMap<channel_name, channel>>>`.
-///
-/// Each channel-driven tool owns its own handle so callers can populate it
-/// independently (late-bound registration). Shared alias of the same
-/// underlying type formerly known as `ChannelMapHandle`.
-pub type PerToolChannelHandle =
-    Arc<RwLock<HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>>>>;
+/// Late-bound channel registry handle (re-exported from `zeroclaw-api`).
+pub use zeroclaw_api::channel::PerToolChannelHandle;
 
 /// Shared handle to the delegate tool's parent-tools list.
 /// Callers can push additional tools (e.g. MCP wrappers) after construction.
@@ -421,6 +423,11 @@ pub struct AllToolsResult {
     pub reaction_handle: PerToolChannelHandle,
     pub poll_handle: Option<PerToolChannelHandle>,
     pub escalate_handle: Option<PerToolChannelHandle>,
+    /// Late-bound channel registry for dawn-tools task submission.
+    /// Populated by `orchestrator::register_channels_for_tools` after
+    /// channels start; `CreateTaskTool` and `QueryTaskTool` resolve the
+    /// `Arc<dyn Channel>` from here at execute time.
+    pub task_channel_handle: PerToolChannelHandle,
     /// Pre-boxed Arcs of every tool (before policy filter). Used by
     /// skill-scoped builtin elevation to resolve targets at registration.
     pub unfiltered_tool_arcs: Vec<Arc<dyn Tool>>,
@@ -501,7 +508,7 @@ pub fn all_tools_with_runtime(
 ) -> AllToolsResult {
     let has_shell_access = runtime.has_shell_access();
     let persistent_writes = runtime.has_filesystem_access();
-    let runtime_kind = root_config.runtime.kind.as_str();
+    let runtime_kind = root_config.runtime.kind.as_wire();
     let sandbox_cfg = risk_profile.sandbox_config();
     let sandbox = create_sandbox(&sandbox_cfg, runtime_kind, Some(&security.workspace_dir));
     let mut tool_arcs: Vec<Arc<dyn Tool>> = vec![
@@ -599,6 +606,12 @@ pub fn all_tools_with_runtime(
         Arc::new(CanvasTool::new(canvas_store.unwrap_or_default())),
     ];
 
+    // Task channel handle for dawn-tools; always created (even without
+    // dawn-tools feature) so AllToolsResult always returns it. Created early
+    // so the dawn-tools block (which comes before the ask_user/reaction handles)
+    // can reference it.
+    let task_channel_handle: PerToolChannelHandle = Arc::new(RwLock::new(HashMap::new()));
+
     // A SubAgent runs as an ephemeral clone of its parent and inherits the
     // parent's model verbatim; it must not be able to switch the active
     // model out from under the parent (the switch signal is process-wide).
@@ -624,6 +637,39 @@ pub fn all_tools_with_runtime(
                     "discord_search: failed to open discord.db"
                 );
             }
+        }
+    }
+
+    // email_search — registered when at least one email channel is enabled
+    {
+        let email_configs: std::collections::HashMap<
+            String,
+            zeroclaw_config::scattered_types::EmailConfig,
+        > = root_config
+            .channels
+            .email
+            .iter()
+            .filter(|(_, c)| c.enabled)
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        if !email_configs.is_empty() {
+            let auth_service = if email_configs.values().any(|c| c.oauth2.is_some()) {
+                Some(Arc::new(
+                    zeroclaw_providers::auth::AuthService::from_config(root_config),
+                ))
+            } else {
+                None
+            };
+            let configs = Arc::new(email_configs);
+            tool_arcs.push(Arc::new(EmailSearchTool::new(
+                Arc::clone(&configs),
+                auth_service.clone(),
+            )));
+            tool_arcs.push(Arc::new(EmailReadTool::new(
+                Arc::clone(&configs),
+                auth_service,
+            )));
         }
     }
 
@@ -873,6 +919,34 @@ pub fn all_tools_with_runtime(
                 "dawn.crawl: tool registered"
             );
         }
+    }
+
+    // ── Dawn task tools (dawn_create_task / dawn_query_task) ──
+    // Always registered when the dawn-tools feature is on; gating per-task-type
+    // happens in `[dawn_task.<n>]` config. Tools refuse to execute outside a
+    // DawnIM context (channel_alias empty), so registering them in a non-DawnIM
+    // build is harmless — the LLM just sees them and either picks a config'd
+    // type or gets a clear error back.
+    #[cfg(feature = "dawn-tools")]
+    if !root_config.dawn_task.executors.is_empty() {
+        let cfg_arc = Arc::new(root_config.clone());
+        tool_arcs.push(Arc::new(CreateTaskTool::new(
+            cfg_arc.clone(),
+            task_channel_handle.clone(),
+        )));
+        tool_arcs.push(Arc::new(QueryTaskTool::new(
+            cfg_arc,
+            task_channel_handle.clone(),
+        )));
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Register)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({
+                    "task_types": root_config.dawn_task.executors.keys().collect::<Vec<_>>(),
+                })),
+            "dawn_task: dawn_create_task / dawn_query_task registered"
+        );
     }
 
     if web_fetch_config.enabled {
@@ -1219,10 +1293,17 @@ pub fn all_tools_with_runtime(
         let mut engine = crate::sop::SopEngine::new(root_config.sop.clone());
         engine.reload(workspace_dir);
         let sop_engine = Arc::new(std::sync::Mutex::new(engine));
+        let sop_audit = Arc::new(crate::sop::SopAuditLogger::new(memory.clone()));
         tool_arcs.push(Arc::new(SopListTool::new(Arc::clone(&sop_engine))));
-        tool_arcs.push(Arc::new(SopExecuteTool::new(Arc::clone(&sop_engine))));
-        tool_arcs.push(Arc::new(SopAdvanceTool::new(Arc::clone(&sop_engine))));
-        tool_arcs.push(Arc::new(SopApproveTool::new(Arc::clone(&sop_engine))));
+        tool_arcs.push(Arc::new(
+            SopExecuteTool::new(Arc::clone(&sop_engine)).with_audit(Arc::clone(&sop_audit)),
+        ));
+        tool_arcs.push(Arc::new(
+            SopAdvanceTool::new(Arc::clone(&sop_engine)).with_audit(Arc::clone(&sop_audit)),
+        ));
+        tool_arcs.push(Arc::new(
+            SopApproveTool::new(Arc::clone(&sop_engine)).with_audit(Arc::clone(&sop_audit)),
+        ));
         tool_arcs.push(Arc::new(SopStatusTool::new(Arc::clone(&sop_engine))));
     }
 
@@ -1293,6 +1374,7 @@ pub fn all_tools_with_runtime(
                     reaction_handle,
                     poll_handle: Some(poll_handle),
                     escalate_handle,
+                    task_channel_handle,
                 };
             }
 
@@ -1491,6 +1573,7 @@ pub fn all_tools_with_runtime(
         reaction_handle,
         poll_handle: Some(poll_handle),
         escalate_handle,
+        task_channel_handle,
     }
 }
 
@@ -1717,6 +1800,79 @@ mod tests {
         assert!(names.contains(&"model_routing_config"));
         assert!(names.contains(&"pushover"));
         assert!(names.contains(&"proxy_config"));
+    }
+
+    /// Wiring guard for issue #6689: SOP tools registered via `all_tools` must
+    /// carry a real audit logger, so a tool-driven run persists the documented
+    /// `sop_run_*` Memory key. The per-tool unit tests prove `with_audit` works;
+    /// this is the only test proving registration actually wires it. Without the
+    /// `.with_audit(...)` calls in the SOP block, the audit trail is silently a
+    /// no-op on the agent path (the path the AMQP/sop_execute deployment uses).
+    #[tokio::test]
+    async fn registered_sop_tools_persist_audit_trail() {
+        let tmp = TempDir::new().unwrap();
+        let sops_dir = tmp.path().join("sops");
+        let sop_subdir = sops_dir.join("canary");
+        std::fs::create_dir_all(&sop_subdir).unwrap();
+        std::fs::write(
+            sop_subdir.join("SOP.toml"),
+            "[sop]\nname = \"canary\"\ndescription = \"audit wiring guard\"\nversion = \"1.0.0\"\n\n[[triggers]]\ntype = \"manual\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sop_subdir.join("SOP.md"),
+            "## Steps\n\n1. **Resolve** Do the first step\n   - tools: shell\n",
+        )
+        .unwrap();
+
+        let mem_cfg = MemoryConfig {
+            backend: "sqlite".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(zeroclaw_memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+
+        let security = Arc::new(SecurityPolicy::default());
+        let mut cfg = test_config(&tmp);
+        cfg.sop.sops_dir = Some(sops_dir.to_string_lossy().into_owned());
+
+        let tools = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            &zeroclaw_config::schema::RiskProfileConfig::default(),
+            "test-agent",
+            mem.clone(),
+            None,
+            None,
+            &BrowserConfig::default(),
+            &zeroclaw_config::schema::HttpRequestConfig::default(),
+            &zeroclaw_config::schema::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+            false,
+            None,
+        )
+        .tools;
+
+        let execute = tools
+            .iter()
+            .find(|t| t.name() == "sop_execute")
+            .expect("sop_execute must be registered when sops_dir is set");
+        let result = execute
+            .execute(serde_json::json!({"name": "canary"}))
+            .await
+            .unwrap();
+        assert!(result.success, "sop_execute failed: {result:?}");
+
+        let audit = crate::sop::SopAuditLogger::new(mem.clone());
+        let run_keys = audit.list_runs().await.unwrap();
+        assert!(
+            !run_keys.is_empty(),
+            "registered sop_execute must persist a sop_run_* audit entry; got none (audit not wired)"
+        );
     }
 
     #[test]
@@ -2032,5 +2188,139 @@ mod tests {
             !subagent.iter().any(|n| n == ModelSwitchTool::NAME),
             "subagent must not be able to switch the inherited model"
         );
+    }
+}
+
+/// Sweep `[dawn_task.<n>]` executor configs against the populated channel
+/// handle. Any `executor.channel` that doesn't match a registered channel
+/// key emits a WARN log. Does not fail or block startup — surfaces config
+/// typos / disabled channels early so operators see them in logs without
+/// the deployment dying.
+pub fn validate_dawn_task_executors(config: &Config, handle: &PerToolChannelHandle) {
+    let missing = validate_dawn_task_executors_collect(config, handle);
+    if missing.is_empty() {
+        return;
+    }
+    let map = handle.read();
+    let available: Vec<&String> = map.keys().collect();
+    for ch_ref in &missing {
+        let affected_task_types: Vec<&String> = config
+            .dawn_task
+            .executors
+            .iter()
+            .filter(|(_, exec)| &exec.channel == ch_ref)
+            .map(|(k, _)| k)
+            .collect();
+        ::zeroclaw_log::record!(
+            WARN,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                .with_attrs(::serde_json::json!({
+                    "missing_channel": ch_ref,
+                    "affected_task_types": affected_task_types,
+                    "available_channels": available,
+                })),
+            "dawn_task: configured channel is not registered; affected tasks will be unavailable"
+        );
+    }
+}
+
+/// Test-friendly variant: returns the deduped list of missing channel refs
+/// instead of logging them. Production callers use
+/// [`validate_dawn_task_executors`].
+pub fn validate_dawn_task_executors_collect(
+    config: &Config,
+    handle: &PerToolChannelHandle,
+) -> Vec<String> {
+    let map = handle.read();
+    let mut missing: Vec<String> = config
+        .dawn_task
+        .executors
+        .values()
+        .map(|exec| exec.channel.clone())
+        .filter(|ch_ref| !map.contains_key(ch_ref))
+        .collect();
+    missing.sort();
+    missing.dedup();
+    missing
+}
+
+#[cfg(test)]
+mod validate_dawn_task_tests {
+    use super::*;
+
+    fn cfg_with_one_executor(channel_ref: &str) -> Config {
+        let toml = format!(
+            r#"
+[dawn_task.1]
+channel = "{channel_ref}"
+recipient = "r"
+name = "n"
+description = "d"
+"#
+        );
+        toml::from_str(&toml).expect("test toml parses")
+    }
+
+    #[test]
+    fn validate_returns_missing_channel_refs() {
+        let cfg = cfg_with_one_executor("wechat.missing");
+        let handle: PerToolChannelHandle =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let missing = validate_dawn_task_executors_collect(&cfg, &handle);
+        assert_eq!(missing, vec!["wechat.missing".to_string()]);
+    }
+
+    #[test]
+    fn validate_returns_empty_when_channel_present() {
+        let cfg = cfg_with_one_executor("dawnim.work");
+        let map = std::collections::HashMap::from([(
+            "dawnim.work".to_string(),
+            placeholder_channel(),
+        )]);
+        let handle: PerToolChannelHandle = Arc::new(RwLock::new(map));
+        let missing = validate_dawn_task_executors_collect(&cfg, &handle);
+        assert!(missing.is_empty(), "got: {missing:?}");
+    }
+
+    #[test]
+    fn validate_no_executors_returns_empty() {
+        let cfg: Config = toml::from_str("").expect("empty toml parses");
+        let handle: PerToolChannelHandle =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+        let missing = validate_dawn_task_executors_collect(&cfg, &handle);
+        assert!(missing.is_empty());
+    }
+
+    fn placeholder_channel() -> Arc<dyn zeroclaw_api::channel::Channel> {
+        use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
+
+        struct Stub;
+        impl zeroclaw_api::attribution::Attributable for Stub {
+            fn role(&self) -> zeroclaw_api::attribution::Role {
+                zeroclaw_api::attribution::Role::Channel(
+                    zeroclaw_api::attribution::ChannelKind::Cli,
+                )
+            }
+            fn alias(&self) -> &str {
+                "stub"
+            }
+        }
+        #[async_trait::async_trait]
+        impl Channel for Stub {
+            fn name(&self) -> &str {
+                "stub"
+            }
+            async fn send(&self, _: &SendMessage) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn listen(
+                &self,
+                _: tokio::sync::mpsc::Sender<ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        Arc::new(Stub)
     }
 }

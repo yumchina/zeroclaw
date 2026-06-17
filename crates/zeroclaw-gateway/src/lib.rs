@@ -823,12 +823,14 @@ pub async fn run_gateway(
             // reaction_handle_gw is PerToolChannelHandle (not Option);
             // register_channels_for_tools expects &Option for all handles.
             let reaction_handle_gw_opt = Some(all_tools_result.reaction_handle.clone());
+            let task_handle_gw_opt = Some(all_tools_result.task_channel_handle.clone());
             let channel_names = zeroclaw_channels::orchestrator::register_channels_for_tools(
                 &config,
                 &all_tools_result.ask_user_handle,
                 &reaction_handle_gw_opt,
                 &all_tools_result.poll_handle,
                 &all_tools_result.escalate_handle,
+                &task_handle_gw_opt,
             );
             if !channel_names.is_empty() {
                 ::zeroclaw_log::record!(
@@ -841,6 +843,10 @@ pub async fn run_gateway(
                     ),
                 );
             }
+            zeroclaw_runtime::tools::validate_dawn_task_executors(
+                &config,
+                &all_tools_result.task_channel_handle,
+            );
             (all_tools_result.tools, all_tools_result.delegate_handle)
         }
         (Some(_), None) => {
@@ -1299,15 +1305,17 @@ pub async fn run_gateway(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
             "Web dashboard: not available — configured gateway.web_dist_dir is missing on \
-             this machine and no fallback location was found. Build with `cargo web build` \
-             and point gateway.web_dist_dir at the resulting web/dist directory."
+             this machine and no fallback location was found. Reinstall with the supported \
+             installer (`./install.sh --source` on Linux/macOS, `setup.bat` on Windows) to \
+             build and place the dashboard where the gateway looks for it."
         );
     } else {
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
-            "Web dashboard: not available — no web/dist found. Build with `cargo web build` \
-             and point gateway.web_dist_dir at the resulting web/dist directory."
+            "Web dashboard: not available — no web/dist found. Reinstall with the supported \
+             installer (`./install.sh --source` on Linux/macOS, `setup.bat` on Windows) to \
+             build and place the dashboard where the gateway looks for it."
         );
     }
 
@@ -1534,6 +1542,10 @@ pub async fn run_gateway(
         )
         .route("/api/config/templates", get(api_config::handle_templates))
         .route("/api/config/map-keys", get(api_config::handle_get_map_keys))
+        .route(
+            "/api/config/resolve-alias-source",
+            get(api_config::handle_resolve_alias_source),
+        )
         .route(
             "/api/config/map-key",
             post(api_config::handle_map_key).delete(api_config::handle_delete_map_key),
@@ -4400,7 +4412,7 @@ mod tests {
         // matching [risk_profiles.<key>] entry exists.
         let agent = AliasedAgentConfig {
             enabled: true,
-            risk_profile: "definitely_not_configured".to_string(),
+            risk_profile: "definitely_not_configured".into(),
             ..AliasedAgentConfig::default()
         };
         config.agents.insert("fake123".to_string(), agent);

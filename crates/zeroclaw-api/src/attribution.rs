@@ -138,6 +138,8 @@ pub enum ToolKind {
     Wait,
     #[strum(serialize = "dawn_s3")]
     DawnS3,
+    #[strum(serialize = "dawn_task")]
+    DawnTask,
     Plugin,
 }
 

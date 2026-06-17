@@ -130,6 +130,11 @@ pub struct RecvNotificationParams {
     pub channel_type: u8,
     pub payload: serde_json::Value,
     pub timestamp: i64,
+    /// DawnIM logical topic identifier. `None` / `Some("")` / `Some("0")`
+    /// all mean "no topic" (default thread). Any other value is treated
+    /// as an isolated topic and mapped to `ChannelMessage.thread_ts`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -160,6 +165,10 @@ pub struct SyncMessage {
     pub from_uid: String,
     pub payload: serde_json::Value,
     pub timestamp: i64,
+    /// DawnIM logical topic identifier (offline sync). See
+    /// `RecvNotificationParams.topic` for semantics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -237,5 +246,50 @@ mod tests {
     fn header_skips_none_fields() {
         let h = Header::default();
         assert_eq!(serde_json::to_string(&h).unwrap(), "{}");
+    }
+
+    #[test]
+    fn recv_params_parses_topic_when_present() {
+        let json = r#"{
+            "messageId": "m1",
+            "messageSeq": 1,
+            "fromUid": "u_alice",
+            "channelId": "u_alice",
+            "channelType": 1,
+            "payload": {},
+            "timestamp": 0,
+            "topic": "db_lock"
+        }"#;
+        let parsed: RecvNotificationParams = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.topic.as_deref(), Some("db_lock"));
+    }
+
+    #[test]
+    fn recv_params_topic_defaults_to_none_when_missing() {
+        let json = r#"{
+            "messageId": "m1",
+            "messageSeq": 1,
+            "fromUid": "u_alice",
+            "channelId": "u_alice",
+            "channelType": 1,
+            "payload": {},
+            "timestamp": 0
+        }"#;
+        let parsed: RecvNotificationParams = serde_json::from_str(json).unwrap();
+        assert!(parsed.topic.is_none());
+    }
+
+    #[test]
+    fn sync_message_parses_topic() {
+        let json = r#"{
+            "message_id": "m1",
+            "message_seq": 1,
+            "from_uid": "u_alice",
+            "payload": {},
+            "timestamp": 0,
+            "topic": "db_lock"
+        }"#;
+        let parsed: SyncMessage = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.topic.as_deref(), Some("db_lock"));
     }
 }

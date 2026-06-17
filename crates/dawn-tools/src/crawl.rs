@@ -48,13 +48,12 @@ impl DawnCrawlTool {
             )
         })?;
 
-        let config: zeroclaw_config::schema::Config =
-            toml::from_str(&contents).map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to parse config file {} for Dawn crawl token: {e}",
-                    self.config_path.display()
-                )
-            })?;
+        let config: zeroclaw_config::schema::Config = toml::from_str(&contents).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse config file {} for Dawn crawl token: {e}",
+                self.config_path.display()
+            )
+        })?;
 
         // Resolve: [dawn.crawl].token → [dawn].token
         let raw_key = config
@@ -126,10 +125,8 @@ impl DawnCrawlTool {
         let body = json!({ "urls": [url] });
 
         let builder = reqwest::Client::builder().timeout(Duration::from_secs(self.timeout_secs));
-        let builder = zeroclaw_config::schema::apply_runtime_proxy_to_builder(
-            builder,
-            "tool.dawn_crawl",
-        );
+        let builder =
+            zeroclaw_config::schema::apply_runtime_proxy_to_builder(builder, "tool.dawn_crawl");
         let client = builder.build()?;
 
         let response = client
@@ -148,7 +145,10 @@ impl DawnCrawlTool {
     }
 }
 
-tool_attribution!(DawnCrawlTool, ::zeroclaw_api::attribution::ToolKind::FetchUrl);
+tool_attribution!(
+    DawnCrawlTool,
+    ::zeroclaw_api::attribution::ToolKind::FetchUrl
+);
 
 #[async_trait]
 impl Tool for DawnCrawlTool {

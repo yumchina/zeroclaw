@@ -20,16 +20,16 @@ use zeroclaw_config::schema::DawnIMConfig;
 
 use super::approval::{PendingApprovals, WkApprovalAction, build_approval_card};
 use super::connection::{
-    ClearUnreadRequest, ConnectParams, HEARTBEAT_TIMEOUT, Header, JsonRpcNotification,
-    JsonRpcRequest, JsonRpcResponse, PING_INTERVAL, RecvAckParams, RecvNotificationParams,
-    SendParams, SyncRequest, SyncResponse, DAWN_IM_RPC_VERSION, WkChannelType, WkMessageType,
+    ClearUnreadRequest, ConnectParams, DAWN_IM_RPC_VERSION, HEARTBEAT_TIMEOUT, Header,
+    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, PING_INTERVAL, RecvAckParams,
+    RecvNotificationParams, SendParams, SyncRequest, SyncResponse, WkChannelType, WkMessageType,
     WsSink,
 };
 use super::exception_card::build_exception_card;
 use super::filter::{is_mentioned, is_user_allowed, parse_recipient};
 use super::messaging::{
-    download_file_to_workspace, download_image_as_base64, encode_text_payload,
-    encode_progress_payload, process_markdown_resources,
+    download_file_to_workspace, download_image_as_base64, encode_progress_payload,
+    encode_text_payload, process_markdown_resources,
 };
 
 #[derive(serde::Serialize, serde::Deserialize, Clone)]
@@ -64,6 +64,16 @@ impl From<&SendMessage> for PendingMessage {
 struct SyncState {
     max_version: i64,
     channel_seqs: HashMap<String, u32>,
+}
+
+/// Normalise a DawnIM `topic` field into an Option<String> suitable for
+/// `ChannelMessage.thread_ts`. The DawnIM protocol uses `"0"` and `""`
+/// as sentinels for "no topic"; both map to `None` so historical
+/// single-thread conversations get the legacy session key unchanged.
+fn topic_to_thread(topic: Option<&str>) -> Option<String> {
+    topic
+        .filter(|t| !t.is_empty() && *t != "0")
+        .map(ToString::to_string)
 }
 
 #[derive(Clone)]
@@ -360,12 +370,7 @@ impl DawnIMChannel {
         if seq > mem_current {
             if let Err(e) = self
                 .memory
-                .store(
-                    &seq_key_mem,
-                    &seq.to_string(),
-                    MemoryCategory::Core,
-                    None,
-                )
+                .store(&seq_key_mem, &seq.to_string(), MemoryCategory::Core, None)
                 .await
             {
                 ::zeroclaw_log::record!(
@@ -514,6 +519,7 @@ impl DawnIMChannel {
                         channel_type: conv.channel_type,
                         payload: m.payload.clone(),
                         timestamp: m.timestamp,
+                        topic: m.topic.clone(),
                     });
 
                     let payload_json: Option<serde_json::Value> = if m.payload.is_string() {
@@ -584,6 +590,8 @@ impl DawnIMChannel {
         params: RecvNotificationParams,
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> anyhow::Result<()> {
+        let topic_thread = topic_to_thread(params.topic.as_deref());
+
         if params.from_uid == self.uid {
             return Ok(());
         }
@@ -654,7 +662,7 @@ impl DawnIMChannel {
                     channel: "dawnim".to_string(),
                     channel_alias: Some(self.alias.clone()),
                     timestamp: u64::try_from(params.timestamp.max(0)).unwrap_or(0),
-                    thread_ts: None,
+                    thread_ts: topic_thread.clone(),
                     interruption_scope_id: None,
                     attachments: vec![],
                     subject: None,
@@ -790,7 +798,7 @@ impl DawnIMChannel {
             channel: "dawnim".to_string(),
             channel_alias: Some(self.alias.clone()),
             timestamp: u64::try_from(params.timestamp.max(0)).unwrap_or(0),
-            thread_ts: None,
+            thread_ts: topic_thread.clone(),
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
@@ -842,6 +850,73 @@ impl DawnIMChannel {
         Ok(())
     }
 
+    /// Send a task-related CMD payload (`dawn.create_task` or `dawn.query_task`)
+    /// to an external DawnIM task executor via the `send` JSON-RPC endpoint.
+    /// Construct `SendParams` for a `SendKind::Text` outbound message,
+    /// including the DawnIM topic mapping (`SendMessage.thread_ts` →
+    /// `SendParams.topic` + `setting` bit-3 to flag topic presence to the
+    /// DawnIM server). Topic sentinels `""` and `"0"` are filtered to
+    /// `None` via `topic_to_thread`.
+    fn build_text_send_params(
+        &self,
+        message: &zeroclaw_api::channel::SendMessage,
+    ) -> anyhow::Result<SendParams> {
+        let payload_b64 = if let Some(code) = message.content.strip_prefix("ERR:") {
+            let card = build_exception_card(code);
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(&card)?)
+        } else {
+            encode_text_payload(&message.content)?
+        };
+        let (channel_id, channel_type) = parse_recipient(&message.recipient);
+        let topic_out = topic_to_thread(message.thread_ts.as_deref());
+        let setting_out: Option<u32> = topic_out.as_ref().map(|_| 8u32);
+        Ok(SendParams {
+            from_uid: Some(self.uid.clone()),
+            client_msg_no: Uuid::new_v4().to_string(),
+            channel_id,
+            channel_type,
+            payload: serde_json::Value::String(payload_b64),
+            header: None,
+            setting: setting_out,
+            msg_key: None,
+            expire: None,
+            stream_no: None,
+            topic: topic_out,
+        })
+    }
+
+    ///
+    /// The `payload` is serialised to JSON, base64-encoded per the DawnIM
+    /// `SendParams.payload` contract, and shipped via `send_rpc("send")` with
+    /// `channel_type = 1` (personal channel) and the executor's `recipient` uid.
+    ///
+    /// This helper is called by the `SendKind::TaskSubmit` / `TaskQuery` branches
+    /// in [`Channel::send`](trait.Channel.html#tymethod.send), following the
+    /// dispatch added in T4 of the dawn-tools/channel decoupling migration.
+    async fn send_task_payload(
+        &self,
+        recipient: &str,
+        payload: serde_json::Value,
+    ) -> anyhow::Result<()> {
+        let payload_bytes = serde_json::to_vec(&payload)?;
+        let payload_b64 = base64::engine::general_purpose::STANDARD.encode(&payload_bytes);
+        let params = SendParams {
+            from_uid: Some(self.uid.clone()),
+            client_msg_no: Uuid::new_v4().to_string(),
+            channel_id: recipient.to_string(),
+            channel_type: 1,
+            payload: serde_json::Value::String(payload_b64),
+            header: None,
+            setting: None,
+            msg_key: None,
+            expire: None,
+            stream_no: None,
+            topic: None,
+        };
+        let _: serde_json::Value = self.send_rpc("send", params).await?;
+        Ok(())
+    }
+
     async fn process_offline_batch(
         &self,
         messages: Vec<RecvNotificationParams>,
@@ -860,33 +935,7 @@ impl DawnIMChannel {
         let channel_id = first.channel_id.clone();
         let channel_type = first.channel_type;
         let is_group = channel_type == WkChannelType::GROUP;
-
-        let is_silent = if is_group && self.mention_only {
-            let mut has_mention = false;
-            for m in &sorted_messages {
-                let payload_json: serde_json::Value = if m.payload.is_string() {
-                    base64::engine::general_purpose::STANDARD
-                        .decode(m.payload.as_str().unwrap_or_default())
-                        .ok()
-                        .and_then(|b| serde_json::from_slice(&b).ok())
-                        .unwrap_or_default()
-                } else {
-                    m.payload.clone()
-                };
-                let content = payload_json
-                    .get("content")
-                    .and_then(|c| c.as_str())
-                    .unwrap_or_default();
-
-                if is_mentioned(&self.uid, &payload_json, content) {
-                    has_mention = true;
-                    break;
-                }
-            }
-            !has_mention
-        } else {
-            false
-        };
+        let total_count = sorted_messages.len();
 
         ::zeroclaw_log::record!(
             INFO,
@@ -894,15 +943,54 @@ impl DawnIMChannel {
                 ::serde_json::json!({
                     "channel_id": channel_id,
                     "channel_type": channel_type,
-                    "count": sorted_messages.len(),
-                    "is_silent": is_silent,
+                    "count": total_count,
                 })
             ),
             "DawnIM: processing offline batch"
         );
 
-        self.send_offline_batch_as_single_message(sorted_messages, is_silent, tx)
-            .await?;
+        // Group by topic — different topics get separate ChannelMessages
+        // so their session histories / memories stay isolated. Order
+        // within a topic is preserved (sorted_messages is already sorted
+        // by timestamp).
+        let mut by_topic: std::collections::HashMap<Option<String>, Vec<RecvNotificationParams>> =
+            std::collections::HashMap::new();
+        for m in sorted_messages {
+            let topic = topic_to_thread(m.topic.as_deref());
+            by_topic.entry(topic).or_default().push(m);
+        }
+
+        for (topic_thread, group) in by_topic {
+            // is_silent is recomputed per topic group: a mention in topic A
+            // shouldn't suppress topic B's silent flag.
+            let group_silent = if is_group && self.mention_only {
+                let mut has_mention = false;
+                for m in &group {
+                    let payload_json: serde_json::Value = if m.payload.is_string() {
+                        base64::engine::general_purpose::STANDARD
+                            .decode(m.payload.as_str().unwrap_or_default())
+                            .ok()
+                            .and_then(|b| serde_json::from_slice(&b).ok())
+                            .unwrap_or_default()
+                    } else {
+                        m.payload.clone()
+                    };
+                    let content = payload_json
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or_default();
+                    if is_mentioned(&self.uid, &payload_json, content) {
+                        has_mention = true;
+                        break;
+                    }
+                }
+                !has_mention
+            } else {
+                false
+            };
+            self.send_offline_batch_as_single_message(group, topic_thread, group_silent, tx)
+                .await?;
+        }
 
         self.clear_unread(&channel_id, channel_type, last_seq)
             .await?;
@@ -912,6 +1000,7 @@ impl DawnIMChannel {
     async fn send_offline_batch_as_single_message(
         &self,
         messages: Vec<RecvNotificationParams>,
+        topic_thread: Option<String>,
         silent: bool,
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> anyhow::Result<()> {
@@ -1000,7 +1089,7 @@ impl DawnIMChannel {
             channel: "dawnim".to_string(),
             channel_alias: Some(self.alias.clone()),
             timestamp: u64::try_from(last.timestamp.max(0)).unwrap_or(0),
-            thread_ts: None,
+            thread_ts: topic_thread.clone(),
             interruption_scope_id: None,
             attachments: vec![],
             subject: None,
@@ -1055,92 +1144,131 @@ impl Channel for DawnIMChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
-        let payload_b64 = if let Some(code) = message.content.strip_prefix("ERR:") {
-            let card = build_exception_card(code);
-            base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(&card)?)
-        } else {
-            encode_text_payload(&message.content)?
-        };
-        let (channel_id, channel_type) = parse_recipient(&message.recipient);
-        let params = SendParams {
-            from_uid: Some(self.uid.clone()),
-            client_msg_no: Uuid::new_v4().to_string(),
-            channel_id,
-            channel_type,
-            payload: serde_json::Value::String(payload_b64),
-            header: None,
-            setting: None,
-            msg_key: None,
-            expire: None,
-            stream_no: None,
-            topic: None,
-        };
-        let mut g = self.ws_sink.write().await;
-        match g.as_mut() {
-            Some(s) => {
-                let req = JsonRpcRequest {
-                    jsonrpc: DAWN_IM_RPC_VERSION.to_string(),
-                    method: "send".to_string(),
-                    id: Uuid::new_v4().to_string(),
-                    params,
-                };
-                let msg = serde_json::to_string(&req)?;
-                match s.send(WsMsg::Text(msg.into())).await {
-                    Ok(_) => {
-                        drop(g);
-                        if let Err(e) = self.remove_from_pending_outbound(message).await {
-                            ::zeroclaw_log::record!(
-                                DEBUG,
-                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                                "DawnIM: remove_from_pending_outbound"
-                            );
+        use zeroclaw_api::channel::SendKind;
+
+        match &message.kind {
+            SendKind::Text => {
+                let params = self.build_text_send_params(message)?;
+                let mut g = self.ws_sink.write().await;
+                match g.as_mut() {
+                    Some(s) => {
+                        let req = JsonRpcRequest {
+                            jsonrpc: DAWN_IM_RPC_VERSION.to_string(),
+                            method: "send".to_string(),
+                            id: Uuid::new_v4().to_string(),
+                            params,
+                        };
+                        let msg = serde_json::to_string(&req)?;
+                        match s.send(WsMsg::Text(msg.into())).await {
+                            Ok(_) => {
+                                drop(g);
+                                if let Err(e) = self.remove_from_pending_outbound(message).await {
+                                    ::zeroclaw_log::record!(
+                                        DEBUG,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Note
+                                        )
+                                        .with_attrs(
+                                            ::serde_json::json!({"error": format!("{}", e)})
+                                        ),
+                                        "DawnIM: remove_from_pending_outbound"
+                                    );
+                                }
+                                Ok(())
+                            }
+                            Err(err) => {
+                                ::zeroclaw_log::record!(
+                                    WARN,
+                                    ::zeroclaw_log::Event::new(
+                                        module_path!(),
+                                        ::zeroclaw_log::Action::Fail
+                                    )
+                                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                                    .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
+                                    "DawnIM: WebSocket send failed. Clearing sink and buffering message."
+                                );
+                                *g = None;
+                                drop(g);
+                                self.pending_outbound.lock().await.push(message.clone());
+                                if let Err(e) = self.save_pending_outbound().await {
+                                    ::zeroclaw_log::record!(
+                                        WARN,
+                                        ::zeroclaw_log::Event::new(
+                                            module_path!(),
+                                            ::zeroclaw_log::Action::Save
+                                        )
+                                        .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                        .with_attrs(
+                                            ::serde_json::json!({"error": format!("{}", e)})
+                                        ),
+                                        "DawnIM: failed to persist pending outbound"
+                                    );
+                                }
+                                Ok(())
+                            }
                         }
-                        Ok(())
                     }
-                    Err(err) => {
-                        ::zeroclaw_log::record!(
-                            WARN,
-                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
-                                .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
-                                .with_attrs(::serde_json::json!({"error": format!("{}", err)})),
-                            "DawnIM: WebSocket send failed. Clearing sink and buffering message."
-                        );
-                        *g = None;
+                    None => {
                         drop(g);
                         self.pending_outbound.lock().await.push(message.clone());
                         if let Err(e) = self.save_pending_outbound().await {
                             ::zeroclaw_log::record!(
                                 WARN,
-                                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Save)
-                                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Save
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                                .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
                                 "DawnIM: failed to persist pending outbound"
                             );
                         }
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                                .with_attrs(::serde_json::json!({"pending": self.pending_outbound.lock().await.len()})),
+                            "DawnIM: not connected, buffered message"
+                        );
                         Ok(())
                     }
                 }
             }
-            None => {
-                drop(g);
-                self.pending_outbound.lock().await.push(message.clone());
-                if let Err(e) = self.save_pending_outbound().await {
-                    ::zeroclaw_log::record!(
-                        WARN,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Save)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
-                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
-                        "DawnIM: failed to persist pending outbound"
-                    );
-                }
-                ::zeroclaw_log::record!(
-                    WARN,
-                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                        .with_attrs(::serde_json::json!({"pending": self.pending_outbound.lock().await.len()})),
-                    "DawnIM: not connected, buffered message"
-                );
-                Ok(())
+            SendKind::TaskSubmit {
+                task_type,
+                user_id,
+                user_text,
+                params,
+            } => {
+                let payload = serde_json::json!({
+                    "type": 2000,
+                    "cmd": "dawn.create_task",
+                    "param": {
+                        "task_type": task_type,
+                        "user_id": user_id,
+                        "user_text": user_text,
+                        "params": params,
+                        "reply_to": self.uid,
+                    }
+                });
+                self.send_task_payload(&message.recipient, payload).await
+            }
+            SendKind::TaskQuery {
+                task_type,
+                user_id,
+                task_id,
+            } => {
+                let payload = serde_json::json!({
+                    "type": 2000,
+                    "cmd": "dawn.query_task",
+                    "param": {
+                        "task_type": task_type,
+                        "user_id": user_id,
+                        "task_id": task_id,
+                        "reply_to": self.uid,
+                    }
+                });
+                self.send_task_payload(&message.recipient, payload).await
             }
         }
     }
@@ -1433,5 +1561,340 @@ impl Channel for DawnIMChannel {
                 Ok(Some(ChannelApprovalResponse::Deny))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod send_kind_dispatch_tests {
+    use super::*;
+    use zeroclaw_api::channel::{SendKind, SendMessage};
+
+    fn build_channel() -> DawnIMChannel {
+        // Use from_config to construct channel; don't actually connect WS.
+        let cfg = zeroclaw_config::schema::DawnIMConfig {
+            enabled: true,
+            ws_url: "ws://localhost:5200".into(),
+            uid: "bot_uid_1".into(),
+            token: String::new(),
+            device_id: "test-device".into(),
+            device_flag: 1,
+            allowed_users: vec![],
+            mention_only: false,
+            approval_timeout_secs: 300,
+            downloads_dir: "downloads".into(),
+            dawn_url: String::new(),
+            dawn_token: String::new(),
+            ack_reactions: false,
+            ack_reactions_message: String::new(),
+            ack_reactions_delay: 300,
+            progress_streaming: false,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn zeroclaw_api::memory_traits::Memory> = Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", tmp.path(), "send_kind_test")
+                .unwrap(),
+        );
+        DawnIMChannel::from_config(&cfg, "test", tmp.path(), memory)
+    }
+
+    /// TaskSubmit kind enters send_task_payload → send_rpc path.
+    /// Unconnected WS should bail at send_rpc layer (not at Text encoding layer).
+    #[tokio::test]
+    async fn send_task_submit_reaches_send_rpc_layer() {
+        let ch = build_channel();
+        let msg = SendMessage {
+            recipient: "1878_xuanji_agent".into(),
+            kind: SendKind::TaskSubmit {
+                task_type: 1,
+                user_id: "u_alice".into(),
+                user_text: "extract this pdf".into(),
+                params: serde_json::json!({"files": []}),
+            },
+            ..Default::default()
+        };
+        let err = ch.send(&msg).await.unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("not connected") || err_str.contains("RPC"),
+            "expected WS-layer error, got: {err_str}"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_task_query_reaches_send_rpc_layer() {
+        let ch = build_channel();
+        let msg = SendMessage {
+            recipient: "1878_xuanji_agent".into(),
+            kind: SendKind::TaskQuery {
+                task_type: 1,
+                user_id: "u_alice".into(),
+                task_id: "task_abc".into(),
+            },
+            ..Default::default()
+        };
+        let err = ch.send(&msg).await.unwrap_err();
+        let err_str = err.to_string();
+        assert!(
+            err_str.contains("not connected") || err_str.contains("RPC"),
+            "expected WS-layer error, got: {err_str}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod topic_to_thread_tests {
+    use super::topic_to_thread;
+
+    #[test]
+    fn none_maps_to_none() {
+        assert_eq!(topic_to_thread(None), None);
+    }
+
+    #[test]
+    fn empty_string_maps_to_none() {
+        assert_eq!(topic_to_thread(Some("")), None);
+    }
+
+    #[test]
+    fn zero_sentinel_maps_to_none() {
+        assert_eq!(topic_to_thread(Some("0")), None);
+    }
+
+    #[test]
+    fn real_topic_maps_to_some() {
+        assert_eq!(
+            topic_to_thread(Some("db_lock")),
+            Some("db_lock".to_string())
+        );
+    }
+}
+
+#[cfg(test)]
+mod inbound_topic_mapping_tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    fn channel_with_test_state() -> DawnIMChannel {
+        let cfg = zeroclaw_config::schema::DawnIMConfig {
+            enabled: true,
+            ws_url: "ws://localhost:5200".into(),
+            uid: "bot_uid_1".into(),
+            token: String::new(),
+            device_id: "test-device".into(),
+            allowed_users: vec!["*".into()],
+            ..Default::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn zeroclaw_api::memory_traits::Memory> = Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", tmp.path(), "inbound_topic_test")
+                .unwrap(),
+        );
+        DawnIMChannel::from_config(&cfg, "test", tmp.path(), memory)
+    }
+
+    fn make_text_recv(topic: Option<&str>) -> RecvNotificationParams {
+        let payload = serde_json::json!({"type": 1, "content": "hello"});
+        let payload_b64 = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_string(&payload).unwrap());
+        RecvNotificationParams {
+            message_id: "m1".into(),
+            message_seq: 1,
+            from_uid: "u_alice".into(),
+            channel_id: "u_alice".into(),
+            channel_type: WkChannelType::PERSONAL,
+            payload: serde_json::Value::String(payload_b64),
+            timestamp: 1,
+            topic: topic.map(ToString::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn inbound_text_with_topic_sets_thread_ts() {
+        let ch = channel_with_test_state();
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(8);
+        ch.process_inbound_message(make_text_recv(Some("db_lock")), &tx)
+            .await
+            .unwrap();
+        let msg = rx.recv().await.expect("text message delivered");
+        assert_eq!(msg.thread_ts.as_deref(), Some("db_lock"));
+    }
+
+    #[tokio::test]
+    async fn inbound_text_without_topic_keeps_thread_ts_none() {
+        let ch = channel_with_test_state();
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(8);
+        ch.process_inbound_message(make_text_recv(None), &tx)
+            .await
+            .unwrap();
+        let msg = rx.recv().await.expect("text message delivered");
+        assert!(msg.thread_ts.is_none());
+    }
+
+    #[tokio::test]
+    async fn inbound_text_with_zero_sentinel_keeps_thread_ts_none() {
+        let ch = channel_with_test_state();
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(8);
+        ch.process_inbound_message(make_text_recv(Some("0")), &tx)
+            .await
+            .unwrap();
+        let msg = rx.recv().await.expect("text message delivered");
+        assert!(msg.thread_ts.is_none());
+    }
+}
+
+#[cfg(test)]
+mod outbound_topic_mapping_tests {
+    use super::*;
+    use zeroclaw_api::channel::{SendKind, SendMessage};
+
+    fn channel_with_test_state() -> DawnIMChannel {
+        let cfg = zeroclaw_config::schema::DawnIMConfig {
+            enabled: true,
+            ws_url: "ws://localhost:5200".into(),
+            uid: "bot_uid_1".into(),
+            token: String::new(),
+            device_id: "test-device".into(),
+            ..Default::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn zeroclaw_api::memory_traits::Memory> = Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", tmp.path(), "outbound_topic_test")
+                .unwrap(),
+        );
+        DawnIMChannel::from_config(&cfg, "test", tmp.path(), memory)
+    }
+
+    /// Verify outbound mapping by intercepting the SendParams the helper
+    /// constructs. We can't easily test the full WS path here; the helper
+    /// is the unit-testable seam.
+    #[test]
+    fn outbound_text_with_thread_ts_sets_topic_and_setting_bit() {
+        let ch = channel_with_test_state();
+        let msg = SendMessage {
+            content: "hello".into(),
+            recipient: "1:u_alice".into(),
+            thread_ts: Some("db_lock".into()),
+            kind: SendKind::Text,
+            ..Default::default()
+        };
+        let params = ch.build_text_send_params(&msg).unwrap();
+        assert_eq!(params.topic.as_deref(), Some("db_lock"));
+        assert_eq!(params.setting, Some(8u32));
+    }
+
+    #[test]
+    fn outbound_text_without_thread_ts_keeps_topic_and_setting_none() {
+        let ch = channel_with_test_state();
+        let msg = SendMessage {
+            content: "hello".into(),
+            recipient: "1:u_alice".into(),
+            thread_ts: None,
+            kind: SendKind::Text,
+            ..Default::default()
+        };
+        let params = ch.build_text_send_params(&msg).unwrap();
+        assert!(params.topic.is_none());
+        assert!(params.setting.is_none());
+    }
+
+    #[test]
+    fn outbound_text_with_zero_sentinel_keeps_topic_and_setting_none() {
+        let ch = channel_with_test_state();
+        let msg = SendMessage {
+            content: "hello".into(),
+            recipient: "1:u_alice".into(),
+            thread_ts: Some("0".into()),
+            kind: SendKind::Text,
+            ..Default::default()
+        };
+        let params = ch.build_text_send_params(&msg).unwrap();
+        assert!(params.topic.is_none());
+        assert!(params.setting.is_none());
+    }
+}
+
+#[cfg(test)]
+mod offline_batch_topic_grouping_tests {
+    use super::*;
+    use tokio::sync::mpsc;
+
+    fn channel_with_test_state() -> DawnIMChannel {
+        let cfg = zeroclaw_config::schema::DawnIMConfig {
+            enabled: true,
+            ws_url: "ws://localhost:5200".into(),
+            uid: "bot_uid_1".into(),
+            token: String::new(),
+            device_id: "test-device".into(),
+            allowed_users: vec!["*".into()],
+            dawn_url: "http://localhost:8080".into(), // prevent reqwest "relative URL" error
+            dawn_token: "test-token".into(),
+            ..Default::default()
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn zeroclaw_api::memory_traits::Memory> = Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", tmp.path(), "offline_topic_test")
+                .unwrap(),
+        );
+        DawnIMChannel::from_config(&cfg, "test", tmp.path(), memory)
+    }
+
+    fn make_recv(seq: u32, ts: i64, topic: Option<&str>, text: &str) -> RecvNotificationParams {
+        let payload = serde_json::json!({"type": 1, "content": text});
+        let payload_b64 = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_string(&payload).unwrap());
+        RecvNotificationParams {
+            message_id: format!("m{seq}"),
+            message_seq: seq,
+            from_uid: "u_alice".into(),
+            channel_id: "u_alice".into(),
+            channel_type: WkChannelType::PERSONAL,
+            payload: serde_json::Value::String(payload_b64),
+            timestamp: ts,
+            topic: topic.map(ToString::to_string),
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_batch_with_mixed_topics_splits_into_separate_channel_messages() {
+        let ch = channel_with_test_state();
+        let (tx, mut rx) = mpsc::channel::<ChannelMessage>(8);
+        // 3 from topic A, 2 from no-topic (one is "0" sentinel), 1 from topic B
+        // → expect 3 ChannelMessages (one per topic, no-topic counted once)
+        let batch = vec![
+            make_recv(1, 1, Some("A"), "a1"),
+            make_recv(2, 2, None, "n1"),
+            make_recv(3, 3, Some("A"), "a2"),
+            make_recv(4, 4, Some("0"), "n2"), // sentinel — same group as None
+            make_recv(5, 5, Some("B"), "b1"),
+            make_recv(6, 6, Some("A"), "a3"),
+        ];
+        // Spawn processing in background — it will fail on clear_unread HTTP
+        // call, but ChannelMessages are sent before that happens.
+        let handle = tokio::spawn(async move {
+            let _ = ch.process_offline_batch(batch, &tx).await;
+            drop(tx);
+        });
+
+        let mut by_thread: std::collections::HashMap<Option<String>, ChannelMessage> =
+            std::collections::HashMap::new();
+        while let Some(msg) = rx.recv().await {
+            by_thread.insert(msg.thread_ts.clone(), msg);
+        }
+        handle.await.unwrap(); // join the task
+
+        assert_eq!(by_thread.len(), 3, "expected 3 groups; got {by_thread:?}");
+        assert!(by_thread.contains_key(&Some("A".to_string())));
+        assert!(by_thread.contains_key(&Some("B".to_string())));
+        assert!(by_thread.contains_key(&None));
+
+        // Group A should contain a1/a2/a3 in order
+        let a = by_thread.get(&Some("A".to_string())).unwrap();
+        assert!(a.content.contains("a1"));
+        assert!(a.content.contains("a2"));
+        assert!(a.content.contains("a3"));
+        // No-topic group should contain n1/n2
+        let none = by_thread.get(&None).unwrap();
+        assert!(none.content.contains("n1"));
+        assert!(none.content.contains("n2"));
     }
 }

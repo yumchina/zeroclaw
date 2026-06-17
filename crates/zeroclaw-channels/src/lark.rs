@@ -20,53 +20,7 @@ const FEISHU_WS_BASE_URL: &str = "https://open.feishu.cn";
 const LARK_BASE_URL: &str = "https://open.larksuite.com/open-apis";
 const LARK_WS_BASE_URL: &str = "https://open.larksuite.com";
 
-#[cfg(test)]
-const LARK_ACK_REACTIONS_ZH_CN: &[&str] = &[
-    "OK", "JIAYI", "APPLAUSE", "THUMBSUP", "MUSCLE", "SMILE", "DONE",
-];
-#[cfg(test)]
-const LARK_ACK_REACTIONS_ZH_TW: &[&str] = &[
-    "OK",
-    "JIAYI",
-    "APPLAUSE",
-    "THUMBSUP",
-    "FINGERHEART",
-    "SMILE",
-    "DONE",
-];
-#[cfg(test)]
-const LARK_ACK_REACTIONS_EN: &[&str] = &[
-    "OK",
-    "THUMBSUP",
-    "THANKS",
-    "MUSCLE",
-    "FINGERHEART",
-    "APPLAUSE",
-    "SMILE",
-    "DONE",
-];
-#[cfg(test)]
-const LARK_ACK_REACTIONS_JA: &[&str] = &[
-    "OK",
-    "THUMBSUP",
-    "THANKS",
-    "MUSCLE",
-    "FINGERHEART",
-    "APPLAUSE",
-    "SMILE",
-    "DONE",
-];
-
 const MAX_LARK_AUDIO_BYTES: u64 = 25 * 1024 * 1024;
-
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LarkAckLocale {
-    ZhCn,
-    ZhTw,
-    En,
-    Ja,
-}
 
 /// Map a unicode emoji used by generic callers of [`Channel::add_reaction`]
 /// (e.g. Reply-Intent Precheck, no-reply ack heuristics) to a Lark/Feishu
@@ -4039,15 +3993,6 @@ fn lark_inline_text_file_preview(text: Cow<'_, str>) -> String {
     }
 }
 
-#[cfg(test)]
-fn random_lark_ack_reaction(
-    payload: Option<&serde_json::Value>,
-    fallback_text: &str,
-) -> &'static str {
-    let locale = detect_lark_ack_locale(payload, fallback_text);
-    random_from_pool(lark_ack_pool(locale))
-}
-
 /// Flatten a Feishu `post` rich-text message to plain text.
 ///
 /// Returns `None` when the content cannot be parsed or yields no usable text,
@@ -5343,103 +5288,6 @@ mod tests {
         let preview = lark_inline_text_file_preview(Cow::Borrowed(&text));
 
         assert_eq!(preview, format!("{prefix}...\n[truncated]"));
-    }
-
-    #[test]
-    fn lark_reaction_locale_explicit_language_tags() {
-        assert_eq!(map_locale_tag("zh-CN"), Some(LarkAckLocale::ZhCn));
-        assert_eq!(map_locale_tag("zh_TW"), Some(LarkAckLocale::ZhTw));
-        assert_eq!(map_locale_tag("zh-Hant"), Some(LarkAckLocale::ZhTw));
-        assert_eq!(map_locale_tag("en-US"), Some(LarkAckLocale::En));
-        assert_eq!(map_locale_tag("ja-JP"), Some(LarkAckLocale::Ja));
-        assert_eq!(map_locale_tag("fr-FR"), None);
-    }
-
-    #[test]
-    fn lark_reaction_locale_prefers_explicit_payload_locale() {
-        let payload = serde_json::json!({
-            "sender": {
-                "locale": "ja-JP"
-            },
-            "message": {
-                "content": "{\"text\":\"hello\"}"
-            }
-        });
-        assert_eq!(
-            detect_lark_ack_locale(Some(&payload), "你好，世界"),
-            LarkAckLocale::Ja
-        );
-    }
-
-    #[test]
-    fn lark_reaction_locale_unsupported_payload_falls_back_to_text_script() {
-        let payload = serde_json::json!({
-            "sender": {
-                "locale": "fr-FR"
-            },
-            "message": {
-                "content": "{\"text\":\"頑張れ\"}"
-            }
-        });
-        assert_eq!(
-            detect_lark_ack_locale(Some(&payload), "頑張ってください"),
-            LarkAckLocale::Ja
-        );
-    }
-
-    #[test]
-    fn lark_reaction_locale_detects_simplified_and_traditional_text() {
-        assert_eq!(
-            detect_lark_ack_locale(None, "继续奋斗，今天很强"),
-            LarkAckLocale::ZhCn
-        );
-        assert_eq!(
-            detect_lark_ack_locale(None, "繼續奮鬥，今天很強"),
-            LarkAckLocale::ZhTw
-        );
-    }
-
-    #[test]
-    fn lark_reaction_locale_defaults_to_english_for_unsupported_text() {
-        assert_eq!(
-            detect_lark_ack_locale(None, "Bonjour tout le monde"),
-            LarkAckLocale::En
-        );
-    }
-
-    #[test]
-    fn random_lark_ack_reaction_respects_detected_locale_pool() {
-        let payload = serde_json::json!({
-            "sender": {
-                "locale": "zh-CN"
-            }
-        });
-        let selected = random_lark_ack_reaction(Some(&payload), "hello");
-        assert!(LARK_ACK_REACTIONS_ZH_CN.contains(&selected));
-
-        let payload = serde_json::json!({
-            "sender": {
-                "locale": "zh-TW"
-            }
-        });
-        let selected = random_lark_ack_reaction(Some(&payload), "hello");
-        assert!(LARK_ACK_REACTIONS_ZH_TW.contains(&selected));
-
-        let payload = serde_json::json!({
-            "sender": {
-                "locale": "en-US"
-            }
-        });
-        let selected = random_lark_ack_reaction(Some(&payload), "hello");
-        assert!(LARK_ACK_REACTIONS_EN.contains(&selected));
-
-        let payload = serde_json::json!({
-            "sender": {
-                "locale": "ja-JP"
-            }
-        });
-        let selected = random_lark_ack_reaction(Some(&payload), "hello");
-        assert!(LARK_ACK_REACTIONS_JA.contains(&selected));
     }
 
     #[test]

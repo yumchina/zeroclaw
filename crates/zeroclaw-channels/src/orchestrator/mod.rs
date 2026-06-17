@@ -31,6 +31,8 @@ pub use crate::amqp::AmqpChannel;
 pub use crate::bluesky::BlueskyChannel;
 #[cfg(feature = "channel-clawdtalk")]
 pub use crate::clawdtalk::ClawdTalkChannel;
+#[cfg(feature = "channel-dawnIM")]
+pub use crate::dawn_im::DawnIMChannel;
 #[cfg(feature = "channel-dingtalk")]
 pub use crate::dingtalk::DingTalkChannel;
 #[cfg(feature = "channel-discord")]
@@ -89,8 +91,6 @@ pub use crate::wecom::WeComChannel;
 pub use crate::wecom_ws::WeComWsChannel;
 #[cfg(feature = "channel-whatsapp-cloud")]
 pub use crate::whatsapp::WhatsAppChannel;
-#[cfg(feature = "channel-dawnIM")]
-pub use crate::dawn_im::DawnIMChannel;
 pub use zeroclaw_api::channel::{Channel, ChannelMessage, SendMessage};
 // Local channel types (in misc, not zeroclaw-channels)
 pub use crate::cli::CliChannel;
@@ -126,9 +126,10 @@ use zeroclaw_memory::{self, MEMORY_CONTEXT_CLOSE, MEMORY_CONTEXT_OPEN, Memory};
 use zeroclaw_providers::reliable::{scope_provider_fallback, take_last_provider_fallback};
 use zeroclaw_providers::{self, ChatMessage, ModelProvider};
 use zeroclaw_runtime::agent::loop_::{
-    apply_policy_tool_filter, apply_text_tool_prompt_policy, build_tool_instructions_for_names,
-    clear_model_switch_request, get_model_switch_state, is_model_switch_requested,
-    run_tool_call_loop, scope_session_key, scope_thread_id, scrub_credentials,
+    LoopKnobs, apply_policy_tool_filter, apply_text_tool_prompt_policy,
+    build_tool_instructions_for_names, clear_model_switch_request, get_model_switch_state,
+    is_model_switch_requested, run_tool_call_loop, scope_session_key, scope_thread_id,
+    scrub_credentials,
 };
 use zeroclaw_runtime::approval::ApprovalManager;
 use zeroclaw_runtime::observability::traits::{ObserverEvent, ObserverMetric};
@@ -305,6 +306,20 @@ enum ChannelRuntimeCommand {
     Bind(Option<String>),
     /// `/unbind` — remove the current slave-channel binding.
     Unbind,
+    /// `/topic` — cross-channel topic binding for superusers.
+    Topic(TopicAction),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TopicAction {
+    /// `/topic` (no arg) — show usage.
+    Help,
+    /// `/topic list` — list available topics on the master channel.
+    List,
+    /// `/topic reset` — clear the binding for this (channel, sender) pair.
+    Reset,
+    /// `/topic <id>` — bind the current (channel, sender) to topic `<id>`.
+    Set(String),
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -480,6 +495,11 @@ struct ChannelRuntimeContext {
     /// Cross-channel identity resolver + master channel ref. `None` disables
     /// unified sessions (behaviour identical to before this feature).
     identity: Option<Arc<IdentityRuntime>>,
+    /// Process-wide topic binding registry. Present iff `identity` is
+    /// present (same gate: `[channels].master_channel` configured).
+    /// Read by `process_channel_message_body` to compute effective_topic;
+    /// mutated by the `/topic` command handler.
+    topic_binding: Option<Arc<zeroclaw_infra::topic_binding::TopicBindingRegistry>>,
     /// Non-interactive approval manager for channel-driven runs.
     /// Enforces `auto_approve` / `always_ask` / supervised policy from
     /// `[autonomy]` config; auto-denies tools that would need interactive
@@ -577,14 +597,42 @@ pub fn conversation_history_key(msg: &zeroclaw_api::channel::ChannelMessage) -> 
     sanitize_session_key(&raw)
 }
 
+/// Resolve the *effective* topic for an inbound channel message:
+/// `msg.thread_ts` always wins on the master channel; on slave channels,
+/// `thread_ts` (if set) wins, else the `topic_binding` registry fills in.
+/// Returns `None` when neither source has a topic.
+///
+/// Centralises the "what topic should this message belong to" decision so
+/// `resolve_session_key` and `ChannelOrigin.topic` stay consistent.
+fn resolve_effective_topic(
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    channel_ref: &str,
+    master_channel_ref: Option<&str>,
+    topic_binding: Option<&zeroclaw_infra::topic_binding::TopicBindingRegistry>,
+) -> Option<String> {
+    if master_channel_ref == Some(channel_ref) {
+        return msg.thread_ts.clone();
+    }
+    msg.thread_ts
+        .clone()
+        .or_else(|| topic_binding.and_then(|reg| reg.get(channel_ref, &msg.sender)))
+}
+
 /// Wrap `conversation_history_key` with cross-channel identity merging.
-/// Returns `unified_<master_id>` for 1:1 messages whose (channel_ref, sender)
-/// resolves to a whitelisted master id; otherwise the base key (unchanged
-/// per-channel isolation). Group chats and unconfigured identity always use
-/// the base key.
+/// Returns `unified_<master_id>` (or `unified_<master_id>_<topic>` when
+/// `effective_topic` is supplied) for 1:1 messages whose
+/// (channel_ref, sender) resolves to a whitelisted master id; otherwise
+/// the base key (unchanged per-channel isolation). Group chats and
+/// unconfigured identity always use the base key.
+///
+/// `effective_topic` is the topic that should drive session isolation
+/// for this message. Callers should compute it via `resolve_effective_topic`
+/// so master channels keep using `msg.thread_ts` while slave channels can
+/// fall back to a `/topic` binding when no native thread is present.
 fn resolve_session_key(
     msg: &zeroclaw_api::channel::ChannelMessage,
     identity: Option<&IdentityRuntime>,
+    effective_topic: Option<&str>,
 ) -> String {
     let base = conversation_history_key(msg);
     let Some(identity) = identity else {
@@ -598,8 +646,21 @@ fn resolve_session_key(
         None => msg.channel.clone(),
     };
     let is_master = channel_ref == identity.master_channel;
-    match identity.resolver.resolve(&channel_ref, &msg.sender, is_master) {
-        Some(master_id) => sanitize_session_key(&format!("unified_{master_id}")),
+    match identity
+        .resolver
+        .resolve(&channel_ref, &msg.sender, is_master)
+    {
+        Some(master_id) => match effective_topic {
+            // Compose unified key with topic suffix when an effective topic
+            // is present, so multi-topic isolation (introduced for DawnIM
+            // and extended to bound slave channels) continues to work for
+            // master / superuser identities. Without this suffix, all topics
+            // for a master user would flatten into the same unified session.
+            Some(topic) if !topic.is_empty() => {
+                sanitize_session_key(&format!("unified_{master_id}_{topic}"))
+            }
+            _ => sanitize_session_key(&format!("unified_{master_id}")),
+        },
         None => base,
     }
 }
@@ -1236,6 +1297,24 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
             parts.next().map(|s| s.trim().to_string()),
         )),
         "/unbind" => Some(ChannelRuntimeCommand::Unbind),
+        "/topic" => {
+            // Collect remaining tokens; 0 -> Help, 1 -> List/Reset/Set, 2+ -> Help (invalid args).
+            let rest: Vec<&str> = parts.collect();
+            match rest.len() {
+                0 => Some(ChannelRuntimeCommand::Topic(TopicAction::Help)),
+                1 => {
+                    let token = rest[0].trim();
+                    let action = match token.to_ascii_lowercase().as_str() {
+                        "list" => TopicAction::List,
+                        "reset" => TopicAction::Reset,
+                        "help" => TopicAction::Help,
+                        _ => TopicAction::Set(token.to_string()),
+                    };
+                    Some(ChannelRuntimeCommand::Topic(action))
+                }
+                _ => Some(ChannelRuntimeCommand::Topic(TopicAction::Help)),
+            }
+        }
         // Model/model_provider switching is channel-gated.
         "/models" if supports_runtime_model_switch(channel_name) => {
             if let Some(model_provider) = parts.next() {
@@ -2426,6 +2505,141 @@ fn build_config_block_kit(
     blocks.to_string()
 }
 
+fn build_topic_help_response() -> String {
+    "用法：\n  /topic list        查看 master 渠道上的所有话题\n  /topic <名称>      把当前渠道绑定到指定话题\n  /topic reset       解除绑定，恢复独立会话\n\n仅 superuser 可用。"
+        .to_string()
+}
+
+fn build_topic_list_response(
+    master_channel: &str,
+    topics: &[String],
+    current: Option<&str>,
+) -> String {
+    if topics.is_empty() {
+        return format!(
+            "你在 {master_channel} 尚无任何话题。请先在 dawnim 客户端创建话题并发送消息。"
+        );
+    }
+    let mut s = format!("你在 {master_channel} 的话题（共 {} 个）：\n", topics.len());
+    for t in topics {
+        if Some(t.as_str()) == current {
+            s.push_str(&format!("  • {t}         ← 当前绑定\n"));
+        } else {
+            s.push_str(&format!("  • {t}\n"));
+        }
+    }
+    s.push_str("\n用法：/topic <名称> 绑定，/topic reset 解绑");
+    s
+}
+
+/// Query the master DawnIM channel's SqliteMemory for topics belonging
+/// to `master_id`. Parses `[channels].master_channel` (form
+/// `<type>.<alias>`) to derive the per-alias memory db name
+/// (`dawn_im_<alias>`). Returns empty + warning on any failure so
+/// the caller can still reply gracefully.
+fn list_master_topics(ctx: &ChannelRuntimeContext, master_id: &str) -> anyhow::Result<Vec<String>> {
+    let Some(identity) = ctx.identity.as_deref() else {
+        return Ok(Vec::new());
+    };
+    // master_channel example: "dawnim.work" -> alias "work"
+    let alias = identity
+        .master_channel
+        .rsplit('.')
+        .next()
+        .ok_or_else(|| anyhow::Error::msg("master_channel has no alias suffix"))?;
+    let db_name = format!("dawn_im_{alias}");
+    let mem = zeroclaw_memory::SqliteMemory::new_named(
+        "topic_list",
+        ctx.workspace_dir.as_ref(),
+        &db_name,
+    )?;
+    mem.list_unified_topics(master_id)
+}
+
+async fn topic_handler_response(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+    action: TopicAction,
+) -> String {
+    // Check deployment-level enablement first to avoid leaking
+    // superuser status to users when /topic is disabled.
+    let binding_reg = match ctx.topic_binding.as_deref() {
+        Some(r) => r,
+        None => return "/topic 未启用。".to_string(),
+    };
+    let identity = match ctx.identity.as_deref() {
+        Some(i) => i,
+        None => return "/topic 仅 superuser 可用。".to_string(),
+    };
+    let channel_ref = match &msg.channel_alias {
+        Some(alias) => format!("{}.{}", msg.channel, alias),
+        None => msg.channel.clone(),
+    };
+    let is_master = channel_ref == identity.master_channel;
+    let master_id = match identity
+        .resolver
+        .resolve(&channel_ref, &msg.sender, is_master)
+    {
+        Some(id) => id,
+        None => return "/topic 仅 superuser 可用。".to_string(),
+    };
+
+    match action {
+        TopicAction::Help => build_topic_help_response(),
+        TopicAction::Reset => {
+            if binding_reg.clear(&channel_ref, &msg.sender) {
+                "已清除话题绑定。本渠道恢复独立会话。".to_string()
+            } else {
+                "当前没有话题绑定。".to_string()
+            }
+        }
+        TopicAction::List => {
+            let topics = match list_master_topics(ctx, &master_id) {
+                Ok(v) => v,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "topic list query failed; returning empty"
+                    );
+                    Vec::new()
+                }
+            };
+            let current = binding_reg.get(&channel_ref, &msg.sender);
+            build_topic_list_response(&identity.master_channel, &topics, current.as_deref())
+        }
+        TopicAction::Set(id) => {
+            let id = id.trim().to_string();
+            if id.is_empty() {
+                return build_topic_help_response();
+            }
+            let topics = match list_master_topics(ctx, &master_id) {
+                Ok(v) => v,
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "topic list query failed during /topic set"
+                    );
+                    return "话题查询失败，请稍后重试。".to_string();
+                }
+            };
+            if !topics.iter().any(|t| t == &id) {
+                format!("话题 \"{id}\" 不存在。运行 /topic list 查看可用话题。")
+            } else if binding_reg.get(&channel_ref, &msg.sender).as_deref() == Some(id.as_str()) {
+                format!("已绑定到话题 \"{id}\"（无变化）。")
+            } else {
+                binding_reg.set(&channel_ref, &msg.sender, &id);
+                format!("已绑定到话题 \"{id}\"。本渠道后续消息将归入该话题的对话历史。")
+            }
+        }
+    }
+}
+
 async fn handle_runtime_command_if_needed(
     ctx: &ChannelRuntimeContext,
     msg: &zeroclaw_api::channel::ChannelMessage,
@@ -2439,7 +2653,10 @@ async fn handle_runtime_command_if_needed(
         return true;
     };
 
-    let sender_key = resolve_session_key(msg, ctx.identity.as_deref());
+    // Command handlers compute the session key for "this message's home";
+    // use the message's literal thread_ts. The `/topic` binding override
+    // applies to user-content messages, not command echoes.
+    let sender_key = resolve_session_key(msg, ctx.identity.as_deref(), msg.thread_ts.as_deref());
     let defaults_snapshot = runtime_defaults_snapshot(ctx);
     let mut current = get_route_selection(ctx, &sender_key, &defaults_snapshot);
 
@@ -2564,12 +2781,21 @@ async fn handle_runtime_command_if_needed(
                         ),
                         None => "你不是 superuser，无法发起绑定。".to_string(),
                     },
-                    None => "请先在主渠道发送 /bind 获取绑定码，再在此渠道发送 /bind <码>。".to_string(),
+                    None => {
+                        "请先在主渠道发送 /bind 获取绑定码，再在此渠道发送 /bind <码>。".to_string()
+                    }
                     Some(_) if is_master => "主渠道无需绑定。".to_string(),
-                    Some(code) => match identity.resolver.redeem_code(&code, &channel_ref, &msg.sender) {
-                        Ok(master_id) => format!("已绑定到 {master_id}，此后本渠道会话将与主渠道合并。"),
-                        Err(reason) => format!("绑定失败：{reason}"),
-                    },
+                    Some(code) => {
+                        match identity
+                            .resolver
+                            .redeem_code(&code, &channel_ref, &msg.sender)
+                        {
+                            Ok(master_id) => {
+                                format!("已绑定到 {master_id}，此后本渠道会话将与主渠道合并。")
+                            }
+                            Err(reason) => format!("绑定失败：{reason}"),
+                        }
+                    }
                 }
             }
         },
@@ -2587,6 +2813,7 @@ async fn handle_runtime_command_if_needed(
                 }
             }
         },
+        ChannelRuntimeCommand::Topic(action) => topic_handler_response(ctx, msg, action).await,
     };
 
     if let Err(err) = channel
@@ -4008,7 +4235,22 @@ async fn process_channel_message_body(
         return;
     }
 
-    let history_key = resolve_session_key(&msg, ctx.identity.as_deref());
+    // Compute the effective topic once: master channels keep using
+    // `msg.thread_ts`, slave channels fall back to a `/topic` binding
+    // when no native thread is present. Reused for both the session key
+    // and the ChannelOrigin so routing and downstream tool dispatch agree.
+    let channel_ref_for_msg = match &msg.channel_alias {
+        Some(alias) => format!("{}.{}", msg.channel, alias),
+        None => msg.channel.clone(),
+    };
+    let effective_topic = resolve_effective_topic(
+        &msg,
+        &channel_ref_for_msg,
+        ctx.identity.as_ref().map(|i| i.master_channel.as_str()),
+        ctx.topic_binding.as_deref(),
+    );
+    let history_key =
+        resolve_session_key(&msg, ctx.identity.as_deref(), effective_topic.as_deref());
     if let Some(ref store) = ctx.session_store {
         let channel_id = msg
             .channel_alias
@@ -4241,6 +4483,19 @@ async fn process_channel_message_body(
     };
     let mut system_prompt =
         build_channel_system_prompt_for_message(&base_system_prompt, &msg, target_channel.as_ref());
+    if send_message_to_peer_tool_available(ctx.as_ref(), &msg)
+        && let Some(current_channel_ref) = peer_prompt_channel_ref(ctx.as_ref(), &msg)
+    {
+        let peer_map =
+            zeroclaw_runtime::tools::send_message_to_peer::render_sender_peer_map_for_channel(
+                ctx.prompt_config.as_ref(),
+                ctx.agent_alias.as_str(),
+                &current_channel_ref,
+            );
+        if !peer_map.is_empty() {
+            let _ = write!(system_prompt, "\n\n{peer_map}");
+        }
+    }
     if !memory_context.is_empty() {
         let _ = write!(system_prompt, "\n\n{memory_context}");
     }
@@ -4286,7 +4541,11 @@ async fn process_channel_message_body(
     // ── Reply-intent precheck ────────────────────────────────────────
     let explicit_channel_address =
         is_explicitly_addressed_channel_message(&msg.channel, &msg.content);
-    let classifier_intent = if explicit_channel_address {
+    let direct_message = target_channel
+        .as_ref()
+        .map(|c| c.is_direct_message(&msg))
+        .unwrap_or(false);
+    let classifier_intent = if explicit_channel_address || direct_message {
         AssistantChannelOutcome::Reply(String::new())
     } else {
         let (classifier_provider_arc, classifier_model_owned, classifier_temperature): (
@@ -4645,6 +4904,22 @@ async fn process_channel_message_body(
             collector: std::sync::Arc::clone(&tool_receipts_collector),
         }
     });
+    // Per-turn context for Dawn task tools (dawn_create_task /
+    // dawn_query_task). Parsed from the inbound message's sender + channel
+    // metadata so the tool can both identify the originating user and route
+    // the task message back through the correct DawnIM channel instance.
+    let channel_origin = zeroclaw_api::channel::ChannelOrigin {
+        from_uid: msg
+            .sender
+            .split("_la_")
+            .next()
+            .unwrap_or(msg.sender.as_str())
+            .to_string(),
+        reply_target: msg.reply_target.clone(),
+        channel_ref: channel_ref_for_msg.clone(),
+        topic: effective_topic.clone(),
+    };
+    let loop_knobs = LoopKnobs::default();
     let (llm_result, fallback_info) = scope_provider_fallback(async {
         let llm_result = loop {
             let loop_result = tokio::select! {
@@ -4661,6 +4936,8 @@ async fn process_channel_message_body(
                             cost_tracking_context.clone(),
                         zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT.scope(
                             receipt_scope.clone(),
+                        zeroclaw_api::channel::CHANNEL_ORIGIN.scope(
+                            channel_origin.clone(),
                         run_tool_call_loop(
                         active_model_provider.as_ref(),
                         &mut history,
@@ -4706,6 +4983,12 @@ async fn process_channel_message_body(
                         ctx.receipt_generator
                             .as_ref()
                             .map(|_| tool_receipts_collector.as_ref()),
+                        None, // event_tx
+                        None, // steering
+                        None, // new_messages_out
+                        &loop_knobs,
+                        None, // image_cache
+                    ),
                     ),
                     ),
                     ),
@@ -5661,7 +5944,7 @@ pub async fn bind_telegram_identity(config: &Config, identity: &str) -> Result<(
         .peer_groups
         .entry(group_name.clone())
         .or_insert_with(|| PeerGroupConfig {
-            channel: "telegram.default".to_string(),
+            channel: "telegram.default".into(),
             ..PeerGroupConfig::default()
         });
 
@@ -5867,7 +6150,8 @@ fn build_channel_by_id(
                 )
                 .with_transcription(config.transcription.clone())
                 .with_stall_timeout(dc.stall_timeout_secs)
-                .with_approval_timeout_secs(dc.approval_timeout_secs),
+                .with_approval_timeout_secs(dc.approval_timeout_secs)
+                .with_intents_mask(dc.intents_mask),
             ))
         }
         #[cfg(not(feature = "channel-discord"))]
@@ -6009,7 +6293,7 @@ fn build_channel_by_id(
                     .context("WhatsApp channel is not configured")?;
                 if !wa.is_web_config() {
                     anyhow::bail!(
-                        "WhatsApp channel send requires Web mode (session_path must be set)"
+                        "WhatsApp channel send requires Web mode (set session_path, pair_phone, or mode = personal)"
                     );
                 }
                 let alias = "default".to_string();
@@ -6613,6 +6897,74 @@ fn find_channel_for_message<'a>(
         .and_then(|(base, _)| channels.get(base))
 }
 
+fn send_message_to_peer_tool_available(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> bool {
+    let excluded_for_turn = msg.channel != "cli" && ctx.autonomy_level != AutonomyLevel::Full;
+    if excluded_for_turn
+        && ctx
+            .non_cli_excluded_tools
+            .iter()
+            .any(|tool_name| tool_name == "send_message_to_peer")
+    {
+        return false;
+    }
+
+    ctx.tools_registry
+        .iter()
+        .any(|tool| tool.name() == "send_message_to_peer")
+}
+
+fn peer_prompt_channel_ref(
+    ctx: &ChannelRuntimeContext,
+    msg: &zeroclaw_api::channel::ChannelMessage,
+) -> Option<String> {
+    let composite = composite_channel_key(&msg.channel, msg.channel_alias.as_deref());
+    if msg
+        .channel_alias
+        .as_deref()
+        .is_some_and(|alias| !alias.is_empty())
+    {
+        return Some(composite);
+    }
+
+    let Some(agent) = ctx.prompt_config.agents.get(ctx.agent_alias.as_str()) else {
+        return Some(composite);
+    };
+
+    if agent.channels.iter().any(|channel| channel == &composite) {
+        return Some(composite);
+    }
+
+    let matches: Vec<&str> = agent
+        .channels
+        .iter()
+        .map(|channel| channel.as_str())
+        .filter(|channel| channel_ref_matches_message_channel(channel, &msg.channel))
+        .collect();
+    if matches.len() == 1 {
+        Some(matches[0].to_string())
+    } else {
+        None
+    }
+}
+
+fn channel_ref_matches_message_channel(channel_ref: &str, message_channel: &str) -> bool {
+    if channel_ref == message_channel {
+        return true;
+    }
+
+    let message_base = message_channel
+        .split_once(':')
+        .map(|(base, _)| base)
+        .unwrap_or(message_channel);
+    channel_ref == message_base
+        || channel_ref
+            .split_once('.')
+            .is_some_and(|(channel_type, _)| channel_type == message_base)
+}
+
 /// Active `<type>.<alias>` channel references from enabled agents.
 ///
 /// An empty set means no enabled agent declared channel bindings, so
@@ -6640,6 +6992,7 @@ pub fn build_channel_map(
 ) -> HashMap<String, Arc<dyn zeroclaw_api::channel::Channel>> {
     let config_arc = Arc::new(RwLock::new(config.clone()));
     collect_configured_channels(&config_arc, "", &[])
+        .channels
         .into_iter()
         .map(|ch| {
             let key = composite_channel_key(ch.channel.name(), ch.alias.as_deref());
@@ -6661,15 +7014,17 @@ pub fn register_channels_for_tools(
     reaction_handle: &Option<tools::PerToolChannelHandle>,
     poll_handle: &Option<tools::PerToolChannelHandle>,
     escalate_handle: &Option<tools::PerToolChannelHandle>,
+    task_channel_handle: &Option<tools::PerToolChannelHandle>,
 ) -> Vec<String> {
     let config_arc = Arc::new(RwLock::new(config.clone()));
-    let configured = collect_configured_channels(&config_arc, "", &[]);
+    let configured = collect_configured_channels(&config_arc, "", &[]).channels;
 
     let handles = [
         ask_user_handle.as_ref(),
         reaction_handle.as_ref(),
         poll_handle.as_ref(),
         escalate_handle.as_ref(),
+        task_channel_handle.as_ref(),
     ];
 
     let mut names = Vec::new();
@@ -6695,11 +7050,17 @@ fn matrix_state_dir(config_path: &std::path::Path, alias: &str) -> std::path::Pa
         .unwrap_or_else(|| std::path::PathBuf::from(".zeroclaw/state/matrix").join(alias))
 }
 
+/// Output of [`collect_configured_channels`].
+#[derive(Default)]
+struct CollectedChannels {
+    channels: Vec<ConfiguredChannel>,
+}
+
 fn collect_configured_channels(
     config_arc: &Arc<RwLock<Config>>,
     matrix_skip_context: &str,
     tool_specs: &[(String, String)],
-) -> Vec<ConfiguredChannel> {
+) -> CollectedChannels {
     let _ = matrix_skip_context;
     let _ = tool_specs;
     #[allow(unused_mut)]
@@ -6802,7 +7163,8 @@ fn collect_configured_channels(
         .with_proxy_url(dc.proxy_url.clone())
         .with_transcription(config.transcription.clone())
         .with_stall_timeout(dc.stall_timeout_secs)
-        .with_approval_timeout_secs(dc.approval_timeout_secs);
+        .with_approval_timeout_secs(dc.approval_timeout_secs)
+        .with_intents_mask(dc.intents_mask);
         if dc.archive {
             match zeroclaw_memory::SqliteMemory::new_named("sqlite", &config.data_dir, "discord") {
                 Ok(mem) => {
@@ -7127,7 +7489,7 @@ fn collect_configured_channels(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown),
-                "WhatsApp config has both phone_number_id and session_path set; preferring Cloud API mode. Remove one selector to avoid ambiguity."
+                "WhatsApp config has both phone_number_id (Cloud) and a Web selector (session_path/pair_phone/pair_code/ws_url/mode=personal) set; preferring Cloud API mode. Remove one selector to avoid ambiguity."
             );
         }
         // Runtime negotiation: detect backend type from config
@@ -7363,27 +7725,32 @@ fn collect_configured_channels(
     }
 
     #[cfg(feature = "channel-email")]
-    for (alias, email_cfg) in &config.channels.email {
-        if !active_channel_aliases.contains(&format!("email.{alias}")) {
-            continue;
+    {
+        // Construct once and share across all email channel instances.
+        let auth_service = Arc::new(zeroclaw_providers::auth::AuthService::from_config(&config));
+
+        for (alias, email_cfg) in &config.channels.email {
+            if !active_channel_aliases.contains(&format!("email.{alias}")) {
+                continue;
+            }
+            if !email_cfg.enabled {
+                continue;
+            }
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
+                let cfg_arc = config_arc.clone();
+                let alias = alias.clone();
+                Arc::new(move || cfg_arc.read().channel_external_peers("email", &alias))
+            };
+            let mut channel = EmailChannel::new(email_cfg.clone(), alias.clone(), peer_resolver);
+            if email_cfg.oauth2.is_some() {
+                channel = channel.with_auth_service(auth_service.clone());
+            }
+            channels.push(ConfiguredChannel {
+                display_name: "Email",
+                alias: Some(alias.clone()),
+                channel: Arc::new(channel),
+            });
         }
-        if !email_cfg.enabled {
-            continue;
-        }
-        let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> = {
-            let cfg_arc = config_arc.clone();
-            let alias = alias.clone();
-            Arc::new(move || cfg_arc.read().channel_external_peers("email", &alias))
-        };
-        channels.push(ConfiguredChannel {
-            display_name: "Email",
-            alias: Some(alias.clone()),
-            channel: Arc::new(EmailChannel::new(
-                email_cfg.clone(),
-                alias.clone(),
-                peer_resolver,
-            )),
-        });
     }
 
     #[cfg(feature = "channel-email")]
@@ -8153,7 +8520,7 @@ fn collect_configured_channels(
         );
     }
 
-    channels
+    CollectedChannels { channels }
 }
 
 fn no_real_time_channels_message() -> &'static str {
@@ -8164,7 +8531,7 @@ fn no_real_time_channels_message() -> &'static str {
 pub async fn doctor_channels(config: Config) -> Result<()> {
     let config_arc = Arc::new(RwLock::new(config));
     #[allow(unused_mut)]
-    let mut channels = collect_configured_channels(&config_arc, "health check", &[]);
+    let mut channels = collect_configured_channels(&config_arc, "health check", &[]).channels;
 
     #[cfg(feature = "channel-nostr")]
     {
@@ -8441,7 +8808,8 @@ pub async fn start_channels(
         .filter(|s| !s.is_empty())
     {
         Some(master_channel) => {
-            match zeroclaw_infra::make_identity_store(&config.data_dir, &config.channels.superusers) {
+            match zeroclaw_infra::make_identity_store(&config.data_dir, &config.channels.superusers)
+            {
                 Ok(resolver) => {
                     ::zeroclaw_log::record!(
                         INFO,
@@ -8467,6 +8835,27 @@ pub async fn start_channels(
         }
         None => None,
     };
+
+    // Process-wide topic binding store, gated on master_channel like
+    // shared_identity. Disabled (None) otherwise.
+    let shared_topic_binding: Option<Arc<zeroclaw_infra::topic_binding::TopicBindingRegistry>> =
+        if shared_identity.is_some() {
+            match zeroclaw_infra::make_topic_binding_registry(&config.data_dir) {
+                Ok(reg) => Some(reg),
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                            .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "topic_binding registry init failed; /topic disabled"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
     // Channel infrastructure (listeners, `channels_by_name`, the mpsc bus)
     // is built once inside the loop on the first iteration — the primary
@@ -8819,6 +9208,16 @@ pub async fn start_channels(
                 "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single prompt and returns its response.",
             ));
         }
+        if config.channels.email.values().any(|c| c.enabled) {
+            tool_descs.push((
+                "email_search",
+                "Search the IMAP inbox by sender, subject, or date. Returns a list of matching emails with UID, sender, subject, and date. Use when asked about email. Follow up with email_read to fetch the full body.",
+            ));
+            tool_descs.push((
+                "email_read",
+                "Fetch the full content of an email by its UID (from email_search). Returns sender, to, date, subject, body text, and attachments.",
+            ));
+        }
 
         // Filter out tools excluded for non-CLI channels so this agent's
         // system prompt does not advertise them for channel-driven runs.
@@ -8903,8 +9302,9 @@ pub async fn start_channels(
             }
 
             #[allow(unused_mut)]
-            let mut configured_channels: Vec<ConfiguredChannel> =
-                collect_configured_channels(&config_arc, "runtime startup", &tool_specs);
+            let CollectedChannels {
+                channels: mut configured_channels,
+            } = collect_configured_channels(&config_arc, "runtime startup", &tool_specs);
 
             #[cfg(feature = "channel-nostr")]
             if let Some((alias, ns)) = config.channels.nostr.iter().next() {
@@ -9140,6 +9540,7 @@ pub async fn start_channels(
             progress_observer: config.channels.progress_observer.clone(),
             session_store: shared_session_store.clone(),
             identity: shared_identity.clone(),
+            topic_binding: shared_topic_binding.clone(),
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(&risk_profile)),
             activated_tools: ch_activated_handle,
             cost_tracking: zeroclaw_runtime::cost::CostTracker::get_or_init_global(
@@ -9594,6 +9995,43 @@ pub async fn deliver_announcement(
                 .ok_or_else(not_configured)?;
             anyhow::bail!("wecom_ws channel is not connected");
         }
+        #[cfg(feature = "channel-email")]
+        "email" => {
+            let em = config
+                .channels
+                .email
+                .get(alias)
+                .ok_or_else(not_configured)?;
+            let peers = config.channel_external_peers("email", alias);
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+                Arc::new(move || peers.clone());
+            let ch = EmailChannel::new(em.clone(), alias.to_string(), peer_resolver);
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+        }
+        #[cfg(not(feature = "channel-email"))]
+        "email" => {
+            anyhow::bail!("Email channel requires the `channel-email` feature");
+        }
+        #[cfg(feature = "whatsapp-web")]
+        "whatsapp" | "whatsapp-web" | "whatsapp_web" => {
+            let wa = config
+                .channels
+                .whatsapp
+                .get(alias)
+                .ok_or_else(not_configured)?;
+            if !wa.is_web_config() {
+                anyhow::bail!("WhatsApp channel send requires Web mode (session_path must be set)");
+            }
+            let peers = config.channel_external_peers("whatsapp", alias);
+            let peer_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync> =
+                Arc::new(move || peers.clone());
+            let ch = WhatsAppWebChannel::new(wa, alias.to_string(), peer_resolver);
+            zeroclaw_api::channel::Channel::send(&ch, &make_msg(&safe_output)).await?;
+        }
+        #[cfg(not(feature = "whatsapp-web"))]
+        "whatsapp" | "whatsapp-web" | "whatsapp_web" => {
+            anyhow::bail!("WhatsApp channel requires the `whatsapp-web` feature");
+        }
         other => anyhow::bail!("unsupported delivery channel: {other}"),
     }
     #[allow(unreachable_code)]
@@ -9994,6 +10432,7 @@ temperature = 0.3
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -10624,6 +11063,7 @@ temperature = 0.3
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             identity: None,
+            topic_binding: None,
         }
     }
 
@@ -11128,6 +11568,7 @@ api_key = "anthropic-key"
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -11269,6 +11710,7 @@ api_key = "anthropic-key"
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -11381,6 +11823,7 @@ api_key = "anthropic-key"
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -11497,6 +11940,7 @@ api_key = "anthropic-key"
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: Some(Arc::clone(&store)),
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -11895,6 +12339,7 @@ api_key = "anthropic-key"
             show_tool_calls: true,
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -12494,6 +12939,87 @@ BTC is currently around $65,000 based on latest tool output."#
         );
     }
 
+    fn peer_prompt_test_context(
+        channels_by_name: HashMap<String, Arc<dyn Channel>>,
+        provider_impl: Arc<HistoryCaptureModelProvider>,
+        prompt_config: Arc<Config>,
+        tools_registry: Arc<Vec<Box<dyn Tool>>>,
+    ) -> Arc<ChannelRuntimeContext> {
+        Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            model_provider: provider_impl,
+            model_provider_ref: Arc::new("test-provider".to_string()),
+            agent_alias: Arc::new("test-agent".to_string()),
+            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
+            memory: Arc::new(RecallMemory),
+            memory_strategy: Arc::new(
+                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
+                    Arc::new(RecallMemory),
+                    zeroclaw_config::schema::MemoryConfig::default(),
+                    std::path::PathBuf::new(),
+                ),
+            ),
+            tools_registry,
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: Some(0.0),
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
+            ))),
+            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
+            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            prompt_config,
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+                discord: false,
+                mattermost: false,
+                matrix: false,
+                whatsapp: false,
+            },
+            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
+            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
+            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
+            agent_transcription_provider: String::new(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            autonomy_level: AutonomyLevel::default(),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
+            session_store: None,
+            identity: None,
+            topic_binding: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &zeroclaw_config::schema::RiskProfileConfig::default(),
+            )),
+            activated_tools: None,
+            cost_tracking: None,
+            pacing: zeroclaw_config::schema::PacingConfig::default(),
+            max_tool_result_chars: 0,
+            context_token_budget: 0,
+            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
+                Duration::ZERO,
+            )),
+            receipt_generator: None,
+            show_receipts_in_response: false,
+            last_applied_config_stamp: Arc::new(Mutex::new(None)),
+            runtime_defaults_override: Arc::new(Mutex::new(None)),
+        })
+    }
+
     #[tokio::test]
     async fn process_channel_message_executes_tool_calls_instead_of_sending_raw_json() {
         let channel_impl = Arc::new(RecordingChannel::default());
@@ -12558,6 +13084,7 @@ BTC is currently around $65,000 based on latest tool output."#
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -12582,7 +13109,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-42".to_string(),
                 content: "What is the BTC price now?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -12671,6 +13198,7 @@ BTC is currently around $65,000 based on latest tool output."#
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: Some(Arc::clone(&session_store)),
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(&{
                 let mut profile = zeroclaw_config::schema::RiskProfileConfig::default();
                 profile.auto_approve.push("sessions_current".to_string());
@@ -12699,7 +13227,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-42".to_string(),
                 content: "Which session is this?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -12794,6 +13322,7 @@ BTC is currently around $65,000 based on latest tool output."#
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig {
                     level: zeroclaw_config::autonomy::AutonomyLevel::Full,
@@ -12826,7 +13355,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-42".to_string(),
                 content: "What is the BTC price now?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -12944,6 +13473,7 @@ BTC is currently around $65,000 based on latest tool output."#
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig {
                     level: zeroclaw_config::autonomy::AutonomyLevel::Full,
@@ -12976,7 +13506,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-42".to_string(),
                 content: "What is the BTC price now?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -13065,6 +13595,7 @@ BTC is currently around $65,000 based on latest tool output."#
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig {
                     level: zeroclaw_config::autonomy::AutonomyLevel::Full,
@@ -13095,7 +13626,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-42".to_string(),
                 content: "What is the BTC price now?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -13206,6 +13737,7 @@ BTC is currently around $65,000 based on latest tool output."#
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -13230,7 +13762,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-telegram".to_string(),
                 content: "What is the BTC price now?".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -13329,6 +13861,7 @@ BTC is currently around $65,000 based on latest tool output."#
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -13353,7 +13886,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-raw".to_string(),
                 content: "What is the BTC price now?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 3,
                 thread_ts: None,
@@ -13437,6 +13970,7 @@ BTC is currently around $65,000 based on latest tool output."#
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -13461,7 +13995,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "bob".to_string(),
                 reply_target: "chat-84".to_string(),
                 content: "What is the BTC price now?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -13565,6 +14099,7 @@ BTC is currently around $65,000 based on latest tool output."#
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -13589,7 +14124,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "/models openrouter".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -13710,6 +14245,7 @@ BTC is currently around $65,000 based on latest tool output."#
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -13734,7 +14270,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "hello routed model_provider".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -13809,7 +14345,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-precheck".to_string(),
                 content: "background chatter".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -13918,6 +14454,7 @@ BTC is currently around $65,000 based on latest tool output."#
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -13942,7 +14479,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "hello cached default model_provider".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 3,
                 thread_ts: None,
@@ -14021,6 +14558,7 @@ BTC is currently around $65,000 based on latest tool output."#
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -14048,7 +14586,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-iter-success".to_string(),
                 content: "Loop until done".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -14134,6 +14672,7 @@ BTC is currently around $65,000 based on latest tool output."#
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -14161,7 +14700,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "bob".to_string(),
                 reply_target: "chat-iter-fail".to_string(),
                 content: "Loop forever".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -14506,6 +15045,7 @@ BTC is currently around $65,000 based on latest tool output."#
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -14529,7 +15069,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sender: "alice".to_string(),
             reply_target: "alice".to_string(),
             content: "hello".to_string(),
-            channel: "test-channel".to_string(),
+            channel: "test-channel".into(),
             channel_alias: None,
             timestamp: 1,
             thread_ts: None,
@@ -14544,7 +15084,7 @@ BTC is currently around $65,000 based on latest tool output."#
             sender: "bob".to_string(),
             reply_target: "bob".to_string(),
             content: "world".to_string(),
-            channel: "test-channel".to_string(),
+            channel: "test-channel".into(),
             channel_alias: None,
             timestamp: 2,
             thread_ts: None,
@@ -14648,6 +15188,7 @@ BTC is currently around $65,000 based on latest tool output."#
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -14672,7 +15213,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "forwarded content".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -14688,7 +15229,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "summarize this".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -14790,6 +15331,7 @@ BTC is currently around $65,000 based on latest tool output."#
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
             media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
             transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
@@ -14824,7 +15366,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "U123".to_string(),
                 reply_target: "C123".to_string(),
                 content: "first question".to_string(),
-                channel: "slack".to_string(),
+                channel: "slack".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: Some("1741234567.100001".to_string()),
@@ -14840,7 +15382,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "U123".to_string(),
                 reply_target: "C123".to_string(),
                 content: "second question".to_string(),
-                channel: "slack".to_string(),
+                channel: "slack".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: Some("1741234567.100001".to_string()),
@@ -14970,6 +15512,7 @@ BTC is currently around $65,000 based on latest tool output."#
             runtime_defaults_override: Arc::new(Mutex::new(None)),
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             identity: None,
+            topic_binding: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(8);
@@ -14979,7 +15522,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "15555550123".to_string(),
                 reply_target: "15555550123".to_string(),
                 content: "first WhatsApp question".to_string(),
-                channel: "whatsapp".to_string(),
+                channel: "whatsapp".into(),
                 channel_alias: Some("default".to_string()),
                 timestamp: 1,
                 thread_ts: None,
@@ -14995,7 +15538,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "15555550123".to_string(),
                 reply_target: "15555550123".to_string(),
                 content: "second WhatsApp question".to_string(),
-                channel: "whatsapp".to_string(),
+                channel: "whatsapp".into(),
                 channel_alias: Some("default".to_string()),
                 timestamp: 2,
                 thread_ts: None,
@@ -15100,6 +15643,7 @@ BTC is currently around $65,000 based on latest tool output."#
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -15124,7 +15668,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "first chat".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -15140,7 +15684,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-2".to_string(),
                 content: "second chat".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -15227,6 +15771,7 @@ BTC is currently around $65,000 based on latest tool output."#
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -15251,7 +15796,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-typing".to_string(),
                 content: "hello".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -15335,6 +15880,7 @@ BTC is currently around $65,000 based on latest tool output."#
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -15359,7 +15905,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-react".to_string(),
                 content: "hello".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -16161,6 +16707,60 @@ BTC is currently around $65,000 based on latest tool output."#
         ));
     }
 
+    #[test]
+    fn parse_runtime_command_recognizes_topic_help() {
+        assert!(matches!(
+            parse_runtime_command("feishu", "/topic"),
+            Some(ChannelRuntimeCommand::Topic(TopicAction::Help))
+        ));
+    }
+
+    #[test]
+    fn parse_runtime_command_recognizes_topic_list() {
+        assert!(matches!(
+            parse_runtime_command("feishu", "/topic list"),
+            Some(ChannelRuntimeCommand::Topic(TopicAction::List))
+        ));
+    }
+
+    #[test]
+    fn parse_runtime_command_recognizes_topic_reset() {
+        assert!(matches!(
+            parse_runtime_command("feishu", "/topic reset"),
+            Some(ChannelRuntimeCommand::Topic(TopicAction::Reset))
+        ));
+    }
+
+    #[test]
+    fn parse_runtime_command_recognizes_topic_set() {
+        match parse_runtime_command("feishu", "/topic db_lock") {
+            Some(ChannelRuntimeCommand::Topic(TopicAction::Set(id))) => {
+                assert_eq!(id, "db_lock");
+            }
+            other => panic!("expected Topic(Set), got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn parse_runtime_command_topic_set_rejects_extra_tokens() {
+        assert!(matches!(
+            parse_runtime_command("feishu", "/topic db_lock extra"),
+            Some(ChannelRuntimeCommand::Topic(TopicAction::Help))
+        ));
+    }
+
+    #[test]
+    fn parse_runtime_command_topic_keywords_case_insensitive() {
+        assert!(matches!(
+            parse_runtime_command("feishu", "/topic LIST"),
+            Some(ChannelRuntimeCommand::Topic(TopicAction::List))
+        ));
+        assert!(matches!(
+            parse_runtime_command("feishu", "/topic Reset"),
+            Some(ChannelRuntimeCommand::Topic(TopicAction::Reset))
+        ));
+    }
+
     /// `/models <family>` must resolve to a configured alias-backed ref so the
     /// switched provider uses the alias entry's key/URI — never construct a bare
     /// family provider that ignores `[providers.models.<family>.<alias>]`.
@@ -16676,6 +17276,7 @@ BTC is currently around $65,000 based on latest tool output."#
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -16700,7 +17301,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "hello".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -16719,7 +17320,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "follow up".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -16844,6 +17445,7 @@ BTC is currently around $65,000 based on latest tool output."#
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -16868,7 +17470,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-refresh".to_string(),
                 content: "hello".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -16904,7 +17506,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-refresh".to_string(),
                 content: "/new".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -16945,7 +17547,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-refresh".to_string(),
                 content: "hello again".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 3,
                 thread_ts: None,
@@ -16996,78 +17598,67 @@ BTC is currently around $65,000 based on latest tool output."#
         channels_by_name.insert(channel.name().to_string(), channel);
 
         let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
-        let runtime_ctx = Arc::new(ChannelRuntimeContext {
-            channels_by_name: Arc::new(channels_by_name),
-            model_provider: provider_impl.clone(),
-            model_provider_ref: Arc::new("test-provider".to_string()),
-            agent_alias: Arc::new("test-agent".to_string()),
-            agent_cfg: Arc::new(zeroclaw_config::schema::AliasedAgentConfig::default()),
-            memory: Arc::new(RecallMemory),
-            memory_strategy: Arc::new(
-                zeroclaw_runtime::agent::memory_strategy::DefaultMemoryStrategy::with_config(
-                    Arc::new(RecallMemory),
-                    zeroclaw_config::schema::MemoryConfig::default(),
-                    std::path::PathBuf::new(),
-                ),
-            ),
-            tools_registry: Arc::new(vec![]),
-            observer: Arc::new(NoopObserver),
-            system_prompt: Arc::new("test-system-prompt".to_string()),
-            model: Arc::new("test-model".to_string()),
-            temperature: Some(0.0),
-            auto_save_memory: false,
-            max_tool_iterations: 5,
-            min_relevance_score: 0.0,
-            conversation_histories: Arc::new(Mutex::new(lru::LruCache::new(
-                std::num::NonZeroUsize::new(MAX_CONVERSATION_SENDERS).unwrap(),
-            ))),
-            pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
-            provider_cache: Arc::new(Mutex::new(HashMap::new())),
-            route_overrides: Arc::new(Mutex::new(HashMap::new())),
-            reliability: Arc::new(zeroclaw_config::schema::ReliabilityConfig::default()),
-            provider_runtime_options: zeroclaw_providers::ModelProviderRuntimeOptions::default(),
-            workspace_dir: Arc::new(std::env::temp_dir()),
-            prompt_config: Arc::new(zeroclaw_config::schema::Config::default()),
-            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
-            interrupt_on_new_message: InterruptOnNewMessageConfig {
-                telegram: false,
-                slack: false,
-                discord: false,
-                mattermost: false,
-                matrix: false,
-                whatsapp: false,
+        let mut prompt_config = zeroclaw_config::schema::Config::default();
+        prompt_config.agents.insert(
+            "test-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                channels: vec![
+                    "test-channel.default".into(),
+                    "other-channel.default".into(),
+                ],
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
             },
-            multimodal: zeroclaw_config::schema::MultimodalConfig::default(),
-            media_pipeline: zeroclaw_config::schema::MediaPipelineConfig::default(),
-            transcription_config: zeroclaw_config::schema::TranscriptionConfig::default(),
-            agent_transcription_provider: String::new(),
-            hooks: None,
-            non_cli_excluded_tools: Arc::new(Vec::new()),
-            autonomy_level: AutonomyLevel::default(),
-            tool_call_dedup_exempt: Arc::new(Vec::new()),
-            model_routes: Arc::new(Vec::new()),
-            query_classification: zeroclaw_config::schema::QueryClassificationConfig::default(),
-            ack_reactions: true,
-            show_tool_calls: true,
-            progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
-            session_store: None,
-            identity: None,
-            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
-                &zeroclaw_config::schema::RiskProfileConfig::default(),
-            )),
-            activated_tools: None,
-            cost_tracking: None,
-            pacing: zeroclaw_config::schema::PacingConfig::default(),
-            max_tool_result_chars: 0,
-            context_token_budget: 0,
-            debouncer: Arc::new(zeroclaw_infra::debounce::MessageDebouncer::new(
-                Duration::ZERO,
-            )),
-            receipt_generator: None,
-            show_receipts_in_response: false,
-            last_applied_config_stamp: Arc::new(Mutex::new(None)),
-            runtime_defaults_override: Arc::new(Mutex::new(None)),
-        });
+        );
+        prompt_config.agents.insert(
+            "peer-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                channels: vec!["test-channel.default".into()],
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
+            },
+        );
+        prompt_config.agents.insert(
+            "other-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                channels: vec!["other-channel.default".into()],
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
+            },
+        );
+        prompt_config.peer_groups.insert(
+            "current-room".to_string(),
+            zeroclaw_config::multi_agent::PeerGroupConfig {
+                channel: "test-channel.default".into(),
+                agents: vec![
+                    zeroclaw_config::multi_agent::AgentAlias::new("test-agent"),
+                    zeroclaw_config::multi_agent::AgentAlias::new("peer-agent"),
+                ],
+                external_peers: vec![zeroclaw_config::multi_agent::PeerUsername::new("@Operator")],
+                ..zeroclaw_config::multi_agent::PeerGroupConfig::default()
+            },
+        );
+        prompt_config.peer_groups.insert(
+            "other-room".to_string(),
+            zeroclaw_config::multi_agent::PeerGroupConfig {
+                channel: "other-channel.default".into(),
+                agents: vec![
+                    zeroclaw_config::multi_agent::AgentAlias::new("test-agent"),
+                    zeroclaw_config::multi_agent::AgentAlias::new("other-agent"),
+                ],
+                ..zeroclaw_config::multi_agent::PeerGroupConfig::default()
+            },
+        );
+        let prompt_config = Arc::new(prompt_config);
+        let tools_registry: Arc<Vec<Box<dyn Tool>>> = Arc::new(vec![Box::new(
+            zeroclaw_runtime::tools::SendMessageToPeerTool::new(
+                Arc::clone(&prompt_config),
+                "test-agent",
+            ),
+        )]);
+        let runtime_ctx = peer_prompt_test_context(
+            channels_by_name,
+            provider_impl.clone(),
+            Arc::clone(&prompt_config),
+            tools_registry,
+        );
 
         process_channel_message(
             runtime_ctx.clone(),
@@ -17076,7 +17667,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-ctx".to_string(),
                 content: "hello".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -17098,6 +17689,21 @@ BTC is currently around $65,000 based on latest tool output."#
         assert_eq!(calls[0][0].0, "system");
         assert!(calls[0][0].1.contains(MEMORY_CONTEXT_OPEN));
         assert!(calls[0][0].1.contains("Age is 45"));
+        assert!(
+            calls[0][0]
+                .1
+                .contains("Current-channel peer map for agent \"test-agent\"")
+        );
+        assert!(calls[0][0].1.contains("peer groups: \"current-room\""));
+        assert!(
+            calls[0][0]
+                .1
+                .contains("use channel ref \"test-channel.default\"")
+        );
+        assert!(calls[0][0].1.contains("agent peers: \"peer-agent\""));
+        assert!(calls[0][0].1.contains("external peers: \"operator\""));
+        assert!(!calls[0][0].1.contains("\"other-room\""));
+        assert!(!calls[0][0].1.contains("\"other-agent\""));
         assert_eq!(calls[0][1].0, "user");
         assert!(calls[0][1].1.starts_with('['));
         assert!(
@@ -17121,6 +17727,76 @@ BTC is currently around $65,000 based on latest tool output."#
             turns[0].content
         );
         assert!(!turns[0].content.contains(MEMORY_CONTEXT_OPEN));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_omits_peer_map_when_send_peer_tool_unavailable() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(HistoryCaptureModelProvider::default());
+        let mut prompt_config = zeroclaw_config::schema::Config::default();
+        prompt_config.agents.insert(
+            "test-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                channels: vec!["test-channel.default".into()],
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
+            },
+        );
+        prompt_config.agents.insert(
+            "peer-agent".to_string(),
+            zeroclaw_config::schema::AliasedAgentConfig {
+                channels: vec!["test-channel.default".into()],
+                ..zeroclaw_config::schema::AliasedAgentConfig::default()
+            },
+        );
+        prompt_config.peer_groups.insert(
+            "current-room".to_string(),
+            zeroclaw_config::multi_agent::PeerGroupConfig {
+                channel: "test-channel.default".into(),
+                agents: vec![
+                    zeroclaw_config::multi_agent::AgentAlias::new("test-agent"),
+                    zeroclaw_config::multi_agent::AgentAlias::new("peer-agent"),
+                ],
+                ..zeroclaw_config::multi_agent::PeerGroupConfig::default()
+            },
+        );
+        let runtime_ctx = peer_prompt_test_context(
+            channels_by_name,
+            provider_impl.clone(),
+            Arc::new(prompt_config),
+            Arc::new(vec![]),
+        );
+
+        process_channel_message(
+            runtime_ctx,
+            zeroclaw_api::channel::ChannelMessage {
+                id: "msg-ctx-no-tool".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-ctx".to_string(),
+                content: "hello".to_string(),
+                channel: "test-channel".into(),
+                channel_alias: None,
+                timestamp: 1,
+                thread_ts: None,
+                interruption_scope_id: None,
+                attachments: vec![],
+                subject: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let calls = provider_impl
+            .calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0][0].1.contains("Current-channel peer map"));
+        assert!(!calls[0][0].1.contains("send_message_to_peer"));
     }
 
     #[tokio::test]
@@ -17194,6 +17870,7 @@ BTC is currently around $65,000 based on latest tool output."#
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -17218,7 +17895,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-image".to_string(),
                 content: "please inspect this".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -17337,6 +18014,7 @@ BTC is currently around $65,000 based on latest tool output."#
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -17361,7 +18039,7 @@ BTC is currently around $65,000 based on latest tool output."#
                 sender: "alice".to_string(),
                 reply_target: "chat-telegram".to_string(),
                 content: "hello".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -17814,7 +18492,7 @@ This is an example JSON object for profile settings."#;
         );
 
         let config_arc = Arc::new(RwLock::new(config));
-        let channels = collect_configured_channels(&config_arc, "test", &[]);
+        let channels = collect_configured_channels(&config_arc, "test", &[]).channels;
         assert!(
             !channels.iter().any(|entry| entry.display_name == "Email"),
             "email with no agent reference should not be collected"
@@ -18414,6 +19092,7 @@ This is an example JSON object for profile settings."#;
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -18439,7 +19118,7 @@ This is an example JSON object for profile settings."#;
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-photo".to_string(),
                 content: "[IMAGE:/tmp/workspace/photo_99_1.jpg]\n\nWhat is this?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -18529,6 +19208,7 @@ This is an example JSON object for profile settings."#;
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -18553,7 +19233,7 @@ This is an example JSON object for profile settings."#;
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-photo".to_string(),
                 content: "[IMAGE:/tmp/workspace/photo_99_1.jpg]\n\nWhat is this?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -18572,7 +19252,7 @@ This is an example JSON object for profile settings."#;
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-photo".to_string(),
                 content: "What is WAL?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -18681,6 +19361,7 @@ This is an example JSON object for profile settings."#;
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -18708,7 +19389,7 @@ This is an example JSON object for profile settings."#;
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-format".to_string(),
                 content: "trigger format error".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -18727,7 +19408,7 @@ This is an example JSON object for profile settings."#;
                 sender: "zeroclaw_user".to_string(),
                 reply_target: "chat-format".to_string(),
                 content: "What is WAL?".to_string(),
-                channel: "test-channel".to_string(),
+                channel: "test-channel".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: None,
@@ -18888,6 +19569,7 @@ This is an example JSON object for profile settings."#;
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -18912,7 +19594,7 @@ This is an example JSON object for profile settings."#;
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "please analyze-image from the dataset".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -19037,6 +19719,7 @@ This is an example JSON object for profile settings."#;
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -19061,7 +19744,7 @@ This is an example JSON object for profile settings."#;
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "please analyze-image from the dataset".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -19178,6 +19861,7 @@ This is an example JSON object for profile settings."#;
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -19202,7 +19886,7 @@ This is an example JSON object for profile settings."#;
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "just a regular text message".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -19340,6 +20024,7 @@ This is an example JSON object for profile settings."#;
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -19364,7 +20049,7 @@ This is an example JSON object for profile settings."#;
                 sender: "alice".to_string(),
                 reply_target: "chat-1".to_string(),
                 content: "write some code for me".to_string(),
-                channel: "telegram".to_string(),
+                channel: "telegram".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: None,
@@ -19738,6 +20423,7 @@ This is an example JSON object for profile settings."#;
             progress_observer: zeroclaw_config::schema::ProgressObserverConfig::default(),
             session_store: None,
             identity: None,
+            topic_binding: None,
             approval_manager: Arc::new(ApprovalManager::for_non_interactive(
                 &zeroclaw_config::schema::RiskProfileConfig::default(),
             )),
@@ -19764,7 +20450,7 @@ This is an example JSON object for profile settings."#;
                 sender: "alice".to_string(),
                 reply_target: "C123".to_string(),
                 content: "thread-a question".to_string(),
-                channel: "slack".to_string(),
+                channel: "slack".into(),
                 channel_alias: None,
                 timestamp: 1,
                 thread_ts: Some("1741234567.100001".to_string()),
@@ -19780,7 +20466,7 @@ This is an example JSON object for profile settings."#;
                 sender: "alice".to_string(),
                 reply_target: "C123".to_string(),
                 content: "thread-b question".to_string(),
-                channel: "slack".to_string(),
+                channel: "slack".into(),
                 channel_alias: None,
                 timestamp: 2,
                 thread_ts: Some("1741234567.200002".to_string()),
@@ -20577,6 +21263,44 @@ Done."#;
     }
 
     #[tokio::test]
+    #[cfg(feature = "channel-email")]
+    async fn deliver_announcement_routes_email_to_email_arm() {
+        let config = zeroclaw_config::schema::Config::default();
+
+        let err = deliver_announcement(&config, "email.default", "user@example.com", None, "hi")
+            .await
+            .expect_err("expected email.default to bail because channel is not configured");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("unsupported delivery channel"),
+            "email.default must route to the email arm, not fall through; got: {msg}"
+        );
+        assert!(
+            msg.contains("[channels.email.default] not configured"),
+            "email.default must report the real config table; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn deliver_announcement_routes_whatsapp_to_whatsapp_arm() {
+        let config = zeroclaw_config::schema::Config::default();
+
+        let err = deliver_announcement(&config, "whatsapp.default", "+15551234567", None, "hi")
+            .await
+            .expect_err("expected whatsapp.default to bail because channel is not configured");
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("unsupported delivery channel"),
+            "whatsapp.default must route to the whatsapp arm, not fall through; got: {msg}"
+        );
+        assert!(
+            msg.contains("[channels.whatsapp.default] not configured"),
+            "whatsapp.default must report the real config table; got: {msg}"
+        );
+    }
+
+    #[tokio::test]
     #[cfg(feature = "channel-lark")]
     async fn deliver_announcement_rejects_feishu_value_when_use_feishu_false() {
         // Reject (not warn): otherwise the message silently lands on the
@@ -20671,20 +21395,25 @@ mod error_code_tests {
             if is_master {
                 return self.whitelist.contains(sender).then(|| sender.to_string());
             }
-            let m = self.map.get(&(channel_ref.to_string(), sender.to_string()))?;
+            let m = self
+                .map
+                .get(&(channel_ref.to_string(), sender.to_string()))?;
             self.whitelist.contains(m).then(|| m.clone())
         }
-        fn issue_code(&self, _m: &str) -> Option<String> { None }
+        fn issue_code(&self, _m: &str) -> Option<String> {
+            None
+        }
         fn redeem_code(&self, _c: &str, _ch: &str, _s: &str) -> Result<String, String> {
             Err("stub".into())
         }
-        fn unbind(&self, _ch: &str, _s: &str) -> bool { false }
+        fn unbind(&self, _ch: &str, _s: &str) -> bool {
+            false
+        }
     }
 
     fn dm(channel: &str, alias: &str, sender: &str) -> zeroclaw_api::channel::ChannelMessage {
-        let mut m = zeroclaw_api::channel::ChannelMessage::new(
-            "id1", sender, sender, "hi", channel, 0,
-        );
+        let mut m =
+            zeroclaw_api::channel::ChannelMessage::new("id1", sender, sender, "hi", channel, 0);
         m.channel_alias = Some(alias.to_string());
         m
     }
@@ -20694,17 +21423,26 @@ mod error_code_tests {
         let mut whitelist = std::collections::HashSet::new();
         whitelist.insert("u_alice".to_string());
         let ident = IdentityRuntime {
-            resolver: Arc::new(StubResolver { map: Default::default(), whitelist }),
+            resolver: Arc::new(StubResolver {
+                map: Default::default(),
+                whitelist,
+            }),
             master_channel: "dawnim.work".to_string(),
         };
         let msg = dm("dawnim", "work", "u_alice");
-        assert_eq!(resolve_session_key(&msg, Some(&ident)), "unified_u_alice");
+        assert_eq!(
+            resolve_session_key(&msg, Some(&ident), msg.thread_ts.as_deref()),
+            "unified_u_alice"
+        );
     }
 
     #[test]
     fn resolve_session_key_slave_uses_binding() {
         let mut map = std::collections::HashMap::new();
-        map.insert(("lark.work".to_string(), "ou_aaa".to_string()), "u_alice".to_string());
+        map.insert(
+            ("lark.work".to_string(), "ou_aaa".to_string()),
+            "u_alice".to_string(),
+        );
         let mut whitelist = std::collections::HashSet::new();
         whitelist.insert("u_alice".to_string());
         let ident = IdentityRuntime {
@@ -20712,23 +21450,35 @@ mod error_code_tests {
             master_channel: "dawnim.work".to_string(),
         };
         let msg = dm("lark", "work", "ou_aaa");
-        assert_eq!(resolve_session_key(&msg, Some(&ident)), "unified_u_alice");
+        assert_eq!(
+            resolve_session_key(&msg, Some(&ident), msg.thread_ts.as_deref()),
+            "unified_u_alice"
+        );
     }
 
     #[test]
     fn resolve_session_key_unbound_falls_back_to_base() {
         let ident = IdentityRuntime {
-            resolver: Arc::new(StubResolver { map: Default::default(), whitelist: Default::default() }),
+            resolver: Arc::new(StubResolver {
+                map: Default::default(),
+                whitelist: Default::default(),
+            }),
             master_channel: "dawnim.work".to_string(),
         };
         let msg = dm("lark", "work", "ou_stranger");
-        assert_eq!(resolve_session_key(&msg, Some(&ident)), conversation_history_key(&msg));
+        assert_eq!(
+            resolve_session_key(&msg, Some(&ident), msg.thread_ts.as_deref()),
+            conversation_history_key(&msg)
+        );
     }
 
     #[test]
     fn resolve_session_key_none_identity_is_base() {
         let msg = dm("lark", "work", "ou_aaa");
-        assert_eq!(resolve_session_key(&msg, None), conversation_history_key(&msg));
+        assert_eq!(
+            resolve_session_key(&msg, None, None),
+            conversation_history_key(&msg)
+        );
     }
 
     #[test]
@@ -20736,37 +21486,246 @@ mod error_code_tests {
         let mut whitelist = std::collections::HashSet::new();
         whitelist.insert("u_alice".to_string());
         let ident = IdentityRuntime {
-            resolver: Arc::new(StubResolver { map: Default::default(), whitelist }),
+            resolver: Arc::new(StubResolver {
+                map: Default::default(),
+                whitelist,
+            }),
             master_channel: "dawnim.work".to_string(),
         };
         let mut msg = dm("dawnim", "work", "u_alice");
         msg.reply_target = "group:team".to_string(); // group → no unify
-        assert_eq!(resolve_session_key(&msg, Some(&ident)), conversation_history_key(&msg));
+        assert_eq!(
+            resolve_session_key(&msg, Some(&ident), msg.thread_ts.as_deref()),
+            conversation_history_key(&msg)
+        );
+    }
+
+    #[test]
+    fn resolve_session_key_master_with_topic_appends_topic_to_unified_key() {
+        // Bug regression guard: when identity resolves AND msg.thread_ts is
+        // set, the session key must include the topic so multi-topic isolation
+        // works even for master/superuser identities.
+        let mut whitelist = std::collections::HashSet::new();
+        whitelist.insert("u_alice".to_string());
+        let ident = IdentityRuntime {
+            resolver: Arc::new(StubResolver {
+                map: Default::default(),
+                whitelist,
+            }),
+            master_channel: "dawnim.work".to_string(),
+        };
+        let mut msg = dm("dawnim", "work", "u_alice");
+        msg.thread_ts = Some("db_lock".to_string());
+        let key = resolve_session_key(&msg, Some(&ident), msg.thread_ts.as_deref());
+        assert!(
+            key.contains("unified_u_alice") && key.contains("db_lock"),
+            "expected unified+topic key, got: {key}"
+        );
+    }
+
+    #[test]
+    fn resolve_session_key_master_without_topic_still_uses_plain_unified() {
+        // Regression guard: when thread_ts is None, behaviour is unchanged
+        // (plain unified_<master_id>).
+        let mut whitelist = std::collections::HashSet::new();
+        whitelist.insert("u_alice".to_string());
+        let ident = IdentityRuntime {
+            resolver: Arc::new(StubResolver {
+                map: Default::default(),
+                whitelist,
+            }),
+            master_channel: "dawnim.work".to_string(),
+        };
+        let msg = dm("dawnim", "work", "u_alice");
+        // thread_ts is None
+        let key = resolve_session_key(&msg, Some(&ident), msg.thread_ts.as_deref());
+        assert_eq!(key, "unified_u_alice");
+    }
+
+    #[test]
+    fn resolve_session_key_uses_effective_topic_over_thread_ts() {
+        // When the caller supplies an `effective_topic` distinct from
+        // `msg.thread_ts`, the session key honours the caller-supplied
+        // topic. This is the path that wires `/topic` bindings into
+        // session routing for slave channels.
+        let identity = IdentityRuntime {
+            resolver: Arc::new(AlwaysResolves),
+            master_channel: "dawnim.work".to_string(),
+        };
+        let msg = test_msg("feishu", Some("work"), Some("ignored_native"), "u_alice");
+        let key = resolve_session_key(&msg, Some(&identity), Some("bound_topic"));
+        assert_eq!(
+            key,
+            zeroclaw_api::session_keys::sanitize_session_key("unified_u_alice_bound_topic")
+        );
+    }
+
+    #[test]
+    fn resolve_session_key_unified_no_topic_when_effective_topic_none() {
+        // When the caller passes `None` for `effective_topic`, the key
+        // collapses to `unified_<master_id>` even if `msg.thread_ts` is
+        // populated. Callers are responsible for choosing the right topic.
+        let identity = IdentityRuntime {
+            resolver: Arc::new(AlwaysResolves),
+            master_channel: "dawnim.work".to_string(),
+        };
+        let msg = test_msg("feishu", Some("work"), None, "u_alice");
+        let key = resolve_session_key(&msg, Some(&identity), None);
+        assert_eq!(
+            key,
+            zeroclaw_api::session_keys::sanitize_session_key("unified_u_alice")
+        );
+    }
+
+    /// Identity resolver that always returns `Some(sender)` as the master id.
+    /// Used by tests that need to exercise the unified-session path without
+    /// configuring whitelists or bindings.
+    struct AlwaysResolves;
+    impl zeroclaw_infra::identity_store::IdentityResolver for AlwaysResolves {
+        fn resolve(&self, _ch: &str, sender: &str, _m: bool) -> Option<String> {
+            Some(sender.to_string())
+        }
+        fn issue_code(&self, _: &str) -> Option<String> {
+            None
+        }
+        fn redeem_code(&self, _: &str, _: &str, _: &str) -> Result<String, String> {
+            Err("n/a".into())
+        }
+        fn unbind(&self, _: &str, _: &str) -> bool {
+            false
+        }
+    }
+
+    fn test_msg(
+        channel: &str,
+        alias: Option<&str>,
+        thread_ts: Option<&str>,
+        sender: &str,
+    ) -> zeroclaw_api::channel::ChannelMessage {
+        let mut m =
+            zeroclaw_api::channel::ChannelMessage::new("m1", sender, "r1", "hi", channel, 0);
+        m.channel_alias = alias.map(|s| s.to_string());
+        m.thread_ts = thread_ts.map(|s| s.to_string());
+        m
+    }
+
+    fn test_topic_registry() -> zeroclaw_infra::topic_binding::TopicBindingRegistry {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let path = tmp.path().join("tb.json");
+        let _ = Box::leak(Box::new(tmp));
+        zeroclaw_infra::topic_binding::TopicBindingRegistry::load(path).unwrap()
+    }
+
+    #[test]
+    fn resolve_effective_topic_master_uses_thread_ts_only() {
+        let msg = test_msg("dawnim", Some("work"), Some("topic_A"), "u_alice");
+        let result = resolve_effective_topic(&msg, "dawnim.work", Some("dawnim.work"), None);
+        assert_eq!(result, Some("topic_A".to_string()));
+    }
+
+    #[test]
+    fn resolve_effective_topic_master_ignores_binding_even_when_set() {
+        let msg = test_msg("dawnim", Some("work"), Some("topic_A"), "u_alice");
+        let reg = test_topic_registry();
+        reg.set("dawnim.work", "u_alice", "binding_topic");
+        let result = resolve_effective_topic(&msg, "dawnim.work", Some("dawnim.work"), Some(&reg));
+        assert_eq!(
+            result,
+            Some("topic_A".to_string()),
+            "master must ignore binding"
+        );
+    }
+
+    #[test]
+    fn resolve_effective_topic_slave_prefers_thread_ts_over_binding() {
+        let msg = test_msg("feishu", Some("work"), Some("native_topic"), "u_alice");
+        let reg = test_topic_registry();
+        reg.set("feishu.work", "u_alice", "bound_topic");
+        let result = resolve_effective_topic(&msg, "feishu.work", Some("dawnim.work"), Some(&reg));
+        assert_eq!(result, Some("native_topic".to_string()));
+    }
+
+    #[test]
+    fn resolve_effective_topic_slave_uses_binding_when_no_thread_ts() {
+        let msg = test_msg("feishu", Some("work"), None, "u_alice");
+        let reg = test_topic_registry();
+        reg.set("feishu.work", "u_alice", "bound_topic");
+        let result = resolve_effective_topic(&msg, "feishu.work", Some("dawnim.work"), Some(&reg));
+        assert_eq!(result, Some("bound_topic".to_string()));
+    }
+
+    #[test]
+    fn resolve_effective_topic_returns_none_when_neither_set() {
+        let msg = test_msg("feishu", Some("work"), None, "u_alice");
+        let result = resolve_effective_topic(&msg, "feishu.work", Some("dawnim.work"), None);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn resolve_effective_topic_no_master_config_falls_to_thread_ts() {
+        let msg = test_msg("feishu", Some("work"), Some("native_topic"), "u_alice");
+        let result = resolve_effective_topic(&msg, "feishu.work", None, None);
+        assert_eq!(result, Some("native_topic".to_string()));
+    }
+
+    #[test]
+    fn topic_help_response_lists_subcommands() {
+        let body = build_topic_help_response();
+        assert!(body.contains("/topic list"));
+        assert!(body.contains("/topic <"));
+        assert!(body.contains("/topic reset"));
+        assert!(body.contains("superuser"));
+    }
+
+    #[test]
+    fn topic_list_response_with_entries_marks_current_binding() {
+        let body = build_topic_list_response(
+            "dawnim.work",
+            &["db_lock".to_string(), "migrations".to_string()],
+            Some("db_lock"),
+        );
+        assert!(body.contains("dawnim.work"));
+        assert!(body.contains("db_lock"));
+        assert!(body.contains("当前绑定"));
+        assert!(body.contains("migrations"));
+    }
+
+    #[test]
+    fn topic_list_response_empty_explains_how_to_create() {
+        let body = build_topic_list_response("dawnim.work", &[], None);
+        assert!(body.contains("dawnim.work"));
+        assert!(body.contains("尚无") || body.contains("没有"));
     }
 
     #[test]
     fn end_to_end_master_and_bound_slave_share_session_key() {
         let tmp = tempfile::TempDir::new().unwrap();
-        let resolver = zeroclaw_infra::make_identity_store(tmp.path(), &["u_alice".to_string()])
-            .unwrap();
+        let resolver =
+            zeroclaw_infra::make_identity_store(tmp.path(), &["u_alice".to_string()]).unwrap();
         // Bind lark.work/ou_aaa -> u_alice via a real code.
         let code = resolver.issue_code("u_alice").unwrap();
         resolver.redeem_code(&code, "lark.work", "ou_aaa").unwrap();
 
-        let ident = IdentityRuntime { resolver, master_channel: "dawnim.work".to_string() };
+        let ident = IdentityRuntime {
+            resolver,
+            master_channel: "dawnim.work".to_string(),
+        };
 
         let master_msg = dm("dawnim", "work", "u_alice");
         let slave_msg = dm("lark", "work", "ou_aaa");
         let stranger = dm("lark", "work", "ou_zzz");
 
         assert_eq!(
-            resolve_session_key(&master_msg, Some(&ident)),
-            resolve_session_key(&slave_msg, Some(&ident)),
+            resolve_session_key(&master_msg, Some(&ident), master_msg.thread_ts.as_deref()),
+            resolve_session_key(&slave_msg, Some(&ident), slave_msg.thread_ts.as_deref()),
             "master and bound slave must share the unified session_key"
         );
-        assert_eq!(resolve_session_key(&master_msg, Some(&ident)), "unified_u_alice");
         assert_eq!(
-            resolve_session_key(&stranger, Some(&ident)),
+            resolve_session_key(&master_msg, Some(&ident), master_msg.thread_ts.as_deref()),
+            "unified_u_alice"
+        );
+        assert_eq!(
+            resolve_session_key(&stranger, Some(&ident), stranger.thread_ts.as_deref()),
             conversation_history_key(&stranger),
             "unbound stranger stays isolated"
         );
@@ -20816,7 +21775,9 @@ mod group_detection_tests {
         assert!(is_group_reply_target("group:12345678"));
 
         // WeCom group format (NEW - needs to be added)
-        assert!(is_group_reply_target("group--wrjEwKDwAALbgnNSPHc1AsopD6TIvxxx"));
+        assert!(is_group_reply_target(
+            "group--wrjEwKDwAALbgnNSPHc1AsopD6TIvxxx"
+        ));
 
         // DawnIM group format (NEW - needs to be added)
         assert!(is_group_reply_target("2:channel_123"));
@@ -20830,4 +21791,3 @@ mod group_detection_tests {
         assert!(!is_group_reply_target("oc_chat123")); // Lark chat_id (cannot distinguish)
     }
 }
-
