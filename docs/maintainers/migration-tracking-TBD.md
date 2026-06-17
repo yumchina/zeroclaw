@@ -1,7 +1,7 @@
-# Migration Tracking — yumchina/master PR #34–#46 → 0.8.0
+# Migration Tracking — yumchina/master PR #34–#50 → 0.8.0
 
-> 生成日期：2026-06-13
-> 范围：yumchina/zeroclaw master 分支 PR #34 至 #46
+> 生成日期：2026-06-13（#34–#46）；2026-06-17 追加 #47–#50
+> 范围：yumchina/zeroclaw master 分支 PR #34 至 #50
 > 目的：记录各 PR 在 0.8.0 分支的迁移状态、优先级及迁移建议
 
 ## 状态图例
@@ -40,14 +40,18 @@
 | **#44** | Revert "feat(shell): 增加命令执行前的环境信息记录" | ⏭️ 已撤销 | — | revert 本身无功能内容 | 放弃 |
 | **#45** | Implement multi-topic mapping logic and refactor settings field | ✅ 已迁移 | P3 | 修改了旧 `zeroclaw-channel-wukongim` crate；需重新评估是否在 0.8.0 上以新方式实现，或待 dawn_im 架构稳定后统一处理 | 已通过 [DawnIM 多话题映射 thread 设计](../superpowers/specs/2026-06-14-dawn-im-multi-topic-design.md) + [实施计划](../superpowers/plans/2026-06-14-dawn-im-multi-topic.md)（方案 ζ）重新设计完成。**不照搬原 PR**：跳过 SettingFlags 重构；新增 `ChannelOrigin.topic` 暴露给工具栈；offline batch 按 topic 拆分；继续用 `setting: Option<u32>` + `Some(8u32)` |
 | **#46** | refactor: rename xuanji tools to generic dawn task tools | ✅ 已迁移 | P3 | `dawn_task.rs` / `dawn_agents.rs` 在 0.8.0 均不存在；需与 #39 捆绑，按 0.8.0 的 `dawn_im` + `dawn-tools` crate 架构重写 | 已迁移完成。`dawn_task.rs`（任务类型配置）进 zeroclaw-config；`task.rs`（工具实现 `CreateTaskTool` / `QueryTaskTool`）进 dawn-tools crate；新增 `ToolKind::DawnTask` 归属。**后续通过 [解耦设计](../superpowers/specs/2026-06-14-dawn-tools-channel-decoupling-design.md) + [实施计划](../superpowers/plans/2026-06-14-dawn-tools-channel-decoupling.md) 把配置项扩展为 `DawnTaskExecutorConfig` (channel + recipient)，允许任意 channel 充当 task executor** |
+| **#47** | feat(wukongim): sequential watermark commit + background recovery | ❌ 未迁移 | P6 | 主体在 `zeroclaw-channel-wukongim/src/channel.rs`（+340 行），0.8.0 已无此 crate，watermark/恢复机制需在 `dawn_im` 上重写；`orchestrator/mod.rs` 中 `followup_thread_id` 对 `wukongim` 特判 0.8.0 也未覆盖 `dawn_im`（root message 仍可能用 `msg.id` 当 thread） | 待 `dawn_im` 历史同步策略设计稳定后重新评估；先把 `followup_thread_id` 对 `dawn_im` 的特判迁过来止血 |
+| **#48** | feat(security): 为泄露检测器添加可配置 URL 白名单 | ❌ 未迁移 | P2 | 改 `runtime/src/security/leak_detector.rs`（+352 行）+ `security/mod.rs` + `agent/tool_execution.rs`；0.8.0 同名文件存在且体积接近（22.3K），但 grep `allowlist/allow_list/allowed_url` 均无命中。改动与 wukongim 解耦，可按 0.8.0 现有 security 架构直接移植，附 spec `docs/superpowers/specs/2026-06-12-url-allowlist-design.md` 可循 | 直接移植，按 0.8.0 leak_detector API 适配 |
+| **#49** | fix: 修复 macOS 休眠唤醒后 WuKongIM 客户端连接死锁 | ⏭️ 待评估 | P6 | 改动只在 `zeroclaw-channel-wukongim/src/channel.rs`（±154 行），0.8.0 无此 crate。`dawn_im` 是否存在同种休眠唤醒死锁需独立复现确认；若复现则按 dawn_im 的连接管理重写，否则归为不适用 | 待 macOS 用户在 dawn_im 上复现后决定 |
+| **#50** | Fix message routing for approval and intervention in threads | ❌ 未迁移 | P3 | 改 `zeroclaw-api/src/channel.rs`（`ChannelApprovalRequest` 加字段）+ `acp_channel.rs` + `orchestrator/mod.rs` + `agent.rs` + `loop_.rs` + `approval/mod.rs` + wukongim `approval/card.rs`。0.8.0 上 `ChannelApprovalRequest` 仍只有 `tool_name/arguments_summary/raw_arguments`，`dawn_im::channel.rs::request_approval` 调用 SendParams 时 `topic: None`，approval/接管卡片不会落到对应 thread。#45 的多话题 transparent 透传只覆盖普通 SendMessage 路径，approval/intervention 路径需要补 thread_ts/topic 字段 | 与 [DawnIM 多话题映射](../superpowers/specs/2026-06-14-dawn-im-multi-topic-design.md) 衔接：扩展 `ChannelApprovalRequest`，让 dawn_im `request_approval` 携带 `topic`；接管/中断流程同步 |
 
 ---
 
 ## 推荐执行顺序
 
 1. **P1 — #40**：一行修复，立即处理。`loop_.rs` 末次迭代改为赋值替换。
-2. **P2 — #41**：seatbelt getcwd traversal 安全修复，`seatbelt.rs` 直接移植。
-3. **P3 — #39 + #46**：xuanji/dawn task tools 完整功能，捆绑处理，按 `dawn_im` + `dawn-tools` 架构重写。
+2. **P2 — #41 / #48**：安全/稳定性修复；#41 seatbelt getcwd traversal 直接移植，#48 URL 白名单按 0.8.0 leak_detector 适配（与 wukongim 解耦）。
+3. **P3 — #39 + #46 / #50**：dawn task tools 捆绑实施（已完成）；#50 approval/intervention thread routing 需扩展 `ChannelApprovalRequest` 并联通 dawn_im。
 4. **P4 — #42**：seatbelt wildcard port mapping，#41 完成后跟进。
 5. **P5 — #34**：human takeover 完整实现（Retry/Intervene/Cancel），工作量最大，需专项排期。
-6. **P6 — #35 / #45**：依赖旧架构，架构差异大，需重新评估是否以新方式实现，或纳入后续版本规划。
+6. **P6 — #35 / #45 / #47 / #49**：依赖旧 wukongim crate，架构差异大；#45 已通过新设计完成，#35/#47/#49 待 `dawn_im` 架构稳定后重新评估是否需要等效实现。
