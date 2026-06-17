@@ -1920,6 +1920,20 @@ impl Channel for WuKongIMChannel {
         let payload_b64 =
             base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(&card)?);
         let (channel_id, channel_type) = parse_recipient(recipient);
+        let topic = request
+            .thread_ts
+            .as_ref()
+            .filter(|&t| !t.is_empty() && *t != "0")
+            .map(ToString::to_string);
+        let setting = if topic.is_some() {
+            Some(SettingFlags {
+                topic: Some(true),
+                ..Default::default()
+            })
+        } else {
+            None
+        };
+
         let params = SendParams {
             from_uid: Some(self.uid.clone()),
             client_msg_no: Uuid::new_v4().to_string(),
@@ -1927,11 +1941,11 @@ impl Channel for WuKongIMChannel {
             channel_type,
             payload: serde_json::Value::String(payload_b64),
             header: None,
-            setting: None,
+            setting,
             msg_key: None,
             expire: None,
             stream_no: None,
-            topic: None,
+            topic,
         };
         let (otx, orx) = tokio::sync::oneshot::channel();
         let recipient_key = format!("{channel_id}:{channel_type}");
@@ -1971,6 +1985,20 @@ impl Channel for WuKongIMChannel {
         let payload_b64 =
             base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(&card)?);
         let (channel_id, channel_type) = parse_recipient(recipient);
+        let topic = request
+            .thread_ts
+            .as_ref()
+            .filter(|&t| !t.is_empty() && *t != "0")
+            .map(ToString::to_string);
+        let setting = if topic.is_some() {
+            Some(SettingFlags {
+                topic: Some(true),
+                ..Default::default()
+            })
+        } else {
+            None
+        };
+
         let params = SendParams {
             from_uid: Some(self.uid.clone()),
             client_msg_no: Uuid::new_v4().to_string(),
@@ -1978,11 +2006,11 @@ impl Channel for WuKongIMChannel {
             channel_type,
             payload: serde_json::Value::String(payload_b64),
             header: None,
-            setting: None,
+            setting,
             msg_key: None,
             expire: None,
             stream_no: None,
-            topic: None,
+            topic,
         };
         let (otx, orx) = tokio::sync::oneshot::channel();
         self.pending_interventions

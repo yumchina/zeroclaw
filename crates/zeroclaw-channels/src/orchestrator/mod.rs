@@ -3600,6 +3600,8 @@ async fn process_channel_message(
                             receipt_scope.clone(),
                         zeroclaw_runtime::tools::dawn_task::DAWN_CONTEXT.scope(
                             dawn_ctx.clone(),
+                        zeroclaw_api::CURRENT_THREAD_TS.scope(
+                            msg.thread_ts.clone(),
                         run_tool_call_loop(
                         active_provider.as_ref(),
                         &mut history,
@@ -3639,6 +3641,7 @@ async fn process_channel_message(
                         ctx.receipt_generator
                             .as_ref()
                             .map(|_| tool_receipts_collector.as_ref()),
+                    ),
                     ),
                     ),
                     ),
@@ -3690,6 +3693,7 @@ async fn process_channel_message(
                         reason: reason.clone(),
                         last_tool,
                         error_detail,
+                        thread_ts: msg.thread_ts.clone(),
                     };
 
                     // Send error status update to channel so user knows why we are requesting intervention
