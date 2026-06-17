@@ -14017,6 +14017,51 @@ pub struct SecurityConfig {
     #[serde(default)]
     #[nested]
     pub webauthn: WebAuthnConfig,
+
+    /// Leak detector configuration: sensitivity + URL allowlist that
+    /// preserves matching URLs verbatim through both `LeakDetector::scan`
+    /// and `scrub_credentials_with_allowlist`.
+    #[serde(default)]
+    #[nested]
+    pub leak_detector: LeakDetectorConfig,
+}
+
+/// `[security.leak_detector]` — controls credential detection sensitivity and
+/// the URL allowlist used by mask→detect→restore in both
+/// `LeakDetector::scan` and `scrub_credentials_with_allowlist`.
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "security.leak_detector"]
+pub struct LeakDetectorConfig {
+    #[serde(default = "default_leak_detector_sensitivity")]
+    pub sensitivity: f64,
+    #[serde(default)]
+    pub url_allowlist: Vec<UrlAllowlistEntry>,
+}
+
+impl Default for LeakDetectorConfig {
+    fn default() -> Self {
+        Self {
+            sensitivity: default_leak_detector_sensitivity(),
+            url_allowlist: Vec::new(),
+        }
+    }
+}
+
+/// One allowlist row. `domain` is a glob (`*` and `?`) matched against the
+/// URL host. `url_pattern`, when set, is a glob matched against `path?query`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+pub struct UrlAllowlistEntry {
+    pub domain: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url_pattern: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+fn default_leak_detector_sensitivity() -> f64 {
+    0.7
 }
 
 /// WebAuthn / FIDO2 hardware key authentication configuration (`[security.webauthn]`).
@@ -14062,6 +14107,39 @@ fn default_webauthn_rp_origin() -> String {
 
 fn default_webauthn_rp_name() -> String {
     "ZeroClaw".into()
+}
+
+#[cfg(test)]
+mod leak_detector_config_serde_tests {
+    use super::*;
+
+    #[test]
+    fn security_leak_detector_defaults_to_empty_allowlist_and_default_sensitivity() {
+        let toml = "[audit]\n";
+        let cfg: SecurityConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.leak_detector.sensitivity, 0.7);
+        assert!(cfg.leak_detector.url_allowlist.is_empty());
+    }
+
+    #[test]
+    fn security_leak_detector_parses_url_allowlist_entries() {
+        let toml = r#"
+[leak_detector]
+sensitivity = 0.5
+
+[[leak_detector.url_allowlist]]
+domain = "*.lkcoffee.com"
+url_pattern = "/transfer/qrcode*"
+description = "Luckin order links"
+"#;
+        let cfg: SecurityConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.leak_detector.sensitivity, 0.5);
+        assert_eq!(cfg.leak_detector.url_allowlist.len(), 1);
+        let e = &cfg.leak_detector.url_allowlist[0];
+        assert_eq!(e.domain, "*.lkcoffee.com");
+        assert_eq!(e.url_pattern.as_deref(), Some("/transfer/qrcode*"));
+        assert_eq!(e.description.as_deref(), Some("Luckin order links"));
+    }
 }
 
 /// OTP validation strategy.
