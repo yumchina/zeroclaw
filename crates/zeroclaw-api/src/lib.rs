@@ -43,6 +43,9 @@ tokio::task_local! {
     /// Current tool call ID. Set by the agent loop / tool executor, read by the progress observer and channel.
     pub static CURRENT_TOOL_CALL_ID: Option<String>;
 
+    /// Current thread_ts (topic) context. Set by the orchestrator, read by channels or the agent loop.
+    pub static CURRENT_THREAD_TS: Option<String>;
+
     /// Current tool name. Set by the agent loop / tool executor, read by the progress observer and channel.
     pub static CURRENT_TOOL_NAME: Option<String>;
 }

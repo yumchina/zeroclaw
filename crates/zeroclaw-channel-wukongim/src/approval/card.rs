@@ -154,6 +154,7 @@ mod tests {
         ChannelApprovalRequest {
             tool_name: tool.to_string(),
             arguments_summary: summary.to_string(),
+            thread_ts: None,
         }
     }
 
