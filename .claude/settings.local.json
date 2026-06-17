@@ -24,7 +24,12 @@
       "Bash(xargs grep -l \"log\\\\|observability\")",
       "Bash(grep -E \"\\\\.rs$\")",
       "Bash(xargs grep -l \"SKILL.toml\")",
-      "Bash(xargs grep -l \"DawnS3\\\\|DawnWebSearch\")"
+      "Bash(xargs grep -l \"DawnS3\\\\|DawnWebSearch\")",
+      "Bash(grep -nE '^[[:space:]]*\\(pub fn|fn|async fn|pub async fn|impl|struct|enum|pub struct|//[[:space:]]*─|// ──\\)')",
+      "Bash(awk *)",
+      "Bash(git grep *)",
+      "Bash(cargo metadata *)",
+      "Bash(cargo check *)"
     ]
   }
 }
