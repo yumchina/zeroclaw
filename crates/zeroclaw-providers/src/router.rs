@@ -1,4 +1,5 @@
 use super::ModelProvider;
+use super::dispatch::ProviderDispatch;
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
 };
@@ -289,7 +290,7 @@ impl ModelProvider for RouterModelProvider {
         // composite. Layer's `set_composite` splits it on emit.
         ::zeroclaw_log::record!(INFO, ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note).with_attrs(::serde_json::json!({"model_provider": provider_name.as_str(), "model": resolved_model.as_str()})), "router dispatching request");
 
-        model_provider
+        ProviderDispatch::from_ref(&**model_provider)
             .chat_with_system(system_prompt, message, &resolved_model, temperature)
             .await
     }
@@ -303,7 +304,7 @@ impl ModelProvider for RouterModelProvider {
         let (provider_idx, resolved_model) = self.resolve(model);
         let temperature = self.effective_temperature(model, temperature);
         let (_, model_provider) = &self.model_providers[provider_idx];
-        model_provider
+        ProviderDispatch::from_ref(&**model_provider)
             .chat_with_history(messages, &resolved_model, temperature)
             .await
     }
@@ -317,7 +318,7 @@ impl ModelProvider for RouterModelProvider {
         let (provider_idx, resolved_model) = self.resolve(model);
         let temperature = self.effective_temperature(model, temperature);
         let (_, model_provider) = &self.model_providers[provider_idx];
-        model_provider
+        ProviderDispatch::from_ref(&**model_provider)
             .chat(request, &resolved_model, temperature)
             .await
     }
@@ -332,7 +333,7 @@ impl ModelProvider for RouterModelProvider {
         let (provider_idx, resolved_model) = self.resolve(model);
         let temperature = self.effective_temperature(model, temperature);
         let (_, model_provider) = &self.model_providers[provider_idx];
-        model_provider
+        ProviderDispatch::from_ref(&**model_provider)
             .chat_with_tools(messages, tools, &resolved_model, temperature)
             .await
     }
@@ -398,7 +399,12 @@ impl ModelProvider for RouterModelProvider {
         let (provider_idx, resolved_model) = self.resolve(model);
         let temperature = self.effective_temperature(model, temperature);
         let (_, model_provider) = &self.model_providers[provider_idx];
-        model_provider.stream_chat(request, &resolved_model, temperature, options)
+        ProviderDispatch::from_ref(&**model_provider).stream_chat(
+            request,
+            &resolved_model,
+            temperature,
+            options,
+        )
     }
 
     fn supports_vision(&self) -> bool {
@@ -416,7 +422,7 @@ impl ModelProvider for RouterModelProvider {
                     .with_attrs(::serde_json::json!({"model_provider": name})),
                 "Warming up routed model_provider"
             );
-            if let Err(e) = model_provider.warmup().await {
+            if let Err(e) = ProviderDispatch::from_ref(&**model_provider).warmup().await {
                 ::zeroclaw_log::record!(
                     WARN,
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)

@@ -448,52 +448,18 @@ const HIDDEN_TOP_LEVEL: &[&str] = &[
     "pre_override_snapshots",
 ];
 
-/// Display group for a section. Hand-curated until v3 / #5947 lands a
-/// schema attribute that encodes grouping declaratively. Unknown keys
-/// fall into `Other` so new schema additions still surface — they just
-/// land in the catch-all bucket until someone curates them.
+/// Display group for a section. Delegates to
+/// `zeroclaw_config::sections::section_group_for_key` — grouping lives
+/// in the `sections!` table (curated rows) plus its long-tail map, so
+/// the dashboard, the RPC `config/sections` handler, and the TUI all
+/// read one source. Unknown keys fall into `Other` so new schema
+/// additions still surface — they just land in the catch-all bucket
+/// until someone curates them.
 ///
 /// Group order in the dashboard sidebar is governed by the frontend (see
-/// `Config.tsx`), not this list.
+/// `Config.tsx`), mirroring `zeroclaw_config::sections::SECTION_GROUPS`.
 fn section_group(key: &str) -> &'static str {
-    match key {
-        "providers.models" | "channels" | "memory" | "hardware" | "tunnel" | "agents"
-        | "skills" | "skill_bundles" | "risk_profiles" | "runtime_profiles" | "peer_groups" => {
-            "Foundation"
-        }
-        // Agent loop, scheduling, and orchestration.
-        "agent"
-        | "cron"
-        | "heartbeat"
-        | "hooks"
-        | "pacing"
-        | "pipeline"
-        | "query_classification"
-        | "reliability"
-        | "runtime"
-        | "scheduler"
-        | "sop"
-        | "verifiable_intent" => "Agent",
-        // Multi-agent / delegation.
-        "delegate" => "Multi-agent",
-        // Tool integrations.
-        "browser" | "browser_delegate" | "http_request" | "image_gen" | "knowledge"
-        | "link_enricher" | "mcp" | "media_pipeline" | "multimodal" | "plugins"
-        | "project_intel" | "shell_tool" | "text_browser" | "transcription" | "tts"
-        | "web_fetch" | "web_search" => "Tools",
-        // External services / vendor integrations. ACP is included because
-        // it is always client-paired — you cannot use it without a client.
-        "acp" | "claude_code" | "claude_code_runner" | "codex_cli" | "composio" | "gemini_cli"
-        | "google_workspace" | "jira" | "linkedin" | "notion" | "opencode_cli" => "Integrations",
-        // Networking / multi-node infrastructure.
-        "gateway" | "node_transport" | "nodes" | "proxy" => "Network",
-        // Storage, identity, secrets.
-        "identity" | "secrets" | "storage" => "Storage",
-        // Operations / monitoring / safety / cost.
-        "backup" | "cloud_ops" | "conversational_ai" | "cost" | "data_retention"
-        | "observability" | "peripherals" | "security" | "security_ops" | "trust" => "Operations",
-        _ => "Other",
-    }
+    zeroclaw_config::sections::section_group_for_key(key).label()
 }
 
 /// Help text for a section. Delegates to `zeroclaw_config::sections::section_help`

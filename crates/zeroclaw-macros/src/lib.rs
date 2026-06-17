@@ -127,7 +127,8 @@ fn has_serde_meta(field: &syn::Field, ident: &str) -> bool {
         resource_key,
         credential_class,
         natural_key,
-        tab
+        tab,
+        group
     )
 )]
 pub fn derive_configurable(input: TokenStream) -> TokenStream {
@@ -220,6 +221,12 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
     // schema's `///` on `pub gateway: GatewayConfig` describes the
     // section's role in this Config, which is what the operator needs.
     let mut nested_section_help_arms: Vec<proc_macro2::TokenStream> = Vec::new();
+    // Parallel to `nested_section_help_arms`: each `#[nested]` field that
+    // carries a `#[group = "..."]` annotation contributes one arm to the
+    // generated `nested_section_group(name)` lookup. This is what lets
+    // the section explorer resolve a top-level config root's display
+    // group from the schema itself instead of a hand-maintained table.
+    let mut nested_section_group_arms: Vec<proc_macro2::TokenStream> = Vec::new();
 
     // Static enumeration of every `#[secret]` field's terminal name
     // reachable from this Configurable type. Direct `#[secret]` fields
@@ -431,6 +438,11 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 if !field_doc.is_empty() {
                     nested_section_help_arms.push(quote! {
                         #field_name_lit => Some(#field_doc),
+                    });
+                }
+                if let Some(group) = extract_string_attr(&field.attrs, "group") {
+                    nested_section_group_arms.push(quote! {
+                        #field_name_lit => Some(#group),
                     });
                 }
 
@@ -1151,6 +1163,11 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                         #opt_field_name_lit => Some(#opt_field_doc),
                     });
                 }
+                if let Some(group) = extract_string_attr(&field.attrs, "group") {
+                    nested_section_group_arms.push(quote! {
+                        #opt_field_name_lit => Some(#group),
+                    });
+                }
                 let display_name_lit = extract_string_attr(&field.attrs, "display_name")
                     .unwrap_or_else(|| snake_to_title(&field_name_str));
                 let description_lit =
@@ -1335,6 +1352,11 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 if !field_doc.is_empty() {
                     nested_section_help_arms.push(quote! {
                         #vec_field_name_lit => Some(#field_doc),
+                    });
+                }
+                if let Some(group) = extract_string_attr(&field.attrs, "group") {
+                    nested_section_group_arms.push(quote! {
+                        #vec_field_name_lit => Some(#group),
                     });
                 }
                 map_key_section_entries.push(quote! {
@@ -1779,6 +1801,11 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
                 if !plain_field_doc.is_empty() {
                     nested_section_help_arms.push(quote! {
                         #plain_field_name_lit => Some(#plain_field_doc),
+                    });
+                }
+                if let Some(group) = extract_string_attr(&field.attrs, "group") {
+                    nested_section_group_arms.push(quote! {
+                        #plain_field_name_lit => Some(#group),
                     });
                 }
                 nested_collect.push(quote! {
@@ -2407,6 +2434,21 @@ pub fn derive_configurable(input: TokenStream) -> TokenStream {
             pub fn nested_section_help(name: &str) -> Option<&'static str> {
                 match name {
                     #(#nested_section_help_arms)*
+                    _ => None,
+                }
+            }
+
+            /// Display-group label for a `#[nested]` field on this struct,
+            /// sourced from its `#[group = "..."]` annotation. Returns
+            /// `None` for fields without the annotation (and for unknown
+            /// names) so callers can fall through to a different lookup —
+            /// the section explorer uses this to resolve a top-level
+            /// config root's group from the schema rather than a
+            /// hand-maintained table.
+            #[must_use]
+            pub fn nested_section_group(name: &str) -> Option<&'static str> {
+                match name {
+                    #(#nested_section_group_arms)*
                     _ => None,
                 }
             }

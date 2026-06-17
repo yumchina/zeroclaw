@@ -1352,6 +1352,12 @@ pub struct ConfigSectionEntry {
     pub label: String,
     pub help: String,
     pub completed: bool,
+    /// Display group label (`"Foundation"`, `"Tools"`, …) from
+    /// `zeroclaw_config::sections::SectionGroup::label()`. Empty when
+    /// the daemon predates group plumbing — the sections pane falls
+    /// back to the flat ungrouped list.
+    #[serde(default)]
+    pub group: String,
     #[serde(default)]
     pub shape: Option<SectionShape>,
 }
