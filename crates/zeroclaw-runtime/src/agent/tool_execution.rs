@@ -13,9 +13,15 @@ use crate::observability::{Observer, ObserverEvent};
 use crate::tools::Tool;
 
 // Items that still live in `loop_` — import via the parent module.
-use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled, scrub_credentials};
+use super::loop_::{ParsedToolCall, ToolLoopCancelled, is_tool_loop_cancelled};
+use super::turn::redact::{scrub_credentials_with_allowlist};
+use crate::agent::scrub_context::current_allowlist;
 
 // ── Helpers ──────────────────────────────────────────────────────────────
+
+pub(crate) fn scrub_for_tool_output(raw: &str) -> String {
+    scrub_credentials_with_allowlist(raw, &current_allowlist())
+}
 
 /// Look up a tool by name in a slice of boxed `dyn Tool` values.
 pub fn find_tool<'a>(tools: &'a [Box<dyn Tool>], name: &str) -> Option<&'a dyn Tool> {
@@ -97,7 +103,7 @@ pub async fn execute_one_tool(
     let Some(tool) = static_tool.or(activated_arc.as_deref()) else {
         let reason = format!("Unknown tool: {call_name}");
         let duration = start.elapsed();
-        let scrubbed_reason = scrub_credentials(&reason);
+        let scrubbed_reason = scrub_for_tool_output(&reason);
         observer.record_event(&ObserverEvent::ToolCall {
             tool: call_name.to_string(),
             tool_call_id: tool_call_id_owned.clone(),
@@ -196,7 +202,7 @@ pub async fn execute_one_tool(
                 } else {
                     &r.output
                 };
-                let output = scrub_credentials(normalized_output);
+                let output = scrub_for_tool_output(normalized_output);
                 let receipt = receipt_generator.map(|receipt_gen| {
                     receipt_gen.generate_now(call_name, &call_arguments, &output)
                 });
@@ -220,7 +226,7 @@ pub async fn execute_one_tool(
                 })
             } else {
                 let reason = r.error.unwrap_or(r.output);
-                let scrubbed_reason = scrub_credentials(&reason);
+                let scrubbed_reason = scrub_for_tool_output(&reason);
                 observer.record_event(&ObserverEvent::ToolCall {
                     tool: call_name.to_string(),
                     tool_call_id: tool_call_id_owned.clone(),
@@ -258,7 +264,7 @@ pub async fn execute_one_tool(
                 format!("tool error: {call_name}")
             );
             let reason = format!("Error executing {call_name}: {e}");
-            let scrubbed_reason = scrub_credentials(&reason);
+            let scrubbed_reason = scrub_for_tool_output(&reason);
             observer.record_event(&ObserverEvent::ToolCall {
                 tool: call_name.to_string(),
                 tool_call_id: tool_call_id_owned.clone(),
@@ -382,4 +388,39 @@ pub async fn execute_tools_sequential(
     }
 
     Ok(outcomes)
+}
+
+#[cfg(test)]
+mod allowlist_integration_tests {
+    use super::*;
+    use std::sync::Arc;
+    use crate::agent::scrub_context::TOOL_LOOP_ALLOWLIST;
+    use crate::security::AllowlistRule;
+
+    #[tokio::test]
+    async fn allowlisted_url_token_survives_tool_output_scrub() {
+        let raw = "QR: https://api.example.com/o?token=hgnD0jgCF63abcdefghij done";
+        let rule = AllowlistRule::new("api.example.com", None).unwrap();
+        let scope_value = Some(Arc::new(vec![rule]));
+        let scrubbed = TOOL_LOOP_ALLOWLIST
+            .scope(scope_value, async move {
+                scrub_for_tool_output(raw)
+            })
+            .await;
+        assert!(
+            scrubbed.contains("token=hgnD0jgCF63abcdefghij"),
+            "allowlisted token must survive: {scrubbed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_allowlisted_url_token_still_scrubbed() {
+        let raw = "evil: https://evil.com/x?token=abcdefghijklmnop done";
+        let rule = AllowlistRule::new("api.example.com", None).unwrap();
+        let scope_value = Some(Arc::new(vec![rule]));
+        let scrubbed = TOOL_LOOP_ALLOWLIST
+            .scope(scope_value, async move { scrub_for_tool_output(raw) })
+            .await;
+        assert!(!scrubbed.contains("abcdefghijklmnop"), "got: {scrubbed}");
+    }
 }

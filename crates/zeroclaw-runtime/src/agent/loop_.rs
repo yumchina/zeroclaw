@@ -419,7 +419,10 @@ pub fn make_query_summary(raw: &str) -> Option<String> {
     if raw.is_empty() {
         return None;
     }
-    Some(truncate_with_ellipsis(&scrub_credentials(raw), 200))
+    Some(truncate_with_ellipsis(
+        &super::turn::redact::scrub_credentials_with_allowlist(raw, &crate::agent::scrub_context::current_allowlist()),
+        200,
+    ))
 }
 
 pub use zeroclaw_api::TOOL_CHOICE_OVERRIDE;
