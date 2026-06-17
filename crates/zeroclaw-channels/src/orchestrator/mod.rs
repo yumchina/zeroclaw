@@ -3435,7 +3435,11 @@ fn should_suppress_top_level_tool_protocol_response(
     zeroclaw_tool_call_parser::looks_like_tool_protocol_envelope(response)
 }
 
-fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String {
+fn sanitize_channel_response(
+    response: &str,
+    tools: &[Box<dyn Tool>],
+    leak_detector_config: &zeroclaw_config::schema::LeakDetectorConfig,
+) -> String {
     let known_tool_names: HashSet<String> = tools
         .iter()
         .map(|tool| tool.name().to_ascii_lowercase())
@@ -3465,8 +3469,13 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
     let sanitized = strip_tool_narration(&stripped_json);
 
     // Scan for credential leaks before returning to caller
-    match zeroclaw_runtime::security::LeakDetector::new().scan(&sanitized) {
-        zeroclaw_runtime::security::LeakResult::Clean => sanitized,
+    let rules = zeroclaw_runtime::security::allowlist_from_config(leak_detector_config);
+    let (masked, mapping) = zeroclaw_runtime::security::mask_allowlist_urls(&sanitized, &rules);
+    let detector = zeroclaw_runtime::security::LeakDetector::from_config(leak_detector_config);
+    match detector.scan(&masked) {
+        zeroclaw_runtime::security::LeakResult::Clean => {
+            zeroclaw_runtime::security::restore_allowlist_urls(&masked, &mapping)
+        }
         zeroclaw_runtime::security::LeakResult::Detected { patterns, redacted } => {
             ::zeroclaw_log::record!(
                 WARN,
@@ -3475,7 +3484,7 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
                     .with_attrs(::serde_json::json!({"patterns": patterns})),
                 "output guardrail: credential leak detected in outbound channel response"
             );
-            redacted
+            zeroclaw_runtime::security::restore_allowlist_urls(&redacted, &mapping)
         }
     }
 }
@@ -4142,6 +4151,14 @@ async fn process_channel_message_body(
         "channel inbound message"
     );
 
+    let rules = zeroclaw_runtime::security::allowlist_from_config(&ctx.prompt_config.security.leak_detector);
+    let scope_value = if rules.is_empty() {
+        None
+    } else {
+        Some(std::sync::Arc::new(rules))
+    };
+    zeroclaw_runtime::agent::scrub_context::TOOL_LOOP_ALLOWLIST
+        .scope(scope_value, async move {
     // ── Hook: on_message_received (modifying) ────────────
     let mut msg = if let Some(hooks) = &ctx.hooks {
         match hooks.run_on_message_received(msg).await {
@@ -5234,8 +5251,11 @@ async fn process_channel_message_body(
                 }
             }
 
-            let sanitized_response =
-                sanitize_channel_response(&outbound_response, ctx.tools_registry.as_ref());
+            let sanitized_response = sanitize_channel_response(
+                &outbound_response,
+                ctx.tools_registry.as_ref(),
+                &ctx.prompt_config.security.leak_detector,
+            );
             let mut delivered_response = if sanitized_response.is_empty()
                 && !outbound_response.trim().is_empty()
             {
@@ -5665,6 +5685,8 @@ async fn process_channel_message_body(
             .add_reaction(&msg.reply_target, &msg.id, reaction_done_emoji)
             .await;
     }
+        })
+        .await
 }
 
 /// Shared worker body extracted so both the normal path and the debounce path
@@ -9825,13 +9847,18 @@ pub async fn deliver_announcement(
     output: &str,
 ) -> anyhow::Result<()> {
     use zeroclaw_api::channel::SendMessage;
-    let _ = config;
 
     // Scan for credential leaks before delivering
-    let leak_detector = zeroclaw_runtime::security::LeakDetector::new();
-    let safe_output = match leak_detector.scan(output) {
-        zeroclaw_runtime::security::LeakResult::Detected { redacted, .. } => redacted,
-        zeroclaw_runtime::security::LeakResult::Clean => output.to_string(),
+    let rules = zeroclaw_runtime::security::allowlist_from_config(&config.security.leak_detector);
+    let (masked, mapping) = zeroclaw_runtime::security::mask_allowlist_urls(output, &rules);
+    let leak_detector = zeroclaw_runtime::security::LeakDetector::from_config(&config.security.leak_detector);
+    let safe_output = match leak_detector.scan(&masked) {
+        zeroclaw_runtime::security::LeakResult::Detected { redacted, .. } => {
+            zeroclaw_runtime::security::restore_allowlist_urls(&redacted, &mapping)
+        }
+        zeroclaw_runtime::security::LeakResult::Clean => {
+            zeroclaw_runtime::security::restore_allowlist_urls(&masked, &mapping)
+        }
     };
 
     let make_msg = |s: &str| SendMessage::new(s, target).in_thread(thread_id.clone());
@@ -11478,8 +11505,9 @@ api_key = "anthropic-key"
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         //: response with leading whitespace before [Used tools: ...]
         let input = "  [Used tools: web_search_tool]\nHere is the search result.";
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(input, &tools);
+        let result = sanitize_channel_response(input, &tools, &cfg);
 
         assert!(!result.contains("[Used tools:"));
         assert!(result.contains("Here is the search result."));
@@ -20690,8 +20718,9 @@ This is an example JSON object for profile settings."#;
     fn sanitize_channel_response_redacts_detected_credentials() {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let leaked = "Temporary key: AKIAABCDEFGHIJKLMNOP"; // gitleaks:allow
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(leaked, &tools);
+        let result = sanitize_channel_response(leaked, &tools, &cfg);
 
         assert!(!result.contains("AKIAABCDEFGHIJKLMNOP")); // gitleaks:allow
         assert!(result.contains("[REDACTED"));
@@ -20701,8 +20730,9 @@ This is an example JSON object for profile settings."#;
     fn sanitize_channel_response_passes_clean_text() {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let clean_text = "This is a normal message with no credentials.";
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(clean_text, &tools);
+        let result = sanitize_channel_response(clean_text, &tools, &cfg);
 
         assert_eq!(result, clean_text);
     }
@@ -20711,8 +20741,9 @@ This is an example JSON object for profile settings."#;
     fn sanitize_channel_response_preserves_schema_json_array_without_tools() {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let schema = r#"[{"name":"planner","parameters":{"goal":"string"}}]"#;
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(schema, &tools);
+        let result = sanitize_channel_response(schema, &tools, &cfg);
 
         assert_eq!(result, schema);
     }
@@ -20722,8 +20753,9 @@ This is an example JSON object for profile settings."#;
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let audit_json =
             r#"{"tool_calls":[{"id":"case-1","status":"queued","service":"billing"}]}"#;
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(audit_json, &tools);
+        let result = sanitize_channel_response(audit_json, &tools, &cfg);
 
         assert_eq!(result, audit_json);
     }
@@ -20733,8 +20765,9 @@ This is an example JSON object for profile settings."#;
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let reference_json =
             r#"{"type":"function_call","name":"support_case","arguments":{"id":"A1"}}"#;
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(reference_json, &tools);
+        let result = sanitize_channel_response(reference_json, &tools, &cfg);
 
         assert_eq!(result, reference_json);
     }
@@ -20744,8 +20777,9 @@ This is an example JSON object for profile settings."#;
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
         let reference_json =
             r#"{"type":"function_call","name":"support_case","arguments":{"id":"A1"}}"#;
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(reference_json, &tools);
+        let result = sanitize_channel_response(reference_json, &tools, &cfg);
 
         assert_eq!(result, reference_json);
     }
@@ -20754,8 +20788,9 @@ This is an example JSON object for profile settings."#;
     fn sanitize_channel_response_preserves_unknown_tool_calls_json_with_tools() {
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
         let business_json = r#"{"tool_calls":[{"name":"support_case","arguments":{"id":"A1"}}]}"#;
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(business_json, &tools);
+        let result = sanitize_channel_response(business_json, &tools, &cfg);
 
         assert_eq!(result, business_json);
     }
@@ -20764,8 +20799,9 @@ This is an example JSON object for profile settings."#;
     fn sanitize_channel_response_preserves_malformed_unknown_tool_calls_json_with_tools() {
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
         let business_json = r#"{"tool_calls":[{"name":"support_case","arguments":{"id":"A1"}}"#;
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(business_json, &tools);
+        let result = sanitize_channel_response(business_json, &tools, &cfg);
 
         assert_eq!(result, business_json);
     }
@@ -20777,8 +20813,9 @@ This is an example JSON object for profile settings."#;
 ```json
 {"tool_calls":[{"name":"shell","arguments":{"command":"pwd"}}]}
 ```"#;
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(example, &tools);
+        let result = sanitize_channel_response(example, &tools, &cfg);
 
         assert_eq!(result, example);
     }
@@ -20787,8 +20824,9 @@ This is an example JSON object for profile settings."#;
     fn sanitize_channel_response_removes_registered_tool_json_array() {
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
         let internal = r#"[{"name":"mock_price","parameters":{"symbol":"BTC"}}]"#;
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(internal, &tools);
+        let result = sanitize_channel_response(internal, &tools, &cfg);
 
         assert_eq!(result, "");
     }
@@ -20797,8 +20835,9 @@ This is an example JSON object for profile settings."#;
     fn sanitize_channel_response_removes_internal_tool_protocol_envelopes() {
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
         let internal = r#"{"toolcalls":[{"name":"mock_price","arguments":{"symbol":"BTC"}}]}"#;
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(internal, &tools);
+        let result = sanitize_channel_response(internal, &tools, &cfg);
 
         assert_eq!(result, "");
     }
@@ -20809,8 +20848,9 @@ This is an example JSON object for profile settings."#;
         let internal = r#"```json
 {"tool_calls":[{"name":"mock_price","arguments":{"symbol":"BTC"}}]}
 ```"#;
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(internal, &tools);
+        let result = sanitize_channel_response(internal, &tools, &cfg);
 
         assert_eq!(result, "");
     }
@@ -20823,8 +20863,9 @@ This is an example JSON object for profile settings."#;
 {"tool_calls":[{"name":"mock_price","arguments":{"symbol":"BTC"}}]}
 ```
 Done."#;
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(response, &tools);
+        let result = sanitize_channel_response(response, &tools, &cfg);
 
         assert!(result.contains("Intro"));
         assert!(result.contains("Done."));
@@ -20840,8 +20881,9 @@ Done."#;
 {"name":"shell","arguments":{"command":"pwd"}}
 ```
 Done."#;
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(response, &tools);
+        let result = sanitize_channel_response(response, &tools, &cfg);
 
         assert!(result.contains("Done."));
         assert!(!result.contains("tool_call"));
@@ -20856,8 +20898,9 @@ Done."#;
 {"name":"shell","arguments":{"command":"pwd"}}
 ```
 This is an example, not an invocation."#;
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(example, &tools);
+        let result = sanitize_channel_response(example, &tools, &cfg);
 
         assert_eq!(result, example);
     }
@@ -20868,8 +20911,9 @@ This is an example, not an invocation."#;
         let internal = r#"```tool_call
 {"name":"shell","arguments":{"command":"pwd"}}
 ```"#;
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(internal, &tools);
+        let result = sanitize_channel_response(internal, &tools, &cfg);
 
         assert_eq!(result, "");
     }
@@ -20880,8 +20924,9 @@ This is an example, not an invocation."#;
         let internal = r#"```tool shell
 {"command":"pwd"}
 ```"#;
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(internal, &tools);
+        let result = sanitize_channel_response(internal, &tools, &cfg);
 
         assert_eq!(result, "");
     }
@@ -20893,8 +20938,9 @@ This is an example, not an invocation."#;
 {"name":"shell","arguments":{"command":"pwd"}}
 </tool_call>
 This is an example, not an invocation."#;
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(example, &tools);
+        let result = sanitize_channel_response(example, &tools, &cfg);
 
         assert_eq!(result, example);
     }
@@ -20906,8 +20952,9 @@ This is an example, not an invocation."#;
 {"name":"shell","arguments":{"command":"pwd"}}
 </tool_call>
 Done."#;
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(response, &tools);
+        let result = sanitize_channel_response(response, &tools, &cfg);
 
         assert_eq!(result, "Done.");
     }
@@ -20916,8 +20963,9 @@ Done."#;
     fn sanitize_channel_response_removes_malformed_top_level_protocol() {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let internal = r#"{"tool_call_id":"call_1","content":"raw"#;
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(internal, &tools);
+        let result = sanitize_channel_response(internal, &tools, &cfg);
 
         assert_eq!(result, "");
     }
@@ -20927,8 +20975,9 @@ Done."#;
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let response =
             "Intro\n{\"tool_calls\":[{\"call_id\":\"call_1\",\"arguments\":{\"value\":\"X\"}\nDone";
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(response, &tools);
+        let result = sanitize_channel_response(response, &tools, &cfg);
 
         assert!(result.contains("Intro"));
         assert!(result.contains("Done"));
@@ -20940,8 +20989,9 @@ Done."#;
     fn sanitize_channel_response_removes_multiline_embedded_malformed_protocol_json() {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let response = "Intro\n{\n  \"tool_calls\": [{\"call_id\":\"call_1\",\"arguments\":{\"value\":\"X\"}}\nDone";
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(response, &tools);
+        let result = sanitize_channel_response(response, &tools, &cfg);
 
         assert!(result.contains("Intro"));
         assert!(result.contains("Done"));
@@ -20954,8 +21004,9 @@ Done."#;
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let explanation =
             "A markdown block starting with ```tool can be used in protocol examples.";
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(explanation, &tools);
+        let result = sanitize_channel_response(explanation, &tools, &cfg);
 
         assert_eq!(result, explanation);
     }
@@ -20964,8 +21015,9 @@ Done."#;
     fn sanitize_channel_response_keeps_safe_protocol_envelope_content_with_tools() {
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
         let response = "Intro text\n{\"content\":\"A markdown block starting with ```tool can be used in examples.\",\"tool_calls\":[{\"name\":\"mock_price\",\"arguments\":{\"symbol\":\"BTC\"}}]}\nDone.";
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(response, &tools);
+        let result = sanitize_channel_response(response, &tools, &cfg);
 
         assert!(result.contains("Intro text"));
         assert!(result.contains("A markdown block starting with ```tool"));
@@ -20978,8 +21030,9 @@ Done."#;
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
         let response =
             "Intro text\n{\"tool_call_id\":\"call_1\",\"content\":\"raw tool output\"}\nDone.";
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(response, &tools);
+        let result = sanitize_channel_response(response, &tools, &cfg);
 
         assert!(result.contains("Intro text"));
         assert!(result.contains("Done."));
@@ -20991,8 +21044,9 @@ Done."#;
     fn sanitize_channel_response_removes_nested_protocol_content_with_tools() {
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockPriceTool)];
         let response = "Intro text\n{\"content\":\"{\\\"toolcalls\\\":[{\\\"name\\\":\\\"mock_price\\\",\\\"arguments\\\":{\\\"symbol\\\":\\\"BTC\\\"}}]}\",\"tool_calls\":[{\"name\":\"mock_price\",\"arguments\":{\"symbol\":\"BTC\"}}]}\nDone.";
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(response, &tools);
+        let result = sanitize_channel_response(response, &tools, &cfg);
 
         assert!(result.contains("Intro text"));
         assert!(result.contains("Done."));
@@ -21004,8 +21058,9 @@ Done."#;
     fn sanitize_channel_response_strips_xml_tool_result_blocks() {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let input = "<tool_result>\n{\"results\":[]}\n</tool_result>\n<tool_result>\n{\"command\":\"ls\",\"exit_code\":0}\n</tool_result>Here is what I found.";
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(input, &tools);
+        let result = sanitize_channel_response(input, &tools, &cfg);
 
         assert!(!result.contains("tool_result"));
         assert!(!result.contains("exit_code"));
@@ -21016,12 +21071,33 @@ Done."#;
     fn sanitize_channel_response_strips_mixed_tool_result_and_text() {
         let tools: Vec<Box<dyn Tool>> = Vec::new();
         let input = "Let me check.\n<tool_result name=\"shell\">\noutput here\n</tool_result>\nThe answer is 42.";
+        let cfg = zeroclaw_config::schema::LeakDetectorConfig::default();
 
-        let result = sanitize_channel_response(input, &tools);
+        let result = sanitize_channel_response(input, &tools, &cfg);
 
         assert!(!result.contains("<tool_result"));
         assert!(!result.contains("output here"));
         assert!(result.contains("The answer is 42."));
+    }
+
+    #[test]
+    fn sanitize_channel_response_preserves_allowlisted_url_token() {
+        use zeroclaw_config::schema::{LeakDetectorConfig, UrlAllowlistEntry};
+        let tools: Vec<Box<dyn Tool>> = Vec::new();
+        let input = "QR: https://api.example.com/o?token=hgnD0jgCF63abcdefghij done";
+        let cfg = LeakDetectorConfig {
+            sensitivity: 0.7,
+            url_allowlist: vec![UrlAllowlistEntry {
+                domain: "api.example.com".into(),
+                url_pattern: None,
+                description: None,
+            }],
+        };
+        let out = sanitize_channel_response(input, &tools, &cfg);
+        assert!(
+            out.contains("token=hgnD0jgCF63abcdefghij"),
+            "allowlisted URL token must survive: {out}"
+        );
     }
 
     // ── Tests for strip_think_tags_inline (streaming draft sanitization) ──
