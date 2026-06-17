@@ -14,7 +14,10 @@ use crate::tools::Tool;
 use crate::util::truncate_with_ellipsis;
 
 // Items that still live in `loop_` — import via the parent module.
-use super::loop_::{ParsedToolCall, ToolLoopCancelled, scrub_credentials};
+use super::loop_::{
+    ParsedToolCall, ToolLoopCancelled, scrub_credentials, scrub_credentials_with_allowlist,
+    TOOL_LOOP_ALLOWLIST,
+};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
@@ -108,7 +111,14 @@ pub async fn execute_one_tool(
                                 } else {
                                     &r.output
                                 };
-                                let output = scrub_credentials(normalized_output);
+                                let output = TOOL_LOOP_ALLOWLIST
+                                    .try_with(|rules| {
+                                        scrub_credentials_with_allowlist(
+                                            normalized_output,
+                                            rules,
+                                        )
+                                    })
+                                    .unwrap_or_else(|_| scrub_credentials(normalized_output));
                                 let receipt = receipt_generator.map(|receipt_gen| {
                                     receipt_gen.generate_now(call_name, &call_arguments, &output)
                                 });

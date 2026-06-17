@@ -291,6 +291,35 @@ pub fn scrub_credentials(input: &str) -> String {
         .to_string()
 }
 
+// Task-local holding leak detector config for the current tool loop.
+tokio::task_local! {
+    pub static TOOL_LOOP_LEAK_DETECTOR_CONFIG: std::sync::Arc<zeroclaw_config::schema::LeakDetectorConfig>;
+}
+
+// Task-local holding URL allowlist rules for the current tool loop.
+// Set by `run_tool_call_loop`; read by `execute_one_tool` to preserve
+// whitelisted URL parameters during credential scrubbing.
+tokio::task_local! {
+    pub static TOOL_LOOP_ALLOWLIST: std::sync::Arc<Vec<crate::security::AllowlistRule>>;
+}
+
+/// Scrub credentials while preserving whitelisted URL parameters.
+///
+/// Delegates the mask/restore dance to [`crate::security`] so the
+/// placeholder format and URL/restore regexes live in one place.
+pub fn scrub_credentials_with_allowlist(
+    input: &str,
+    allowlist: &[crate::security::AllowlistRule],
+) -> String {
+    if allowlist.is_empty() {
+        return scrub_credentials(input);
+    }
+
+    let (masked, preserved_urls) = crate::security::mask_allowlist_urls(input, allowlist);
+    let scrubbed = scrub_credentials(&masked);
+    crate::security::restore_allowlist_urls(&scrubbed, &preserved_urls)
+}
+
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
 /// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
 /// used when callers omit the parameter.
@@ -882,11 +911,24 @@ pub async fn run_tool_call_loop(
     receipt_generator: Option<&crate::agent::tool_receipts::ReceiptGenerator>,
     collected_receipts: Option<&std::sync::Mutex<Vec<String>>>,
 ) -> Result<String> {
+    let leak_detector_config = TOOL_LOOP_LEAK_DETECTOR_CONFIG
+        .try_with(std::sync::Arc::clone)
+        .ok();
+
     let max_iterations = if max_tool_iterations == 0 {
         DEFAULT_MAX_TOOL_ITERATIONS
     } else {
         max_tool_iterations
     };
+
+    // Build URL allowlist rules from config
+    let allowlist_rules: std::sync::Arc<Vec<crate::security::AllowlistRule>> =
+        std::sync::Arc::new(
+            leak_detector_config
+                .as_ref()
+                .map(|c| crate::security::allowlist_from_config(c))
+                .unwrap_or_default(),
+        );
 
     let turn_id = Uuid::new_v4().to_string();
     let loop_started_at = Instant::now();
@@ -1854,27 +1896,31 @@ pub async fn run_tool_call_loop(
             });
         }
 
-        let executed_outcomes = if allow_parallel_execution && executable_calls.len() > 1 {
-            execute_tools_parallel(
-                &executable_calls,
-                tools_registry,
-                activated_tools,
-                observer,
-                cancellation_token.as_ref(),
-                receipt_generator,
-            )
-            .await?
-        } else {
-            execute_tools_sequential(
-                &executable_calls,
-                tools_registry,
-                activated_tools,
-                observer,
-                cancellation_token.as_ref(),
-                receipt_generator,
-            )
-            .await?
-        };
+        let executed_outcomes = TOOL_LOOP_ALLOWLIST
+            .scope(allowlist_rules.clone(), async {
+                if allow_parallel_execution && executable_calls.len() > 1 {
+                    execute_tools_parallel(
+                        &executable_calls,
+                        tools_registry,
+                        activated_tools,
+                        observer,
+                        cancellation_token.as_ref(),
+                        receipt_generator,
+                    )
+                    .await
+                } else {
+                    execute_tools_sequential(
+                        &executable_calls,
+                        tools_registry,
+                        activated_tools,
+                        observer,
+                        cancellation_token.as_ref(),
+                        receipt_generator,
+                    )
+                    .await
+                }
+            })
+            .await?;
 
         for ((idx, call), outcome) in executable_indices
             .iter()
@@ -3099,7 +3145,7 @@ pub async fn run(
                             None, // channel: interactive CLI — uses prompt_cli
                             None, // receipt_generator
                             None, // collected_receipts
-                        ),
+                                    ),
                     )
                     .await
                 {
@@ -4124,6 +4170,59 @@ mod tests {
         assert!(scrubbed.contains("public"));
     }
 
+    fn lkcoffee_allowlist_rules() -> Vec<crate::security::AllowlistRule> {
+        let config = zeroclaw_config::schema::LeakDetectorConfig {
+            url_allowlist: vec![zeroclaw_config::schema::UrlAllowlistEntry {
+                domain: "*.lkcoffee.com".into(),
+                url_pattern: None,
+                description: None,
+            }],
+            ..Default::default()
+        };
+        crate::security::allowlist_from_config(&config)
+    }
+
+    #[test]
+    fn scrub_credentials_with_allowlist_preserves_whitelist_url() {
+        let rules = lkcoffee_allowlist_rules();
+        let url = "https://open.lkcoffee.com/transfer/qrcode?token=hgnD0jgCF63vmdtP0ITJsnMYdQpvX3TE8q";
+        let out = scrub_credentials_with_allowlist(url, &rules);
+        assert_eq!(out, url, "allowlisted URL must survive scrubbing intact");
+    }
+
+    #[test]
+    fn scrub_credentials_with_allowlist_redacts_credential_outside_url() {
+        let rules = lkcoffee_allowlist_rules();
+        let input = "token=hgnD0jgCF63vmdtP0ITJsnMYdQpvX3TE8q";
+        let out = scrub_credentials_with_allowlist(input, &rules);
+        assert!(out.contains("[REDACTED]"), "non-url token must be scrubbed: {out}");
+        assert!(!out.contains("vmdtP0ITJsnMYdQpvX3TE8q"));
+    }
+
+    #[test]
+    fn scrub_credentials_with_allowlist_empty_falls_back() {
+        let rules: Vec<crate::security::AllowlistRule> = Vec::new();
+        let input = "token=hgnD0jgCF63vmdtP0ITJsnMYdQpvX3TE8q";
+        let out = scrub_credentials_with_allowlist(input, &rules);
+        assert_eq!(out, scrub_credentials(input));
+    }
+
+    #[test]
+    fn scrub_credentials_with_allowlist_same_token_in_text_and_url() {
+        let rules = lkcoffee_allowlist_rules();
+        let token = "hgnD0jgCF63vmdtP0ITJsnMYdQpvX3TE8q";
+        let input = format!(
+            "token={token} https://open.lkcoffee.com/transfer/qrcode?token={token}"
+        );
+        let out = scrub_credentials_with_allowlist(&input, &rules);
+        // Whitelisted URL survives intact, including its token param.
+        assert!(out.contains(&format!(
+            "https://open.lkcoffee.com/transfer/qrcode?token={token}"
+        )));
+        // The bare-text token is still scrubbed.
+        assert!(out.contains("[REDACTED]"));
+    }
+
     #[tokio::test]
     async fn execute_one_tool_does_not_panic_on_utf8_boundary() {
         let call_arguments = (0..600)
@@ -4945,7 +5044,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect_err("provider without vision support should fail");
 
@@ -5001,7 +5100,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("oversized payload should be skipped and continue as text-only");
 
@@ -5061,7 +5160,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("valid multimodal payload should pass");
 
@@ -5112,7 +5211,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect_err("should fail without vision_provider config");
 
@@ -5170,7 +5269,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect_err("should fail when vision provider cannot be created");
 
@@ -5228,7 +5327,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("text-only messages should succeed with default provider");
 
@@ -5287,7 +5386,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect_err("should fail due to nonexistent vision provider");
 
@@ -5344,7 +5443,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("empty image markers should not trigger vision routing");
 
@@ -5401,7 +5500,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect_err("should attempt vision provider creation for multiple images");
 
@@ -5541,7 +5640,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("parallel execution should complete");
 
@@ -5621,7 +5720,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("cron_add delivery defaults should be injected");
 
@@ -5693,7 +5792,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("explicit delivery mode should be preserved");
 
@@ -5760,7 +5859,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("loop should finish after deduplicating repeated calls");
 
@@ -5840,7 +5939,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("non-interactive shell should succeed for low-risk command");
 
@@ -5910,7 +6009,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("loop should finish with exempt tool executing twice");
 
@@ -6000,7 +6099,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("loop should complete");
 
@@ -6064,7 +6163,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("native fallback id flow should complete");
 
@@ -6156,7 +6255,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("native tool-call text should be relayed through on_delta");
 
@@ -6224,7 +6323,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("streaming provider should complete");
 
@@ -6295,7 +6394,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("streaming tool loop should execute tool and finish");
 
@@ -6374,7 +6473,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("native streaming events should preserve tool loop semantics");
 
@@ -6461,7 +6560,7 @@ mod tests {
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("routed streaming provider should complete");
 
@@ -7776,7 +7875,7 @@ Let me check the result."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("tool loop should complete");
 
@@ -7938,7 +8037,7 @@ Let me check the result."#;
                     None, // channel
                     None, // receipt_generator
                     None, // collected_receipts
-                ),
+            ),
             )
             .await
             .expect("tool loop should succeed");
@@ -8090,7 +8189,7 @@ Let me check the result."#;
                     None, // channel
                     None, // receipt_generator
                     None, // collected_receipts
-                ),
+            ),
             )
             .await
             .expect_err("should fail with budget exceeded");
@@ -8151,7 +8250,7 @@ Let me check the result."#;
             None, // channel
             None, // receipt_generator
             None, // collected_receipts
-        )
+            )
         .await
         .expect("should succeed without cost scope");
 
