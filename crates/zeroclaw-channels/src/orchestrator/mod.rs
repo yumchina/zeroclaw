@@ -3609,106 +3609,54 @@ async fn process_channel_message(
                                             std::sync::Arc::new(
                                                 ctx.prompt_config.security.leak_detector.clone(),
                                             ),
-                                            run_tool_call_loop(
-                                                active_provider.as_ref(),
-                                                &mut history,
-                                                ctx.tools_registry.as_ref(),
-                                                notify_observer.as_ref() as &dyn Observer,
-                                                route.provider.as_str(),
-                                                route.model.as_str(),
-                                                runtime_defaults.temperature,
-                                                true,
-                                                Some(&*ctx.approval_manager),
-                                                msg.channel.as_str(),
-                                                Some(msg.reply_target.as_str()),
-                                                &ctx.multimodal,
-                                                ctx.max_tool_iterations,
-                                                Some(cancellation_token.clone()),
-                                                delta_tx.clone(),
-                                                ctx.hooks.as_deref(),
-                                                if msg.channel == "cli"
-                                                    || ctx.autonomy_level == AutonomyLevel::Full
-                                                {
-                                                    &[]
-                                                } else {
-                                                    ctx.non_cli_excluded_tools.as_ref()
-                                                },
-                                                ctx.tool_call_dedup_exempt.as_ref(),
-                                                ctx.activated_tools.as_ref(),
-                                                Some(model_switch_callback.clone()),
-                                                &ctx.pacing,
-                                                ctx.max_tool_result_chars,
-                                                ctx.context_token_budget,
-                                                None, // shared_budget
-                                                target_channel.as_deref(),
-                                                ctx.receipt_generator.as_ref(),
-                                                // Collector is meaningful only when the generator is
-                                                // active. Pass None when receipts are disabled so the
-                                                // call site reflects that coupling explicitly.
-                                                ctx.receipt_generator
-                                                    .as_ref()
-                                                    .map(|_| tool_receipts_collector.as_ref()),
+                                            zeroclaw_api::CURRENT_THREAD_TS.scope(
+                                                msg.thread_ts.clone(),
+                                                run_tool_call_loop(
+                                                    active_provider.as_ref(),
+                                                    &mut history,
+                                                    ctx.tools_registry.as_ref(),
+                                                    notify_observer.as_ref() as &dyn Observer,
+                                                    route.provider.as_str(),
+                                                    route.model.as_str(),
+                                                    runtime_defaults.temperature,
+                                                    true,
+                                                    Some(&*ctx.approval_manager),
+                                                    msg.channel.as_str(),
+                                                    Some(msg.reply_target.as_str()),
+                                                    &ctx.multimodal,
+                                                    ctx.max_tool_iterations,
+                                                    Some(cancellation_token.clone()),
+                                                    delta_tx.clone(),
+                                                    ctx.hooks.as_deref(),
+                                                    if msg.channel == "cli"
+                                                        || ctx.autonomy_level == AutonomyLevel::Full
+                                                    {
+                                                        &[]
+                                                    } else {
+                                                        ctx.non_cli_excluded_tools.as_ref()
+                                                    },
+                                                    ctx.tool_call_dedup_exempt.as_ref(),
+                                                    ctx.activated_tools.as_ref(),
+                                                    Some(model_switch_callback.clone()),
+                                                    &ctx.pacing,
+                                                    ctx.max_tool_result_chars,
+                                                    ctx.context_token_budget,
+                                                    None, // shared_budget
+                                                    target_channel.as_deref(),
+                                                    ctx.receipt_generator.as_ref(),
+                                                    // Collector is meaningful only when the generator is
+                                                    // active. Pass None when receipts are disabled so the
+                                                    // call site reflects that coupling explicitly.
+                                                    ctx.receipt_generator
+                                                        .as_ref()
+                                                        .map(|_| tool_receipts_collector.as_ref()),
+                                                ),
                                             ),
                                         ),
                                     ),
                                 ),
                             ),
                         ),
-                    scope_session_key(
-                        Some(history_key.clone()),
-                        zeroclaw_runtime::agent::loop_::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
-                            cost_tracking_context.clone(),
-                        zeroclaw_runtime::agent::tool_receipts::TOOL_LOOP_RECEIPT_CONTEXT.scope(
-                            receipt_scope.clone(),
-                        zeroclaw_runtime::tools::dawn_task::DAWN_CONTEXT.scope(
-                            dawn_ctx.clone(),
-                        zeroclaw_api::CURRENT_THREAD_TS.scope(
-                            msg.thread_ts.clone(),
-                        run_tool_call_loop(
-                        active_provider.as_ref(),
-                        &mut history,
-                        ctx.tools_registry.as_ref(),
-                        notify_observer.as_ref() as &dyn Observer,
-                        route.provider.as_str(),
-                        route.model.as_str(),
-                        runtime_defaults.temperature,
-                        true,
-                        Some(&*ctx.approval_manager),
-                        msg.channel.as_str(),
-                        Some(msg.reply_target.as_str()),
-                        &ctx.multimodal,
-                        ctx.max_tool_iterations,
-                        Some(cancellation_token.clone()),
-                        delta_tx.clone(),
-                        ctx.hooks.as_deref(),
-                        if msg.channel == "cli"
-                            || ctx.autonomy_level == AutonomyLevel::Full
-                        {
-                            &[]
-                        } else {
-                            ctx.non_cli_excluded_tools.as_ref()
-                        },
-                        ctx.tool_call_dedup_exempt.as_ref(),
-                        ctx.activated_tools.as_ref(),
-                        Some(model_switch_callback.clone()),
-                        &ctx.pacing,
-                        ctx.max_tool_result_chars,
-                        ctx.context_token_budget,
-                        None, // shared_budget
-                        target_channel.as_deref(),
-                        ctx.receipt_generator.as_ref(),
-                        // Collector is meaningful only when the generator is
-                        // active. Pass None when receipts are disabled so the
-                        // call site reflects that coupling explicitly.
-                        ctx.receipt_generator
-                            .as_ref()
-                            .map(|_| tool_receipts_collector.as_ref()),
-                    ),
-                    ),
-                    ),
-                    ),
-                    ),
-                    ),
                     ),
                 ) => LlmExecutionResult::Completed(result),
             };

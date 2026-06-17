@@ -112,7 +112,7 @@ pub fn create_sandbox(
 /// container wrapping, so Docker is excluded from consideration even if it is
 /// installed on the host.
 fn detect_best_sandbox(
-    _config: &SecurityConfig,
+    config: &SecurityConfig,
     runtime_kind: &str,
     workspace_dir: Option<&Path>,
 ) -> Arc<dyn Sandbox> {
