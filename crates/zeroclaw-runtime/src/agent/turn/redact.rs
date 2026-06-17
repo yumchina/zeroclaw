@@ -2,6 +2,7 @@
 
 use regex::Regex;
 use std::sync::LazyLock;
+use crate::security::{AllowlistRule, mask_allowlist_urls, restore_allowlist_urls};
 
 static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r#"(?i)(token|api[_-]?key|password|secret|user[_-]?key|bearer|credential)["']?\s*[:=]\s*(?:"([^"]{8,})"|'([^']{8,})'|([a-zA-Z0-9_\-\./+=]{8,}))"#).unwrap()
@@ -53,9 +54,23 @@ pub fn scrub_credentials(input: &str) -> String {
         .to_string()
 }
 
+/// Allowlist-aware variant of `scrub_credentials`. Pre-masks allowlisted URLs
+/// before redaction, then restores them after. Empty `rules` short-circuits
+/// to plain `scrub_credentials` for byte-identical semantics — see test
+/// `scrub_with_empty_allowlist_matches_plain_scrub_credentials`.
+pub fn scrub_credentials_with_allowlist(input: &str, rules: &[AllowlistRule]) -> String {
+    if rules.is_empty() {
+        return scrub_credentials(input);
+    }
+    let (masked, mapping) = mask_allowlist_urls(input, rules);
+    let scrubbed = scrub_credentials(&masked);
+    restore_allowlist_urls(&scrubbed, &mapping)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::scrub_credentials;
+    use super::{scrub_credentials, scrub_credentials_with_allowlist};
+    use crate::security::AllowlistRule;
 
     #[test]
     fn scrub_credentials_redacts_unquoted_base64_credential_values() {
@@ -75,5 +90,35 @@ mod tests {
         assert_eq!(scrubbed, r#"secret="QWxh*[REDACTED]""#);
         assert!(!scrubbed.contains("IHNlc2FtZQ"));
         assert!(!scrubbed.contains("=="));
+    }
+
+    #[test]
+    fn scrub_with_allowlist_preserves_token_in_allowlisted_url() {
+        let rules = vec![AllowlistRule::new("api.example.com", None).unwrap()];
+        let input = "Pay here: https://api.example.com/o?token=hgnD0jgCF63abcdefghij ok";
+        let out = scrub_credentials_with_allowlist(input, &rules);
+        assert!(
+            out.contains("token=hgnD0jgCF63abcdefghij"),
+            "allowlisted URL token must survive: {out}"
+        );
+    }
+
+    #[test]
+    fn scrub_with_allowlist_still_redacts_non_allowlisted_tokens() {
+        let rules = vec![AllowlistRule::new("api.example.com", None).unwrap()];
+        let input = "api_key=abcdefghijklmnop and url https://evil.com/?token=secret123456";
+        let out = scrub_credentials_with_allowlist(input, &rules);
+        assert!(!out.contains("abcdefghijklmnop"), "api_key token must be scrubbed: {out}");
+        assert!(!out.contains("secret123456"), "evil.com token must be scrubbed: {out}");
+    }
+
+    #[test]
+    fn scrub_with_empty_allowlist_matches_plain_scrub_credentials() {
+        let input = "token=hgnD0jgCF63 and password=\"plaintext123\"";
+        assert_eq!(
+            scrub_credentials_with_allowlist(input, &[]),
+            scrub_credentials(input),
+            "empty allowlist must be a strict no-op vs plain scrub_credentials"
+        );
     }
 }
