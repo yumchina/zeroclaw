@@ -7,7 +7,7 @@ use super::context::TurnCtx;
 use super::delivery_defaults::maybe_inject_channel_delivery_defaults;
 use super::events::{StreamDelta, emit_tool_call_pair};
 use super::redact::scrub_credentials;
-use crate::agent::tool_execution::ToolExecutionOutcome;
+use crate::agent::tool_execution::{ToolExecutionOutcome, scrub_for_tool_output};
 use crate::util::truncate_with_ellipsis;
 use std::collections::HashSet;
 use std::time::Duration;
@@ -71,7 +71,7 @@ pub(crate) async fn prepare_tool_calls(
                             .send(StreamDelta::Status(format!(
                                 "\u{274c} {}: {}\n",
                                 call.name,
-                                truncate_with_ellipsis(&scrub_credentials(&cancelled), 200)
+                                truncate_with_ellipsis(&scrub_for_tool_output(&cancelled), 200)
                             )))
                             .await;
                     }

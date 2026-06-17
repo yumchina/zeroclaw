@@ -194,7 +194,7 @@ impl LeakDetector {
         // Same logical shape as `new()` but uses configured sensitivity.
         // The detector does NOT own the allowlist — callers mask first.
         Self {
-            sensitivity: cfg.sensitivity,
+            sensitivity: cfg.sensitivity.clamp(0.0, 1.0),
         }
     }
 
@@ -880,5 +880,28 @@ MIIEowIBAAKCAQEA0ZPr5JeyVDonXsKhfq...
         };
         let rules = allowlist_from_config(&cfg);
         assert_eq!(rules.len(), 1, "invalid entry must be dropped");
+    }
+
+    #[test]
+    fn from_config_clamps_sensitivity_to_unit_interval() {
+        use zeroclaw_config::schema::LeakDetectorConfig;
+        let above = LeakDetectorConfig { sensitivity: 5.0, url_allowlist: Vec::new() };
+        let below = LeakDetectorConfig { sensitivity: -1.0, url_allowlist: Vec::new() };
+        let high = LeakDetector::from_config(&above);
+        let low = LeakDetector::from_config(&below);
+        // Same detector behavior as the clamped values via with_sensitivity.
+        let baseline_high = LeakDetector::with_sensitivity(1.0);
+        let baseline_low = LeakDetector::with_sensitivity(0.0);
+        let probe = "AKIAEXAMPLEXAMPLEXAMP token=hgnD0jgCF63abcdefghij";
+        assert_eq!(
+            matches!(high.scan(probe), LeakResult::Detected { .. }),
+            matches!(baseline_high.scan(probe), LeakResult::Detected { .. }),
+            "above-range sensitivity must clamp to 1.0"
+        );
+        assert_eq!(
+            matches!(low.scan(probe), LeakResult::Detected { .. }),
+            matches!(baseline_low.scan(probe), LeakResult::Detected { .. }),
+            "below-range sensitivity must clamp to 0.0"
+        );
     }
 }
