@@ -1643,8 +1643,19 @@ impl Channel for WuKongIMChannel {
             "content": content
         });
         let topic = _thread_ts.map(ToString::to_string);
-        self.send_status_message_with_topic(&channel_id, channel_type, payload, topic)
-            .await
+        // Fire-and-forget: status updates are high-frequency, best-effort
+        // progress signals. Awaiting the JSON-RPC round-trip stalls the agent
+        // worker when the server is slow or the socket is half-broken.
+        let ch = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = ch
+                .send_status_message_with_topic(&channel_id, channel_type, payload, topic)
+                .await
+            {
+                tracing::debug!("WuKongIM: status_update RPC dropped: {e}");
+            }
+        });
+        Ok(())
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()> {

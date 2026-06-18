@@ -3128,6 +3128,37 @@ async fn process_channel_message(
         }
     }
 
+    // Remove sentinel error/interrupt assistant turns from history before
+    // sending to the LLM.  These are injected to close orphan user turns
+    // when a request fails, but if they accumulate in history the LLM
+    // pattern-matches on them and starts echoing the sentinel string instead
+    // of answering normally (history poisoning).  The preceding user turn
+    // that triggered the failure is also removed so the history stays
+    // alternating user/assistant.
+    {
+        const SENTINELS: &[&str] = &[
+            "[Task failed \u{2014} not continuing this request]",
+            "[Task timed out \u{2014} not continuing this request]",
+            "[Session interrupted \u{2014} not continuing this request]",
+        ];
+        let mut i = 0usize;
+        while i < prior_turns.len().saturating_sub(1) {
+            let is_sentinel = prior_turns[i].role == "assistant"
+                && SENTINELS
+                    .iter()
+                    .any(|s| prior_turns[i].content.trim() == *s);
+            if is_sentinel {
+                prior_turns.remove(i);
+                if i > 0 && prior_turns[i - 1].role == "user" {
+                    prior_turns.remove(i - 1);
+                    i = i.saturating_sub(1);
+                }
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     // Strip [IMAGE:] markers from *older* history messages when the active
     // provider does not support vision. This prevents "history poisoning"
     // where a previously-sent image marker gets reloaded from the JSONL
