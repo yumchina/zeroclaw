@@ -10,3 +10,9 @@ event-tool-start-generic = Calling tool: { $tool }
 event-tool-done-success = { $tool } completed ({ $elapsed }ms)
 event-tool-done-failure = { $tool } failed
 event-error = { $component } error: { $message }
+
+# Approval cancel-on-fanout — see broker::compute_cancel_reason
+event-approval-cancelled-status = This request has been resolved — { $decision }
+event-approval-decision-approve = approved
+event-approval-decision-deny = denied
+event-approval-decision-always = always approved

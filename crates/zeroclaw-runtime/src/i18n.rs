@@ -922,4 +922,39 @@ mod tests {
             Some("Step Error")
         );
     }
+
+    #[test]
+    fn cancel_status_reason_formats_in_en_and_zh() {
+        let en = include_str!("../locales/en/events.ftl");
+        let en_str = format_ftl_message(en, "en",
+            "event-approval-cancelled-status",
+            &[("decision", "approved")]).expect("en cancelled-status should format");
+        assert!(en_str.contains("approved"), "en got: {en_str}");
+        assert!(en_str.to_lowercase().contains("resolved"), "en should mention 'resolved': {en_str}");
+
+        let zh = include_str!("../locales/zh-CN/events.ftl");
+        let zh_str = format_ftl_message(zh, "zh-CN",
+            "event-approval-cancelled-status",
+            &[("decision", "同意")]).expect("zh cancelled-status should format");
+        assert!(zh_str.contains("同意"), "zh got: {zh_str}");
+        assert!(zh_str.contains("此请求已被处理"), "zh should mention '此请求已被处理': {zh_str}");
+    }
+
+    #[test]
+    fn approval_decision_keys_present_in_both_locales() {
+        for (locale_ftl, locale) in [
+            (include_str!("../locales/en/events.ftl"), "en"),
+            (include_str!("../locales/zh-CN/events.ftl"), "zh-CN"),
+        ] {
+            for key in [
+                "event-approval-decision-approve",
+                "event-approval-decision-deny",
+                "event-approval-decision-always",
+            ] {
+                let s = format_ftl_message(locale_ftl, locale, key, &[]);
+                assert!(s.is_some(), "missing key {key} in {locale}");
+                assert!(!s.unwrap().is_empty(), "empty value for {key} in {locale}");
+            }
+        }
+    }
 }
