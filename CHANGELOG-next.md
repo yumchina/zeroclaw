@@ -117,16 +117,13 @@ A [pluggable memory strategy](https://docs.zeroclawlabs.ai/master/en/agents/inte
 - **Approval card humanization**: approval cards optionally run a lightweight LLM summary (configurable via `[approval] summary_provider`, 10-second timeout with automatic fallback to the standard args summary on failure). The feature respects the same secret redaction rules as the task execution path.
 - **Channel approval cancellation**: `Channel::cancel_approval(approval_id, reason)` default no-op method added to the trait; the DawnIM channel implements it to clear pending cards when a fan-out loser cancels early.
 - **Identity reverse lookup**: `IdentityResolver::reverse_lookup(master_id, channel_ref)` added for proxy-approval routing; queries the existing identity bindings table to find a user's local channel-specific id when they lack a direct binding.
+- **Approval cancellation on fan-out (completed)**: broker-generated `approval_id` now flows end-to-end through `ChannelApprovalRequest`; fan-out losers are cancelled per `(channel_ref, recipient)` instead of channel_ref alone; dawn_im pushes a new card and lark patches the original card with the localized "resolved" status. Reason text is sourced from `events.ftl` and follows the active locale.
 
 ## Changed
 
 - `ApprovalManager.session_allowlist` (in-memory `HashSet<String>` per-tool allowlist) **removed** in favor of per-`(channel, topic, user, tool)` persistent grants via `SqliteGrantStore`.
 - `ApprovalManager.audit_log` (in-memory `Vec<ApprovalLogEntry>`) and its `audit_log()` accessor **removed**. All approval decisions (approve, reject, reason, participants) now flow through `zeroclaw_log::record!` and land in `runtime-trace.jsonl` as the single source of truth. Query approval events via `LogFilter { action: Some("approve" | "reject"), .. }` or filter the JSONL directly with `jq '.action=="approve"'`.
 - `ChannelsConfig.superusers` docstring reframed: the field's role now spans both `/bind` whitelist seed and global tool approver. Non-superuser tool requests fan-out to all superusers in this list; the first non-timeout reply wins and the rest are cancelled.
-
-## Known Limitations
-
-- **Approval cancellation on fan-out**: When multiple superusers receive an approval card and the first responder approves, losing cards in other channels remain visible. The broker-generated `approval_id` is not yet plumbed through all channel `pending_keys` structures. A follow-up PR will close this gap so fan-out losers disappear cleanly.
 
 ## Security
 
