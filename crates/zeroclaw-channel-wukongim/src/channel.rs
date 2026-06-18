@@ -1866,12 +1866,11 @@ impl Channel for WuKongIMChannel {
                     if let Ok(msg) = serde_json::to_string(&ping) {
                         self.send_ws_frame(WsMsg::Text(msg.into())).await?;
                     }
-                    self.send_ws_frame(WsMsg::Ping(Default::default())).await?;
                 }
                 frame = read.next() => {
                     let frame = frame.ok_or_else(|| anyhow::anyhow!("WuKongIM: stream closed"))??;
-                    last_activity = Instant::now();
                     let WsMsg::Text(text) = frame else { continue; };
+                    last_activity = Instant::now();
                     let val: serde_json::Value = serde_json::from_str(&text)?;
 
                     if val.get("method").and_then(|m| m.as_str()) == Some("pong") { continue; }
