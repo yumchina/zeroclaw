@@ -2627,6 +2627,7 @@ mod tests {
             model_provider: "anthropic.default".to_string(),
             model: "claude".to_string(),
             api_key: None,
+            temperature: None,
         });
 
         let kind = provider_kind("anthropic");

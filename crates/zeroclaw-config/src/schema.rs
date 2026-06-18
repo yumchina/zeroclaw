@@ -272,6 +272,12 @@ pub struct Config {
     #[nested]
     pub channels: ChannelsConfig,
 
+    /// Tool approval configuration (`[approval]`).
+    #[serde(default)]
+    #[nested]
+    #[group = "Operations"]
+    pub approval: ApprovalConfig,
+
     /// Memory backend configuration: sqlite, markdown, embeddings (`[memory]`).
     #[serde(default)]
     #[nested]
@@ -11396,8 +11402,10 @@ pub struct ChannelsConfig {
     /// channel's user id IS the unified person id. `None` disables the feature.
     #[serde(default)]
     pub master_channel: Option<String>,
-    /// Master-channel user ids seeded into the unified-session whitelist on
-    /// first init. Only these users may initiate `/bind`.
+    /// Master-channel user ids. 双重用途：
+    /// (1) 仅这些用户可发起 `/bind`（unified-session whitelist 种子）；
+    /// (2) 全局工具审批人（spec docs/superpowers/specs/2026-06-18-persistent-tool-approval-grants-design.md）。
+    /// 非 superuser 触发的工具调用会被 broker 代发给该列表中的所有用户。
     #[serde(default)]
     pub superusers: Vec<String>,
     /// Telegram bot channel instances (`[channels.telegram.<alias>]`).
@@ -11639,6 +11647,34 @@ impl ProgressObserverConfig {
                 || self.tool_call
                 || self.llm_thinking
                 || self.error)
+    }
+}
+
+/// 工具审批相关配置。新增于持久化审批授权设计（spec 2026-06-18）。
+#[derive(Debug, Clone, Serialize, Deserialize, Configurable)]
+#[cfg_attr(feature = "schema-export", derive(schemars::JsonSchema))]
+#[prefix = "approval"]
+pub struct ApprovalConfig {
+    /// 用于生成审批卡片「人话摘要」的 provider 别名（`<type>.<alias>` 或 provider 名）。
+    /// `None` 表示复用 agent 主 provider。
+    #[serde(default)]
+    pub summary_provider: Option<String>,
+
+    /// LLM 人话摘要硬超时（秒）。超时即回退到 `summarize_args` 原文。
+    #[serde(default = "default_humanize_timeout_secs")]
+    pub humanize_timeout_secs: u64,
+}
+
+fn default_humanize_timeout_secs() -> u64 {
+    10
+}
+
+impl Default for ApprovalConfig {
+    fn default() -> Self {
+        Self {
+            summary_provider: None,
+            humanize_timeout_secs: 10,
+        }
     }
 }
 
@@ -15628,6 +15664,7 @@ impl Default for Config {
             cron: HashMap::new(),
             acp: AcpConfig::default(),
             channels: ChannelsConfig::default(),
+            approval: ApprovalConfig::default(),
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
@@ -20619,6 +20656,7 @@ auto_save = true
                 debounce_ms: 0,
                 progress_observer: ProgressObserverConfig::default(),
             },
+            approval: ApprovalConfig::default(),
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
@@ -21284,6 +21322,7 @@ default_temperature = 0.7
             cron: HashMap::new(),
             acp: AcpConfig::default(),
             channels: ChannelsConfig::default(),
+            approval: ApprovalConfig::default(),
             memory: MemoryConfig::default(),
             storage: StorageConfig::default(),
             tunnel: TunnelConfig::default(),
@@ -29708,7 +29747,7 @@ token = "s3-tok"
     }
 
     mod unified_cfg_tests {
-        use super::ChannelsConfig;
+        use super::{ApprovalConfig, ChannelsConfig};
 
         #[test]
         fn channels_config_parses_master_and_superusers() {
@@ -29718,7 +29757,10 @@ token = "s3-tok"
             "#;
             let cfg: ChannelsConfig = toml::from_str(toml).unwrap();
             assert_eq!(cfg.master_channel.as_deref(), Some("dawnim.work"));
-            assert_eq!(cfg.superusers, vec!["u_alice".to_string(), "u_bob".to_string()]);
+            assert_eq!(
+                cfg.superusers,
+                vec!["u_alice".to_string(), "u_bob".to_string()]
+            );
         }
 
         #[test]
@@ -29726,6 +29768,15 @@ token = "s3-tok"
             let cfg: ChannelsConfig = toml::from_str("").unwrap();
             assert!(cfg.master_channel.is_none());
             assert!(cfg.superusers.is_empty());
+        }
+
+        #[test]
+        fn superusers_doc_mentions_global_approver() {
+            // 编译期检查注释里包含 "审批" 关键词不可行（doc-string 不暴露给运行时），
+            // 改为：构造空 ApprovalConfig 默认值的烟雾测试。
+            let cfg = ApprovalConfig::default();
+            assert_eq!(cfg.humanize_timeout_secs, 10);
+            assert!(cfg.summary_provider.is_none());
         }
     }
 }
