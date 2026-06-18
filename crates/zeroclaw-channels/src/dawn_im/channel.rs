@@ -1534,6 +1534,8 @@ impl Channel for DawnIMChannel {
         let payload_b64 =
             base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(&card)?);
         let (channel_id, channel_type) = parse_recipient(recipient);
+        let topic_out = topic_to_thread(request.thread_ts.as_deref());
+        let setting_out = topic_out.as_ref().map(|_| 8u32);
         let params = SendParams {
             from_uid: Some(self.uid.clone()),
             client_msg_no: Uuid::new_v4().to_string(),
@@ -1541,11 +1543,11 @@ impl Channel for DawnIMChannel {
             channel_type,
             payload: serde_json::Value::String(payload_b64),
             header: None,
-            setting: None,
+            setting: setting_out,
             msg_key: None,
             expire: None,
             stream_no: None,
-            topic: None,
+            topic: topic_out,
         };
         let (otx, orx) = tokio::sync::oneshot::channel();
         self.pending_approvals

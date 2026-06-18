@@ -390,6 +390,7 @@ fn sandbox_config_from_policy(policy: &SecurityPolicy) -> SandboxConfig {
             .map(parse_sandbox_backend)
             .unwrap_or_default(),
         firejail_args: policy.firejail_args.clone(),
+        network_outbound_allow: Vec::new(),
     }
 }
 

@@ -139,6 +139,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "ls /tmp".to_string(),
             raw_arguments: None,
+            thread_ts: None,
         };
 
         let pending_for_resolve = Arc::clone(&pending);
@@ -167,6 +168,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "rm -rf /".to_string(),
             raw_arguments: None,
+            thread_ts: None,
         };
         let task = zeroclaw_spawn::spawn!(async move {
             ch.request_approval_with_timeout("", &request, std::time::Duration::from_millis(50))
@@ -199,6 +201,7 @@ mod tests {
             tool_name: "shell".to_string(),
             arguments_summary: "sleep 60".to_string(),
             raw_arguments: None,
+            thread_ts: None,
         };
         let task = zeroclaw_spawn::spawn!(async move {
             ch.request_approval_with_timeout("", &request, std::time::Duration::from_secs(60))

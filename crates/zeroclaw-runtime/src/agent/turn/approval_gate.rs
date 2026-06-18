@@ -51,6 +51,9 @@ pub(crate) async fn gate_tool_approval(
                     tool_name: request.tool_name.clone(),
                     arguments_summary: crate::approval::summarize_args(&request.arguments),
                     raw_arguments: Some(request.arguments.clone()),
+                    thread_ts: zeroclaw_api::channel::CHANNEL_ORIGIN
+                        .try_with(|o| o.topic.clone())
+                        .unwrap_or(None),
                 };
                 let recipient = ctx.channel_reply_target.unwrap_or_default();
                 match ch.request_approval(recipient, &ch_request).await {

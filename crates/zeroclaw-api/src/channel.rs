@@ -7,7 +7,7 @@ use crate::media::MediaAttachment;
 // ── Channel approval types ──────────────────────────────────────
 
 /// Compact description of a tool call presented to the user for approval.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ChannelApprovalRequest {
     pub tool_name: String,
     pub arguments_summary: String,
@@ -15,6 +15,10 @@ pub struct ChannelApprovalRequest {
     /// diffs instead of a plain summary string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw_arguments: Option<serde_json::Value>,
+    /// Topic thread the approval card should be routed into.
+    /// `None` = default thread (pre-multi-topic behaviour).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub thread_ts: Option<String>,
 }
 
 /// The operator's response to a channel-presented approval prompt.
