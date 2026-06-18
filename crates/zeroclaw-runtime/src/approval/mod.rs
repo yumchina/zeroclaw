@@ -3,6 +3,9 @@
 //! Provides a pre-execution hook that prompts the user before tool calls,
 //! with session-scoped "Always" allowlists and audit logging.
 
+pub mod grant_store;
+pub use grant_store::{ApprovalGrant, ApprovalGrantStore, GrantFilter, SqliteGrantStore};
+
 use crate::security::AutonomyLevel;
 use chrono::Utc;
 use parking_lot::Mutex;
