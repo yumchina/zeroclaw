@@ -12,9 +12,15 @@ use zeroclaw_api::channel::{ChannelApprovalRequest, ChannelApprovalResponse};
 use super::connection::WkMessageType;
 
 /// Pending approvals waiting on operator response.
-/// Key = approval_id, value = oneshot sender to resolve `request_approval`.
-pub type PendingApprovals =
-    RwLock<HashMap<String, tokio::sync::oneshot::Sender<ChannelApprovalResponse>>>;
+/// Key = (approval_id, recipient_uid), value = sender + the topic the original
+/// card was sent into (so cancel_approval can land the resolved-status card in
+/// the same topic thread).
+pub struct PendingApproval {
+    pub sender: tokio::sync::oneshot::Sender<ChannelApprovalResponse>,
+    pub topic: Option<String>,
+}
+
+pub type PendingApprovals = RwLock<HashMap<(String, String), PendingApproval>>;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WkApprovalCard {
@@ -121,16 +127,18 @@ pub fn build_approval_card(
     }
 }
 
-/// Render a no-button "已由 XX 处理" card to replace an in-flight approval card
-/// after another superuser already decided. Used by `Channel::cancel_approval`.
-pub fn build_resolved_card(approval_id: &str, decider: &str) -> WkApprovalCard {
+/// Render a no-button "resolved-status" card to replace an in-flight approval
+/// card after another superuser already decided. Used by
+/// `Channel::cancel_approval`. The `reason` argument is a pre-localized
+/// human-facing string (the broker resolves fluent keys before passing it in).
+pub fn build_resolved_card(approval_id: &str, reason: &str) -> WkApprovalCard {
     WkApprovalCard {
         msg_type: WkMessageType::INTERACTIVE_CARD,
         approval_id: approval_id.to_string(),
         timeout_secs: 0,
         title: "📋 任务执行审批".to_string(),
         body: WkApprovalBody {
-            content: format!("此请求已由 **{decider}** 处理，无需再次操作。"),
+            content: reason.to_string(),
         },
         actions: None,
     }
@@ -203,10 +211,10 @@ mod tests {
     }
 
     #[test]
-    fn resolved_card_has_no_actions() {
-        let card = build_resolved_card("id-X", "u_admin");
+    fn resolved_card_renders_reason_as_body() {
+        let card = build_resolved_card("id-X", "此请求已被处理 — 同意");
         assert!(card.actions.is_none());
-        assert!(card.body.content.contains("u_admin"));
+        assert_eq!(card.body.content, "此请求已被处理 — 同意");
     }
 
     #[test]

@@ -19,7 +19,7 @@ use zeroclaw_api::memory_traits::{Memory, MemoryCategory};
 use zeroclaw_config::schema::DawnIMConfig;
 
 use super::approval::{
-    PendingApprovals, WkApprovalAction, build_approval_card, build_resolved_card,
+    PendingApproval, PendingApprovals, WkApprovalAction, build_approval_card, build_resolved_card,
 };
 use super::connection::{
     ClearUnreadRequest, ConnectParams, DAWN_IM_RPC_VERSION, HEARTBEAT_TIMEOUT, Header,
@@ -696,13 +696,13 @@ impl DawnIMChannel {
                 .await;
             if let Ok(action) = serde_json::from_value::<WkApprovalAction>(payload_json) {
                 let resp = map_approval_action(&action);
-                if let Some(ptx) = self
+                if let Some(p) = self
                     .pending_approvals
                     .write()
                     .await
-                    .remove(&action.approval_id)
+                    .remove(&(action.approval_id, params.from_uid.clone()))
                 {
-                    let _ = ptx.send(resp);
+                    let _ = p.sender.send(resp);
                 }
             }
             return Ok(());
@@ -886,6 +886,37 @@ impl DawnIMChannel {
             expire: None,
             stream_no: None,
             topic: topic_out,
+        })
+    }
+
+    /// Construct `SendParams` for a cancel-approval card resend.
+    /// Extracted as a seam so tests can assert on SendParams shape
+    /// (topic, setting bit-3, payload type/body) without standing up
+    /// a mock WebSocket. Mirrors `build_text_send_params`'s pattern.
+    fn build_cancel_send_params(
+        &self,
+        approval_id: &str,
+        recipient: &str,
+        reason: &str,
+        topic: Option<String>,
+    ) -> anyhow::Result<SendParams> {
+        let card = build_resolved_card(approval_id, reason);
+        let payload_b64 = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_string(&card)?);
+        let (channel_id, channel_type) = parse_recipient(recipient);
+        let setting_out = topic.as_ref().map(|_| 8u32);
+        Ok(SendParams {
+            from_uid: Some(self.uid.clone()),
+            client_msg_no: Uuid::new_v4().to_string(),
+            channel_id,
+            channel_type,
+            payload: serde_json::Value::String(payload_b64),
+            header: None,
+            setting: setting_out,
+            msg_key: None,
+            expire: None,
+            stream_no: None,
+            topic,
         })
     }
 
@@ -1533,7 +1564,10 @@ impl Channel for DawnIMChannel {
         recipient: &str,
         request: &ChannelApprovalRequest,
     ) -> anyhow::Result<Option<ChannelApprovalResponse>> {
-        let approval_id = Uuid::new_v4().to_string();
+        let approval_id = request
+            .approval_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let card = build_approval_card(&approval_id, request, self.approval_timeout_secs);
         let payload_b64 =
             base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(&card)?);
@@ -1551,19 +1585,25 @@ impl Channel for DawnIMChannel {
             msg_key: None,
             expire: None,
             stream_no: None,
-            topic: topic_out,
+            topic: topic_out.clone(),
         };
         let (otx, orx) = tokio::sync::oneshot::channel();
-        self.pending_approvals
-            .write()
-            .await
-            .insert(approval_id.clone(), otx);
+        self.pending_approvals.write().await.insert(
+            (approval_id.clone(), recipient.to_string()),
+            PendingApproval {
+                sender: otx,
+                topic: topic_out,
+            },
+        );
         self.send_rpc::<_, serde_json::Value>("send", params)
             .await?;
         match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), orx).await {
             Ok(Ok(resp)) => Ok(Some(resp)),
             _ => {
-                self.pending_approvals.write().await.remove(&approval_id);
+                self.pending_approvals
+                    .write()
+                    .await
+                    .remove(&(approval_id, recipient.to_string()));
                 Ok(Some(ChannelApprovalResponse::Deny))
             }
         }
@@ -1572,21 +1612,28 @@ impl Channel for DawnIMChannel {
     async fn cancel_approval(
         &self,
         approval_id: &str,
-        _recipient: &str,
+        recipient: &str,
         reason: &str,
     ) -> anyhow::Result<()> {
-        let _removed = self.pending_approvals.write().await.remove(approval_id);
-        ::zeroclaw_log::record!(
-            INFO,
-            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                .with_outcome(::zeroclaw_log::EventOutcome::Success)
-                .with_attrs(::serde_json::json!({
-                    "approval_id": approval_id,
-                    "reason": reason,
-                })),
-            "dawn_im: cancel_approval invoked (card patch is best-effort)"
-        );
-        let _ = build_resolved_card(approval_id, reason);
+        let removed = self
+            .pending_approvals
+            .write()
+            .await
+            .remove(&(approval_id.to_string(), recipient.to_string()));
+        let Some(pending) = removed else {
+            ::zeroclaw_log::record!(
+                DEBUG,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "approval_id": approval_id,
+                        "recipient": recipient,
+                    })),
+                "dawn_im: cancel_approval for unknown (id, recipient) — already resolved or expired"
+            );
+            return Ok(());
+        };
+        let params = self.build_cancel_send_params(approval_id, recipient, reason, pending.topic)?;
+        let _: serde_json::Value = self.send_rpc("send", params).await?;
         Ok(())
     }
 }
@@ -1923,5 +1970,221 @@ mod offline_batch_topic_grouping_tests {
         let none = by_thread.get(&None).unwrap();
         assert!(none.content.contains("n1"));
         assert!(none.content.contains("n2"));
+    }
+}
+
+#[cfg(test)]
+mod approval_id_propagation_tests {
+    use super::*;
+    use zeroclaw_api::channel::ChannelApprovalRequest;
+
+    fn build_test_channel() -> DawnIMChannel {
+        let cfg = zeroclaw_config::schema::DawnIMConfig {
+            enabled: true,
+            ws_url: "ws://localhost:5200".into(),
+            uid: "bot_uid_1".into(),
+            token: String::new(),
+            device_id: "test-device".into(),
+            device_flag: 1,
+            allowed_users: vec!["*".into()],
+            mention_only: false,
+            approval_timeout_secs: 1,
+            downloads_dir: "downloads".into(),
+            dawn_url: String::new(),
+            dawn_token: String::new(),
+            ack_reactions: false,
+            ack_reactions_message: String::new(),
+            ack_reactions_delay: 300,
+            progress_streaming: false,
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let memory: Arc<dyn zeroclaw_api::memory_traits::Memory> = Arc::new(
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", tmp.path(), "approval_id_test").unwrap(),
+        );
+        DawnIMChannel::from_config(&cfg, "test", tmp.path(), memory)
+    }
+
+    #[tokio::test]
+    async fn request_approval_uses_broker_approval_id_when_provided() {
+        let ch = build_test_channel();
+        let req = ChannelApprovalRequest {
+            tool_name: "shell".into(),
+            arguments_summary: "ls".into(),
+            raw_arguments: None,
+            thread_ts: None,
+            approval_id: Some("uuid-CANONICAL".into()),
+        };
+        // ws_sink is None — send_rpc will fail, but the pending insert happens
+        // BEFORE send_rpc, so we can still observe the key.
+        let _ = tokio::spawn({
+            let ch = ch.clone();
+            async move { ch.request_approval("u_admin1", &req).await }
+        });
+        // Give the spawn a moment to reach the insert step.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let pending = ch.pending_approvals.read().await;
+        assert!(
+            pending.contains_key(&("uuid-CANONICAL".to_string(), "u_admin1".to_string())),
+            "pending should be keyed by (broker_id, recipient); got keys: {:?}",
+            pending.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn request_approval_generates_local_id_when_none() {
+        let ch = build_test_channel();
+        let req = ChannelApprovalRequest {
+            tool_name: "shell".into(),
+            arguments_summary: "ls".into(),
+            raw_arguments: None,
+            thread_ts: None,
+            approval_id: None,
+        };
+        let _ = tokio::spawn({
+            let ch = ch.clone();
+            async move { ch.request_approval("u_admin1", &req).await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let pending = ch.pending_approvals.read().await;
+        let keys: Vec<_> = pending.keys().collect();
+        assert_eq!(keys.len(), 1, "expected one pending entry");
+        let (id, recipient) = keys[0];
+        assert_eq!(recipient, "u_admin1");
+        assert_eq!(id.len(), 36, "uuid v4 should be 36 chars, got: {id}");
+    }
+
+    #[tokio::test]
+    async fn inbound_interactive_response_resolves_by_id_and_from_uid() {
+        let ch = build_test_channel();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        ch.pending_approvals.write().await.insert(
+            ("uuid-X".to_string(), "u_admin1".to_string()),
+            crate::dawn_im::approval::PendingApproval { sender: tx, topic: None },
+        );
+        // Simulate inbound: build the payload the channel would receive.
+        let action_payload = serde_json::json!({
+            "type": u32::from(crate::dawn_im::connection::WkMessageType::INTERACTIVE_RESPONSE),
+            "approval_id": "uuid-X",
+            "action": "approve",
+        });
+        let payload_b64 = base64::engine::general_purpose::STANDARD
+            .encode(serde_json::to_string(&action_payload).unwrap());
+        let params = crate::dawn_im::connection::RecvNotificationParams {
+            message_id: "m1".into(),
+            message_seq: 1,
+            from_uid: "u_admin1".into(),
+            channel_id: "u_admin1".into(),
+            channel_type: crate::dawn_im::connection::WkChannelType::PERSONAL,
+            payload: serde_json::Value::String(payload_b64),
+            timestamp: 1,
+            topic: None,
+        };
+        let (channel_tx, _channel_rx) = tokio::sync::mpsc::channel(1);
+        let _ = ch.process_inbound_message(params, &channel_tx).await;
+        let pending = ch.pending_approvals.read().await;
+        assert!(
+            pending.is_empty(),
+            "inbound matching key should have been removed; remaining: {:?}",
+            pending.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_approval_unknown_key_returns_ok_no_rpc() {
+        let ch = build_test_channel();
+        // ws_sink is None throughout; if cancel_approval attempted to RPC,
+        // send_rpc would bail with "not connected". Returning Ok means
+        // it short-circuited at the "unknown key" guard.
+        let res = ch
+            .cancel_approval("uuid-nope", "u_admin1", "此请求已被处理 — 同意")
+            .await;
+        assert!(res.is_ok(), "unknown key should return Ok, got: {:?}", res);
+    }
+
+    #[tokio::test]
+    async fn cancel_send_params_carries_resolved_card_payload() {
+        let ch = build_test_channel();
+        let params = ch
+            .build_cancel_send_params(
+                "uuid-X",
+                "u_admin1",
+                "此请求已被处理 — 同意",
+                None,
+            )
+            .expect("build_cancel_send_params should succeed");
+        // channel_id should be the bare recipient (no <type>: prefix), channel_type PERSONAL (1).
+        assert_eq!(params.channel_id, "u_admin1");
+        assert_eq!(params.channel_type, 1u8);
+        // Decode the base64 payload and verify the card shape.
+        let payload_b64 = match params.payload {
+            serde_json::Value::String(s) => s,
+            other => panic!("expected payload to be a string, got {other:?}"),
+        };
+        let payload_bytes = base64::engine::general_purpose::STANDARD
+            .decode(&payload_b64)
+            .expect("payload should be valid base64");
+        let card: serde_json::Value = serde_json::from_slice(&payload_bytes)
+            .expect("payload should decode to JSON");
+        assert_eq!(
+            card["type"].as_u64().unwrap(),
+            u64::from(crate::dawn_im::connection::WkMessageType::INTERACTIVE_CARD)
+        );
+        assert_eq!(card["body"]["content"], "此请求已被处理 — 同意");
+        assert!(card["actions"].is_null(), "resolved card must have no actions");
+    }
+
+    #[tokio::test]
+    async fn cancel_send_params_preserves_original_topic() {
+        let ch = build_test_channel();
+        let params = ch
+            .build_cancel_send_params(
+                "uuid-X",
+                "u_admin1",
+                "此请求已被处理 — 同意",
+                Some("db_lock".to_string()),
+            )
+            .expect("build_cancel_send_params should succeed");
+        assert_eq!(params.topic.as_deref(), Some("db_lock"));
+        assert_eq!(params.setting, Some(8u32));
+    }
+
+    #[tokio::test]
+    async fn cancel_send_params_without_topic_omits_setting_bit() {
+        let ch = build_test_channel();
+        let params = ch
+            .build_cancel_send_params(
+                "uuid-X",
+                "u_admin1",
+                "此请求已被处理 — 同意",
+                None,
+            )
+            .expect("build_cancel_send_params should succeed");
+        assert!(params.topic.is_none());
+        assert!(params.setting.is_none());
+    }
+
+    #[tokio::test]
+    async fn cancel_approval_attempts_send_rpc() {
+        // Integration spy: ws_sink is None throughout (build_test_channel
+        // never connects), so send_rpc will bail with "not connected". This
+        // proves cancel_approval reached the RPC call path — not just the
+        // helper — when (approval_id, recipient) is found in pending.
+        // Catches regressions where a refactor accidentally drops the
+        // send_rpc call after build_cancel_send_params.
+        let ch = build_test_channel();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        ch.pending_approvals.write().await.insert(
+            ("uuid-X".to_string(), "u_admin1".to_string()),
+            crate::dawn_im::approval::PendingApproval { sender: tx, topic: None },
+        );
+        let res = ch
+            .cancel_approval("uuid-X", "u_admin1", "此请求已被处理 — 同意")
+            .await;
+        assert!(res.is_err(), "expected Err from send_rpc when ws_sink is None, got: {res:?}");
+        let err_msg = res.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("not connected") || err_msg.contains("WebSocket"),
+            "expected ws-not-connected error, got: {err_msg}"
+        );
     }
 }
