@@ -19,6 +19,8 @@
 
 #[cfg(feature = "channel-acp-server")]
 pub mod acp_server;
+mod approval_wiring;
+mod channel_directory;
 pub mod media_pipeline;
 #[cfg(feature = "channel-mqtt")]
 pub mod mqtt;
@@ -8891,6 +8893,7 @@ pub async fn start_channels(
     cancel: tokio_util::sync::CancellationToken,
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    approval_grants: Option<Arc<dyn zeroclaw_runtime::approval::ApprovalGrantStore>>,
 ) -> Result<()> {
     // Wrap into the canonical shared handle so channels and persistence
     // paths share one source of truth. The local `config` shadowing
@@ -9630,6 +9633,12 @@ pub async fn start_channels(
                 .expect("channels_by_name initialized on first iteration"),
         );
 
+        // Build channel directory for ApprovalBroker once channels_by_name is ready
+        let channel_directory: Option<Arc<dyn zeroclaw_runtime::approval::ChannelDirectory>> =
+            Some(Arc::new(channel_directory::OrchestratorChannelDirectory::new(
+                Arc::clone(&channels_by_name),
+            )));
+
         // Wire this agent's reaction / ask_user / escalate tool handles
         // into the shared `channels_by_name` map.
         {
@@ -9739,7 +9748,28 @@ pub async fn start_channels(
             session_store: shared_session_store.clone(),
             identity: shared_identity.clone(),
             topic_binding: shared_topic_binding.clone(),
-            approval_manager: Arc::new(ApprovalManager::for_non_interactive(&risk_profile)),
+            approval_manager: Arc::new({
+                let identity_resolver = shared_identity
+                    .as_ref()
+                    .map(|ir| ir.resolver.clone() as Arc<dyn zeroclaw_infra::identity_store::IdentityResolver>);
+                let cfg = config.clone();
+                let superusers_resolver = Arc::new(move || cfg.channels.superusers.clone());
+                let cfg2 = config.clone();
+                let master_channel_resolver = Arc::new(move || cfg2.channels.master_channel.clone());
+                // Default approval timeout: 300s (5 min). Channel-specific overrides
+                // (e.g. dawn_im.approval_timeout_secs) are not yet threaded through here.
+                let approval_timeout = std::time::Duration::from_secs(300);
+                approval_wiring::build_approval_manager_for_non_interactive(
+                    &risk_profile,
+                    &config.approval,
+                    approval_grants.clone(),
+                    identity_resolver,
+                    channel_directory.clone(),
+                    superusers_resolver,
+                    master_channel_resolver,
+                    approval_timeout,
+                )
+            }),
             activated_tools: ch_activated_handle,
             cost_tracking: zeroclaw_runtime::cost::CostTracker::get_or_init_global(
                 config.cost.clone(),

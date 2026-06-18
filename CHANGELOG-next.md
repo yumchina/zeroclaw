@@ -126,7 +126,7 @@ A [pluggable memory strategy](https://docs.zeroclawlabs.ai/master/en/agents/inte
 
 ## Known Limitations
 
-- **Approval grant caching active on gateway, not in runtime**: Gateway `GET /api/approvals/grants` and approval lookups use a local `SqliteGrantStore` with LRU cache. The runtime-side `ApprovalManager` construction sites (13 sites across channels and orchestrator code) do not yet inject the shared `Arc<dyn ApprovalGrantStore>` at initialization, so the approval gate's cached-grant short-circuit at runtime is not operational. A follow-up PR will thread the `SqliteGrantStore` arc through all 13 sites so the runtime can skip approval prompts on cache hits.
+- **Approval cancellation on fan-out**: When multiple superusers receive an approval card and the first responder approves, losing cards in other channels remain visible. The broker-generated `approval_id` is not yet plumbed through all channel `pending_keys` structures. A follow-up PR will close this gap so fan-out losers disappear cleanly.
 
 ## Security
 

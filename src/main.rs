@@ -3941,10 +3941,12 @@ async fn main() -> Result<()> {
                 registry.register_channels(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
+                    let grants = approval_grants.clone();
                     move |config, cancel| {
                         let canvas_store = canvas_store_for_channels.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
+                        let approval_grants = grants.clone();
                         Box::pin(async move {
                             Box::pin(zeroclaw_channels::orchestrator::start_channels(
                                 config,
@@ -3952,6 +3954,7 @@ async fn main() -> Result<()> {
                                 cancel,
                                 sop_engine,
                                 sop_audit,
+                                approval_grants,
                             ))
                             .await
                         })
@@ -4604,7 +4607,7 @@ async fn main() -> Result<()> {
                     (None, None)
                 };
                 Box::pin(channels::start_channels(
-                    config, None, cancel, sop_engine, sop_audit,
+                    config, None, cancel, sop_engine, sop_audit, None,
                 ))
                 .await
             }

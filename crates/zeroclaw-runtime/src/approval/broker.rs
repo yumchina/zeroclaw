@@ -47,6 +47,26 @@ pub struct ApprovalBroker {
 }
 
 impl ApprovalBroker {
+    pub fn new(
+        grants: Arc<dyn ApprovalGrantStore>,
+        identity: Arc<dyn IdentityResolver>,
+        directory: Arc<dyn ChannelDirectory>,
+        humanizer: Arc<Humanizer>,
+        superusers_resolver: Arc<dyn Fn() -> Vec<String> + Send + Sync>,
+        master_channel_resolver: Arc<dyn Fn() -> Option<String> + Send + Sync>,
+        approval_timeout: std::time::Duration,
+    ) -> Self {
+        Self {
+            grants,
+            identity,
+            directory,
+            humanizer,
+            superusers_resolver,
+            master_channel_resolver,
+            approval_timeout,
+        }
+    }
+
     pub async fn request_decision(&self, ctx: &BrokerRequestCtx<'_>) -> BrokerDecision {
         // 1) Cached grant?
         let cached = self.grants.get(
