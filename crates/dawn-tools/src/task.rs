@@ -347,7 +347,7 @@ description = "doc extraction"
             from_uid: "u_alice".into(),
             channel_ref: "dawnim.work".into(),
             reply_target: "1:u_alice".into(),
-            topic: None,
+            ..Default::default()
         };
         let result = zeroclaw_api::channel::CHANNEL_ORIGIN
             .scope(origin, async {
@@ -394,7 +394,7 @@ description = "doc extraction"
             from_uid: "u_alice".into(),
             channel_ref: "dawnim.other".into(),
             reply_target: "1:u_alice".into(),
-            topic: None,
+            ..Default::default()
         };
         let err = zeroclaw_api::channel::CHANNEL_ORIGIN
             .scope(origin, async {
@@ -417,7 +417,7 @@ description = "doc extraction"
             from_uid: "u_alice".into(),
             channel_ref: "dawnim.work".into(),
             reply_target: "1:u_alice".into(),
-            topic: None,
+            ..Default::default()
         };
         let result = zeroclaw_api::channel::CHANNEL_ORIGIN
             .scope(origin, async {
@@ -454,7 +454,7 @@ description = "doc extraction"
             from_uid: "u_alice".into(),
             reply_target: "1:u_alice".into(),
             channel_ref: "dawnim.work".into(),
-            topic: None,
+            ..Default::default()
         };
         let err = zeroclaw_api::channel::CHANNEL_ORIGIN
             .scope(origin, async {

@@ -143,25 +143,30 @@ pub enum SendKind {
 #[derive(Clone, Default, Debug)]
 pub struct ChannelOrigin {
     /// Originating user id, with any channel-specific suffix (e.g.
-    /// `_la_<bot_uid>` on DawnIM) already stripped.
+    /// `_la_<bot_uid>` on DawnIM) already stripped. This is the raw
+    /// channel-side identity, NOT the unified master_id; use
+    /// `triggerer_master_id` for unified-identity lookups.
     pub from_uid: String,
     /// Composite channel ref `"<type>.<alias>"`, e.g. `"dawnim.work"`.
     pub channel_ref: String,
     /// Original `ChannelMessage.reply_target` value, preserved verbatim
     /// so reply paths reconstruct correctly.
     pub reply_target: String,
-    /// Per-turn topic identifier. `None` means "no topic" (default
-    /// behaviour, equivalent to pre-multi-topic single-thread session).
-    /// `Some(t)` means the current turn lives in the isolated topic `t`
-    /// — its conversation history and memory are scoped separately from
-    /// other topics under the same (channel, user) pair.
-    ///
-    /// Sourced from the inbound `ChannelMessage.thread_ts` by the
-    /// orchestrator. Channel-aware tools read this to make topic-aware
-    /// decisions; the default tools (e.g. `dawn_create_task`) currently
-    /// ignore it (task messages route to external agent UIDs, not topic-
-    /// scoped user sessions).
+    /// **Effective topic** for the current turn, sourced via
+    /// `resolve_effective_topic(msg, channel_ref, master_channel_ref, topic_binding)`.
+    /// `None` means "no topic" (default behaviour, equivalent to pre-multi-topic single-thread session).
+    /// `Some(t)` means the current turn lives in the isolated topic `t` — its conversation
+    /// history and memory are scoped separately from other topics under the same
+    /// (channel, user) pair. Includes `/topic` binding fallback on slave channels;
+    /// this is the SAME topic the orchestrator uses to compute session keys
+    /// (`resolve_session_key`), so downstream consumers stay consistent.
     pub topic: Option<String>,
+    /// Unified `master_id` resolved from `(channel_ref, sender)` via
+    /// `IdentityResolver::resolve(...)`. `None` when the sender has no
+    /// unified identity (not a whitelisted superuser and no `/bind` mapping).
+    /// Single source of truth for downstream consumers (e.g. ApprovalBroker)
+    /// that need the master_id — do NOT re-resolve from identity store.
+    pub triggerer_master_id: Option<String>,
 }
 
 tokio::task_local! {
@@ -841,7 +846,7 @@ mod channel_origin_tests {
             from_uid: "u_alice".into(),
             channel_ref: "dawnim.work".into(),
             reply_target: "1:u_alice".into(),
-            topic: None,
+            ..Default::default()
         };
         let read_back = CHANNEL_ORIGIN
             .scope(origin.clone(), async {
@@ -872,6 +877,7 @@ mod channel_origin_tests {
             channel_ref: "dawnim.work".into(),
             reply_target: "1:u_alice".into(),
             topic: Some("db_lock".into()),
+            ..Default::default()
         };
         let read_back = CHANNEL_ORIGIN
             .scope(origin.clone(), async {
@@ -879,6 +885,39 @@ mod channel_origin_tests {
             })
             .await;
         assert_eq!(read_back, Some("db_lock".to_string()));
+    }
+
+    #[test]
+    fn channel_origin_default_has_triggerer_master_id_none() {
+        let o = ChannelOrigin::default();
+        assert!(o.triggerer_master_id.is_none());
+        assert!(o.topic.is_none());
+        assert!(o.channel_ref.is_empty());
+    }
+
+    #[test]
+    fn channel_origin_with_triggerer_master_id_round_trips_via_scope() {
+        let origin = ChannelOrigin {
+            from_uid: "raw_sender_la_botid".into(),
+            channel_ref: "lark.work".into(),
+            reply_target: "oc_xxx".into(),
+            topic: Some("db_lock".into()),
+            triggerer_master_id: Some("u_alice".into()),
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let read_back = rt.block_on(async {
+            CHANNEL_ORIGIN
+                .scope(origin, async {
+                    CHANNEL_ORIGIN
+                        .try_with(|o| o.triggerer_master_id.clone())
+                        .unwrap()
+                })
+                .await
+        });
+        assert_eq!(read_back, Some("u_alice".to_string()));
     }
 }
 

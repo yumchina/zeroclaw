@@ -631,6 +631,7 @@ fn resolve_session_key(
     msg: &zeroclaw_api::channel::ChannelMessage,
     identity: Option<&IdentityRuntime>,
     effective_topic: Option<&str>,
+    master_id_hint: Option<&str>,
 ) -> String {
     let base = conversation_history_key(msg);
     let Some(identity) = identity else {
@@ -644,10 +645,13 @@ fn resolve_session_key(
         None => msg.channel.clone(),
     };
     let is_master = channel_ref == identity.master_channel;
-    match identity
-        .resolver
-        .resolve(&channel_ref, &msg.sender, is_master)
-    {
+    let master_id = match master_id_hint {
+        Some(m) => Some(m.to_string()),
+        None => identity
+            .resolver
+            .resolve(&channel_ref, &msg.sender, is_master),
+    };
+    match master_id {
         Some(master_id) => match effective_topic {
             // Compose unified key with topic suffix when an effective topic
             // is present, so multi-topic isolation (introduced for DawnIM
@@ -2677,7 +2681,8 @@ async fn handle_runtime_command_if_needed(
     // Command handlers compute the session key for "this message's home";
     // use the message's literal thread_ts. The `/topic` binding override
     // applies to user-content messages, not command echoes.
-    let sender_key = resolve_session_key(msg, ctx.identity.as_deref(), msg.thread_ts.as_deref());
+    let sender_key =
+        resolve_session_key(msg, ctx.identity.as_deref(), msg.thread_ts.as_deref(), None);
     let defaults_snapshot = runtime_defaults_snapshot(ctx);
     let mut current = get_route_selection(ctx, &sender_key, &defaults_snapshot);
 
@@ -4199,7 +4204,9 @@ async fn process_channel_message_body(
         "channel inbound message"
     );
 
-    let rules = zeroclaw_runtime::security::allowlist_from_config(&ctx.prompt_config.security.leak_detector);
+    let rules = zeroclaw_runtime::security::allowlist_from_config(
+        &ctx.prompt_config.security.leak_detector,
+    );
     let scope_value = if rules.is_empty() {
         None
     } else {
@@ -4327,8 +4334,19 @@ async fn process_channel_message_body(
         ctx.identity.as_ref().map(|i| i.master_channel.as_str()),
         ctx.topic_binding.as_deref(),
     );
-    let history_key =
-        resolve_session_key(&msg, ctx.identity.as_deref(), effective_topic.as_deref());
+    // Resolve unified master_id once and share it with both resolve_session_key
+    // (inside history_key computation, done earlier) and ChannelOrigin below,
+    // so we never call identity.resolver.resolve(...) twice for the same turn.
+    let triggerer_master_id_opt = ctx.identity.as_deref().and_then(|id_rt| {
+        let is_master = channel_ref_for_msg == id_rt.master_channel;
+        id_rt.resolver.resolve(&channel_ref_for_msg, &msg.sender, is_master)
+    });
+    let history_key = resolve_session_key(
+        &msg,
+        ctx.identity.as_deref(),
+        effective_topic.as_deref(),
+        triggerer_master_id_opt.as_deref(),
+    );
     if let Some(ref store) = ctx.session_store {
         let channel_id = msg
             .channel_alias
@@ -5000,6 +5018,7 @@ async fn process_channel_message_body(
         reply_target: msg.reply_target.clone(),
         channel_ref: channel_ref_for_msg.clone(),
         topic: effective_topic.clone(),
+        triggerer_master_id: triggerer_master_id_opt.clone(),
     };
     let loop_knobs = LoopKnobs::default();
     let (llm_result, fallback_info) = scope_provider_fallback(async {
@@ -9914,7 +9933,8 @@ pub async fn deliver_announcement(
     // Scan for credential leaks before delivering
     let rules = zeroclaw_runtime::security::allowlist_from_config(&config.security.leak_detector);
     let (masked, mapping) = zeroclaw_runtime::security::mask_allowlist_urls(output, &rules);
-    let leak_detector = zeroclaw_runtime::security::LeakDetector::from_config(&config.security.leak_detector);
+    let leak_detector =
+        zeroclaw_runtime::security::LeakDetector::from_config(&config.security.leak_detector);
     let safe_output = match leak_detector.scan(&masked) {
         zeroclaw_runtime::security::LeakResult::Detected { redacted, .. } => {
             zeroclaw_runtime::security::restore_allowlist_urls(&redacted, &mapping)
@@ -21805,6 +21825,9 @@ mod error_code_tests {
                 .get(&(channel_ref.to_string(), sender.to_string()))?;
             self.whitelist.contains(m).then(|| m.clone())
         }
+        fn reverse_lookup(&self, _channel_ref: &str, _master_id: &str) -> Option<String> {
+            None
+        }
         fn issue_code(&self, _m: &str) -> Option<String> {
             None
         }
@@ -21836,7 +21859,7 @@ mod error_code_tests {
         };
         let msg = dm("dawnim", "work", "u_alice");
         assert_eq!(
-            resolve_session_key(&msg, Some(&ident), msg.thread_ts.as_deref()),
+            resolve_session_key(&msg, Some(&ident), msg.thread_ts.as_deref(), None),
             "unified_u_alice"
         );
     }
@@ -21856,7 +21879,7 @@ mod error_code_tests {
         };
         let msg = dm("lark", "work", "ou_aaa");
         assert_eq!(
-            resolve_session_key(&msg, Some(&ident), msg.thread_ts.as_deref()),
+            resolve_session_key(&msg, Some(&ident), msg.thread_ts.as_deref(), None),
             "unified_u_alice"
         );
     }
@@ -21872,7 +21895,7 @@ mod error_code_tests {
         };
         let msg = dm("lark", "work", "ou_stranger");
         assert_eq!(
-            resolve_session_key(&msg, Some(&ident), msg.thread_ts.as_deref()),
+            resolve_session_key(&msg, Some(&ident), msg.thread_ts.as_deref(), None),
             conversation_history_key(&msg)
         );
     }
@@ -21881,7 +21904,7 @@ mod error_code_tests {
     fn resolve_session_key_none_identity_is_base() {
         let msg = dm("lark", "work", "ou_aaa");
         assert_eq!(
-            resolve_session_key(&msg, None, None),
+            resolve_session_key(&msg, None, None, None),
             conversation_history_key(&msg)
         );
     }
@@ -21900,7 +21923,7 @@ mod error_code_tests {
         let mut msg = dm("dawnim", "work", "u_alice");
         msg.reply_target = "group:team".to_string(); // group → no unify
         assert_eq!(
-            resolve_session_key(&msg, Some(&ident), msg.thread_ts.as_deref()),
+            resolve_session_key(&msg, Some(&ident), msg.thread_ts.as_deref(), None),
             conversation_history_key(&msg)
         );
     }
@@ -21921,7 +21944,7 @@ mod error_code_tests {
         };
         let mut msg = dm("dawnim", "work", "u_alice");
         msg.thread_ts = Some("db_lock".to_string());
-        let key = resolve_session_key(&msg, Some(&ident), msg.thread_ts.as_deref());
+        let key = resolve_session_key(&msg, Some(&ident), msg.thread_ts.as_deref(), None);
         assert!(
             key.contains("unified_u_alice") && key.contains("db_lock"),
             "expected unified+topic key, got: {key}"
@@ -21943,7 +21966,7 @@ mod error_code_tests {
         };
         let msg = dm("dawnim", "work", "u_alice");
         // thread_ts is None
-        let key = resolve_session_key(&msg, Some(&ident), msg.thread_ts.as_deref());
+        let key = resolve_session_key(&msg, Some(&ident), msg.thread_ts.as_deref(), None);
         assert_eq!(key, "unified_u_alice");
     }
 
@@ -21958,7 +21981,7 @@ mod error_code_tests {
             master_channel: "dawnim.work".to_string(),
         };
         let msg = test_msg("feishu", Some("work"), Some("ignored_native"), "u_alice");
-        let key = resolve_session_key(&msg, Some(&identity), Some("bound_topic"));
+        let key = resolve_session_key(&msg, Some(&identity), Some("bound_topic"), None);
         assert_eq!(
             key,
             zeroclaw_api::session_keys::sanitize_session_key("unified_u_alice_bound_topic")
@@ -21975,7 +21998,7 @@ mod error_code_tests {
             master_channel: "dawnim.work".to_string(),
         };
         let msg = test_msg("feishu", Some("work"), None, "u_alice");
-        let key = resolve_session_key(&msg, Some(&identity), None);
+        let key = resolve_session_key(&msg, Some(&identity), None, None);
         assert_eq!(
             key,
             zeroclaw_api::session_keys::sanitize_session_key("unified_u_alice")
@@ -21989,6 +22012,9 @@ mod error_code_tests {
     impl zeroclaw_infra::identity_store::IdentityResolver for AlwaysResolves {
         fn resolve(&self, _ch: &str, sender: &str, _m: bool) -> Option<String> {
             Some(sender.to_string())
+        }
+        fn reverse_lookup(&self, _channel_ref: &str, _master_id: &str) -> Option<String> {
+            None
         }
         fn issue_code(&self, _: &str) -> Option<String> {
             None
@@ -22121,16 +22147,31 @@ mod error_code_tests {
         let stranger = dm("lark", "work", "ou_zzz");
 
         assert_eq!(
-            resolve_session_key(&master_msg, Some(&ident), master_msg.thread_ts.as_deref()),
-            resolve_session_key(&slave_msg, Some(&ident), slave_msg.thread_ts.as_deref()),
+            resolve_session_key(
+                &master_msg,
+                Some(&ident),
+                master_msg.thread_ts.as_deref(),
+                None
+            ),
+            resolve_session_key(
+                &slave_msg,
+                Some(&ident),
+                slave_msg.thread_ts.as_deref(),
+                None
+            ),
             "master and bound slave must share the unified session_key"
         );
         assert_eq!(
-            resolve_session_key(&master_msg, Some(&ident), master_msg.thread_ts.as_deref()),
+            resolve_session_key(
+                &master_msg,
+                Some(&ident),
+                master_msg.thread_ts.as_deref(),
+                None
+            ),
             "unified_u_alice"
         );
         assert_eq!(
-            resolve_session_key(&stranger, Some(&ident), stranger.thread_ts.as_deref()),
+            resolve_session_key(&stranger, Some(&ident), stranger.thread_ts.as_deref(), None),
             conversation_history_key(&stranger),
             "unbound stranger stays isolated"
         );
