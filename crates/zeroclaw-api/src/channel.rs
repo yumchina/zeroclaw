@@ -549,6 +549,13 @@ pub trait Channel: Send + Sync + crate::attribution::Attributable {
         Ok(None)
     }
 
+    /// Cancel an in-flight approval (e.g. fan-out lost the race to another superuser).
+    /// Default impl is a no-op; channels that support card patching (e.g. dawn_im,
+    /// lark) should override this to update the card with the deciding superuser.
+    async fn cancel_approval(&self, _approval_id: &str, _reason: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// The name of the back-channel that produced the most recent
     /// [`Channel::request_approval`] decision, when this channel fans a single
     /// request out to several registered back-channels (the agent's approval
@@ -958,5 +965,40 @@ mod send_message_kind_tests {
         let msg = err.to_string();
         assert!(msg.contains("wechat.main"), "got: {msg}");
         assert!(msg.contains("does not support kind"), "got: {msg}");
+    }
+}
+
+#[cfg(test)]
+mod approval_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn default_cancel_approval_is_noop_ok() {
+        struct Dummy;
+        impl crate::attribution::Attributable for Dummy {
+            fn role(&self) -> crate::attribution::Role {
+                crate::attribution::Role::Channel(crate::attribution::ChannelKind::Webhook)
+            }
+            fn alias(&self) -> &str {
+                "dummy"
+            }
+        }
+        #[async_trait]
+        impl crate::channel::Channel for Dummy {
+            fn name(&self) -> &str {
+                "dummy"
+            }
+            async fn send(&self, _: &crate::channel::SendMessage) -> anyhow::Result<()> {
+                Ok(())
+            }
+            async fn listen(
+                &self,
+                _: tokio::sync::mpsc::Sender<crate::channel::ChannelMessage>,
+            ) -> anyhow::Result<()> {
+                Ok(())
+            }
+        }
+        let d = Dummy;
+        assert!(d.cancel_approval("id", "reason").await.is_ok());
     }
 }
