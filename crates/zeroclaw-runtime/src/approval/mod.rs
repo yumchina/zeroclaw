@@ -10,6 +10,9 @@ pub mod decision_reason;
 pub mod humanize;
 pub use humanize::{Humanizer, SummaryProvider};
 
+pub mod broker;
+pub use broker::{ApprovalBroker, BrokerDecision, BrokerRequestCtx, ChannelDirectory};
+
 use crate::security::AutonomyLevel;
 use chrono::Utc;
 use parking_lot::Mutex;
