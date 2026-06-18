@@ -11,6 +11,7 @@ use crate::media::MediaAttachment;
 pub struct ChannelApprovalRequest {
     pub tool_name: String,
     pub arguments_summary: String,
+    pub thread_ts: Option<String>,
 }
 
 /// The operator's response to a channel-presented approval prompt.
@@ -34,6 +35,7 @@ pub struct ChannelInterventionRequest {
     pub reason: String, // Why are we halting (e.g. "Step Timeout", "Loop Detected")
     pub last_tool: Option<String>, // Last executed tool (if any)
     pub error_detail: String, // Specific error text/details
+    pub thread_ts: Option<String>,
 }
 
 /// Operator response to intervention request.

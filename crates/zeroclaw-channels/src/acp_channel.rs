@@ -459,6 +459,7 @@ mod tests {
         let request = ChannelApprovalRequest {
             tool_name: "git".to_string(),
             arguments_summary: "git status --short".to_string(),
+            thread_ts: None,
         };
 
         let task = tokio::spawn(async move { ch.request_approval("", &request).await });
