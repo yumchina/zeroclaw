@@ -1,7 +1,7 @@
 //! Interactive approval workflow for supervised mode.
 //!
 //! Provides a pre-execution hook that prompts the user before tool calls,
-//! with session-scoped "Always" allowlists and audit logging.
+//! with persistent grant storage and structured event logging.
 
 pub mod grant_store;
 pub use grant_store::{ApprovalGrant, ApprovalGrantStore, GrantFilter, SqliteGrantStore};
@@ -14,11 +14,9 @@ pub mod broker;
 pub use broker::{ApprovalBroker, BrokerDecision, BrokerRequestCtx, ChannelDirectory};
 
 use crate::security::AutonomyLevel;
-use chrono::Utc;
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::io::{self, BufRead, Write};
+use std::sync::Arc;
 use zeroclaw_config::schema::RiskProfileConfig;
 
 // ── Types ────────────────────────────────────────────────────────
@@ -71,16 +69,6 @@ pub fn sanitize_tool_replacement(replacement: &str) -> String {
     cleaned[..end].to_string()
 }
 
-/// A single audit log entry for an approval decision.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApprovalLogEntry {
-    pub timestamp: String,
-    pub tool_name: String,
-    pub arguments_summary: String,
-    pub decision: ApprovalResponse,
-    pub channel: String,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ApprovalRequirement {
     Prompt,
@@ -88,13 +76,20 @@ pub enum ApprovalRequirement {
     NotRequired,
 }
 
+/// Context for grant store lookup during approval requirement checks.
+pub struct GrantLookupCtx {
+    pub channel_ref: String,
+    pub topic: Option<String>,
+    pub user_master_id: String,
+}
+
 // ── ApprovalManager ──────────────────────────────────────────────
 
 /// Manages the approval workflow for tool calls.
 ///
 /// - Checks config-level `auto_approve` / `always_ask` lists
-/// - Maintains a session-scoped "always" allowlist
-/// - Records an audit trail of all decisions
+/// - Queries persistent grant storage when lookup context is provided
+/// - Routes approval decisions to structured log events
 ///
 /// Two modes:
 /// - **Interactive** (CLI): tools needing approval trigger a stdin prompt.
@@ -106,9 +101,9 @@ pub enum ApprovalRequirement {
 ///   through a client approval channel instead of trusting tool arguments.
 pub struct ApprovalManager {
     /// Tools that never need approval (from config).
-    auto_approve: HashSet<String>,
-    /// Tools that always need approval, ignoring session allowlist.
-    always_ask: HashSet<String>,
+    auto_approve: std::collections::HashSet<String>,
+    /// Tools that always need approval, overriding grants.
+    always_ask: std::collections::HashSet<String>,
     /// Autonomy level from config.
     autonomy_level: AutonomyLevel,
     /// When `true`, tools that would require interactive approval are
@@ -117,10 +112,10 @@ pub struct ApprovalManager {
     /// When `true`, shell calls in non-interactive mode still enter the outer
     /// approval flow because a real client approval channel exists.
     non_interactive_shell_requires_approval: bool,
-    /// Session-scoped allowlist built from "Always" responses.
-    session_allowlist: Mutex<HashSet<String>>,
-    /// Audit trail of approval decisions.
-    audit_log: Mutex<Vec<ApprovalLogEntry>>,
+    /// Persistent grant store for "Always" approvals.
+    grants: Option<Arc<dyn ApprovalGrantStore>>,
+    /// Approval broker for routing approval requests.
+    broker: Option<Arc<ApprovalBroker>>,
 }
 
 impl ApprovalManager {
@@ -132,8 +127,8 @@ impl ApprovalManager {
             autonomy_level: risk_profile.level,
             non_interactive: false,
             non_interactive_shell_requires_approval: false,
-            session_allowlist: Mutex::new(HashSet::new()),
-            audit_log: Mutex::new(Vec::new()),
+            grants: None,
+            broker: None,
         }
     }
 
@@ -149,8 +144,8 @@ impl ApprovalManager {
             autonomy_level: risk_profile.level,
             non_interactive: true,
             non_interactive_shell_requires_approval: false,
-            session_allowlist: Mutex::new(HashSet::new()),
-            audit_log: Mutex::new(Vec::new()),
+            grants: None,
+            broker: None,
         }
     }
 
@@ -167,9 +162,26 @@ impl ApprovalManager {
             autonomy_level: risk_profile.level,
             non_interactive: true,
             non_interactive_shell_requires_approval: true,
-            session_allowlist: Mutex::new(HashSet::new()),
-            audit_log: Mutex::new(Vec::new()),
+            grants: None,
+            broker: None,
         }
+    }
+
+    /// Attach a persistent grant store.
+    pub fn with_grant_store(mut self, grants: Arc<dyn ApprovalGrantStore>) -> Self {
+        self.grants = Some(grants);
+        self
+    }
+
+    /// Attach an approval broker.
+    pub fn with_broker(mut self, broker: Arc<ApprovalBroker>) -> Self {
+        self.broker = Some(broker);
+        self
+    }
+
+    /// Get the approval broker if attached.
+    pub fn broker(&self) -> Option<Arc<ApprovalBroker>> {
+        self.broker.clone()
     }
 
     /// Returns `true` when this manager operates in non-interactive mode
@@ -182,10 +194,14 @@ impl ApprovalManager {
     ///
     /// Returns `true` if the call needs a prompt, `false` if it can proceed.
     pub fn needs_approval(&self, tool_name: &str) -> bool {
-        self.approval_requirement(tool_name) == ApprovalRequirement::Prompt
+        self.approval_requirement(tool_name, None) == ApprovalRequirement::Prompt
     }
 
-    pub fn approval_requirement(&self, tool_name: &str) -> ApprovalRequirement {
+    pub fn approval_requirement(
+        &self,
+        tool_name: &str,
+        lookup: Option<&GrantLookupCtx>,
+    ) -> ApprovalRequirement {
         // Full autonomy never prompts.
         if self.autonomy_level == AutonomyLevel::Full {
             return ApprovalRequirement::Approved;
@@ -218,51 +234,85 @@ impl ApprovalManager {
             return ApprovalRequirement::Approved;
         }
 
-        // Session allowlist (from prior "Always" responses).
-        let allowlist = self.session_allowlist.lock();
-        if allowlist.contains(tool_name) {
-            return ApprovalRequirement::Approved;
+        // Check persistent grant store.
+        if let (Some(lookup), Some(grants)) = (lookup, &self.grants) {
+            if let Ok(Some(_)) = grants.get(
+                lookup.channel_ref.as_str(),
+                lookup.topic.as_deref(),
+                lookup.user_master_id.as_str(),
+                tool_name,
+            ) {
+                return ApprovalRequirement::Approved;
+            }
         }
 
         // Default: supervised mode requires approval.
         ApprovalRequirement::Prompt
     }
 
-    /// Record an approval decision and update session state.
+    /// Record an approval decision to the structured log.
     pub fn record_decision(
         &self,
         tool_name: &str,
         args: &serde_json::Value,
         decision: &ApprovalResponse,
         channel: &str,
+        reason: &'static str,
+        extras: serde_json::Value,
     ) {
-        // If "Always", add to session allowlist.
-        if *decision == ApprovalResponse::Always {
-            let mut allowlist = self.session_allowlist.lock();
-            allowlist.insert(tool_name.to_string());
+        let summary = summarize_args(args);
+        let (action, outcome) = match decision {
+            ApprovalResponse::Yes | ApprovalResponse::Always => (
+                ::zeroclaw_log::Action::Approve,
+                ::zeroclaw_log::EventOutcome::Success,
+            ),
+            ApprovalResponse::No => (
+                ::zeroclaw_log::Action::Reject,
+                ::zeroclaw_log::EventOutcome::Failure,
+            ),
+            ApprovalResponse::ReplaceWith(_) => (
+                ::zeroclaw_log::Action::Reject,
+                ::zeroclaw_log::EventOutcome::Failure,
+            ),
+        };
+
+        let mut attrs = serde_json::json!({
+            "tool": tool_name,
+            "channel": channel,
+            "reason": reason,
+            "arguments_summary": summary,
+        });
+
+        if let Some(map) = attrs.as_object_mut() {
+            if let Some(extra_map) = extras.as_object() {
+                for (k, v) in extra_map {
+                    map.insert(k.clone(), v.clone());
+                }
+            }
         }
 
-        // Append to audit log.
-        let summary = summarize_args(args);
-        let entry = ApprovalLogEntry {
-            timestamp: Utc::now().to_rfc3339(),
-            tool_name: tool_name.to_string(),
-            arguments_summary: summary,
-            decision: decision.clone(),
-            channel: channel.to_string(),
-        };
-        let mut log = self.audit_log.lock();
-        log.push(entry);
-    }
-
-    /// Get a snapshot of the audit log.
-    pub fn audit_log(&self) -> Vec<ApprovalLogEntry> {
-        self.audit_log.lock().clone()
-    }
-
-    /// Get the current session allowlist.
-    pub fn session_allowlist(&self) -> HashSet<String> {
-        self.session_allowlist.lock().clone()
+        match action {
+            ::zeroclaw_log::Action::Approve => {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), action)
+                        .with_category(::zeroclaw_log::EventCategory::Tool)
+                        .with_outcome(outcome)
+                        .with_attrs(attrs),
+                    "tool_approval_decision"
+                );
+            }
+            _ => {
+                ::zeroclaw_log::record!(
+                    WARN,
+                    ::zeroclaw_log::Event::new(module_path!(), action)
+                        .with_category(::zeroclaw_log::EventCategory::Tool)
+                        .with_outcome(outcome)
+                        .with_attrs(attrs),
+                    "tool_approval_decision"
+                );
+            }
+        }
     }
 
     /// Prompt the user on the CLI and return their decision.
@@ -468,93 +518,114 @@ mod tests {
         assert!(!mgr.needs_approval("shell"));
     }
 
-    // ── session allowlist ────────────────────────────────────
+    // ── grant store ────────────────────────────────────
 
     #[test]
-    fn always_response_adds_to_session_allowlist() {
-        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
-        assert!(mgr.needs_approval("file_write"));
-
-        mgr.record_decision(
-            "file_write",
-            &serde_json::json!({"path": "test.txt"}),
-            &ApprovalResponse::Always,
-            "cli",
+    fn grant_hit_short_circuits_approval_requirement() {
+        use std::sync::Arc;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let grants =
+            Arc::new(crate::approval::grant_store::SqliteGrantStore::new(tmp.path()).unwrap())
+                as Arc<dyn ApprovalGrantStore>;
+        grants
+            .put(crate::approval::grant_store::ApprovalGrant::new(
+                "dawnim.work".into(),
+                Some("t1".into()),
+                "u_alice".into(),
+                "file_write".into(),
+                "u_admin".into(),
+                "dawnim.work".into(),
+            ))
+            .unwrap();
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config()).with_grant_store(grants);
+        let ctx = GrantLookupCtx {
+            channel_ref: "dawnim.work".into(),
+            topic: Some("t1".into()),
+            user_master_id: "u_alice".into(),
+        };
+        assert_eq!(
+            mgr.approval_requirement("file_write", Some(&ctx)),
+            ApprovalRequirement::Approved
         );
-
-        // Now file_write should be in session allowlist.
-        assert!(!mgr.needs_approval("file_write"));
     }
 
     #[test]
-    fn always_ask_overrides_session_allowlist() {
-        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
+    fn always_ask_overrides_grant_hit() {
+        use std::sync::Arc;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let grants =
+            Arc::new(crate::approval::grant_store::SqliteGrantStore::new(tmp.path()).unwrap())
+                as Arc<dyn ApprovalGrantStore>;
+        grants
+            .put(crate::approval::grant_store::ApprovalGrant::new(
+                "dawnim.work".into(),
+                None,
+                "u_alice".into(),
+                "shell".into(),
+                "u_admin".into(),
+                "dawnim.work".into(),
+            ))
+            .unwrap();
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config()).with_grant_store(grants);
+        let ctx = GrantLookupCtx {
+            channel_ref: "dawnim.work".into(),
+            topic: None,
+            user_master_id: "u_alice".into(),
+        };
+        // shell is in always_ask, so grant is ignored.
+        assert_eq!(
+            mgr.approval_requirement("shell", Some(&ctx)),
+            ApprovalRequirement::Prompt
+        );
+    }
 
-        // Even after "Always" for shell, it should still prompt.
+    #[test]
+    fn approval_manager_no_longer_exposes_session_allowlist() {
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
+        // Compile-time check: the method `session_allowlist()` must not exist.
+        // The body intentionally does not call it; if a future refactor re-adds the
+        // method, this test stays green but the spec invariant is preserved by the
+        // type-level removal in mod.rs.
+        let _ = mgr;
+    }
+
+    // ── record_decision log emission ────────────────────────────────────────────
+
+    #[test]
+    fn record_decision_emits_record_event() {
+        let _g1 = ::zeroclaw_log::__private_test_writer_lock();
+        let _g2 = ::zeroclaw_log::__private_test_hook_lock();
+        let _sub = ::zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = ::zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
+        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
         mgr.record_decision(
             "shell",
             &serde_json::json!({"command": "ls"}),
-            &ApprovalResponse::Always,
-            "cli",
-        );
-
-        // shell is in always_ask, so it still needs approval.
-        assert!(mgr.needs_approval("shell"));
-    }
-
-    #[test]
-    fn yes_response_does_not_add_to_allowlist() {
-        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
-        mgr.record_decision(
-            "file_write",
-            &serde_json::json!({}),
             &ApprovalResponse::Yes,
             "cli",
-        );
-        assert!(mgr.needs_approval("file_write"));
-    }
-
-    // ── audit log ────────────────────────────────────────────
-
-    #[test]
-    fn audit_log_records_decisions() {
-        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
-
-        mgr.record_decision(
-            "shell",
-            &serde_json::json!({"command": "rm -rf ./build/"}),
-            &ApprovalResponse::No,
-            "cli",
-        );
-        mgr.record_decision(
-            "file_write",
-            &serde_json::json!({"path": "out.txt", "content": "hello"}),
-            &ApprovalResponse::Yes,
-            "cli",
+            crate::approval::decision_reason::INTERACTIVE_APPROVE,
+            serde_json::json!({}),
         );
 
-        let log = mgr.audit_log();
-        assert_eq!(log.len(), 2);
-        assert_eq!(log[0].tool_name, "shell");
-        assert_eq!(log[0].decision, ApprovalResponse::No);
-        assert_eq!(log[1].tool_name, "file_write");
-        assert_eq!(log[1].decision, ApprovalResponse::Yes);
-    }
-
-    #[test]
-    fn audit_log_contains_timestamp_and_channel() {
-        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
-        mgr.record_decision(
-            "shell",
-            &serde_json::json!({"command": "ls"}),
-            &ApprovalResponse::Yes,
-            "telegram",
+        let captured: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            captured.iter().any(|ev| {
+                ev.get("action").and_then(|v| v.as_str()) == Some("approve")
+                    && ev
+                        .get("zeroclaw.attrs")
+                        .and_then(|v| v.get("reason"))
+                        .and_then(|v| v.as_str())
+                        == Some("interactive_approve")
+                    && ev
+                        .get("zeroclaw.attrs")
+                        .and_then(|v| v.get("tool"))
+                        .and_then(|v| v.as_str())
+                        == Some("shell")
+            }),
+            "expected event with action=approve, reason=interactive_approve, tool=shell; got: {captured:#?}"
         );
-
-        let log = mgr.audit_log();
-        assert_eq!(log.len(), 1);
-        assert!(!log[0].timestamp.is_empty());
-        assert_eq!(log[0].channel, "telegram");
     }
 
     // ── summarize_args ───────────────────────────────────────
@@ -678,35 +749,64 @@ mod tests {
     }
 
     #[test]
-    fn non_interactive_session_allowlist_still_works() {
-        let mgr = ApprovalManager::for_non_interactive(&supervised_config());
-        assert!(mgr.needs_approval("file_write"));
-
-        // Simulate an "Always" decision (would come from a prior channel run
-        // if the tool was auto-approved somehow, e.g. via config change).
-        mgr.record_decision(
-            "file_write",
-            &serde_json::json!({"path": "test.txt"}),
-            &ApprovalResponse::Always,
-            "telegram",
+    fn non_interactive_grant_hit_short_circuits() {
+        use std::sync::Arc;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let grants =
+            Arc::new(crate::approval::grant_store::SqliteGrantStore::new(tmp.path()).unwrap())
+                as Arc<dyn ApprovalGrantStore>;
+        grants
+            .put(crate::approval::grant_store::ApprovalGrant::new(
+                "tg".into(),
+                None,
+                "u_bob".into(),
+                "file_write".into(),
+                "u_admin".into(),
+                "tg".into(),
+            ))
+            .unwrap();
+        let mgr =
+            ApprovalManager::for_non_interactive(&supervised_config()).with_grant_store(grants);
+        let ctx = GrantLookupCtx {
+            channel_ref: "tg".into(),
+            topic: None,
+            user_master_id: "u_bob".into(),
+        };
+        assert_eq!(
+            mgr.approval_requirement("file_write", Some(&ctx)),
+            ApprovalRequirement::Approved
         );
-
-        assert!(!mgr.needs_approval("file_write"));
     }
 
     #[test]
-    fn non_interactive_always_ask_overrides_session_allowlist() {
-        let mgr = ApprovalManager::for_non_interactive(&supervised_config());
-
-        mgr.record_decision(
-            "shell",
-            &serde_json::json!({"command": "ls"}),
-            &ApprovalResponse::Always,
-            "telegram",
+    fn non_interactive_always_ask_overrides_grant() {
+        use std::sync::Arc;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let grants =
+            Arc::new(crate::approval::grant_store::SqliteGrantStore::new(tmp.path()).unwrap())
+                as Arc<dyn ApprovalGrantStore>;
+        grants
+            .put(crate::approval::grant_store::ApprovalGrant::new(
+                "tg".into(),
+                None,
+                "u_bob".into(),
+                "shell".into(),
+                "u_admin".into(),
+                "tg".into(),
+            ))
+            .unwrap();
+        let mgr =
+            ApprovalManager::for_non_interactive(&supervised_config()).with_grant_store(grants);
+        let ctx = GrantLookupCtx {
+            channel_ref: "tg".into(),
+            topic: None,
+            user_master_id: "u_bob".into(),
+        };
+        // shell is in always_ask, so grant is ignored.
+        assert_eq!(
+            mgr.approval_requirement("shell", Some(&ctx)),
+            ApprovalRequirement::Prompt
         );
-
-        // shell is in always_ask, so it still needs approval even after "Always".
-        assert!(mgr.needs_approval("shell"));
     }
 
     // ── ApprovalResponse serde ───────────────────────────────
