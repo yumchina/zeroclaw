@@ -517,6 +517,7 @@ mod tests {
             enabled: Some(false),
             backend: SandboxBackend::None,
             firejail_args: Vec::new(),
+            network_outbound_allow: Vec::new(),
         };
         let posture = sandbox_posture(&sandbox_cfg, "", None);
         assert_eq!(posture.requested_backend, "none");
@@ -552,6 +553,7 @@ mod tests {
             enabled: None,
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            network_outbound_allow: Vec::new(),
         };
         let posture = sandbox_posture(&sandbox_cfg, "native", None);
         assert_ne!(posture.active_backend, "docker");
@@ -563,6 +565,7 @@ mod tests {
             enabled: None,
             backend: SandboxBackend::Auto,
             firejail_args: Vec::new(),
+            network_outbound_allow: Vec::new(),
         };
         let sandbox = create_sandbox(&sandbox_cfg, "native", None);
         let posture = sandbox_posture(&sandbox_cfg, "native", None);
