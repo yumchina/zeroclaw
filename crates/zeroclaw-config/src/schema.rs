@@ -275,7 +275,6 @@ pub struct Config {
     /// Tool approval configuration (`[approval]`).
     #[serde(default)]
     #[nested]
-    #[group = "Operations"]
     pub approval: ApprovalConfig,
 
     /// Memory backend configuration: sqlite, markdown, embeddings (`[memory]`).
