@@ -134,6 +134,7 @@ impl ApprovalBroker {
             arguments_summary: card_summary,
             raw_arguments: None,
             thread_ts: ctx.topic.clone(),
+            approval_id: None,
         };
         let (winner, winning_channel_ref) = self.fan_out(&targets, &approval_id, &request).await;
 
@@ -235,7 +236,7 @@ impl ApprovalBroker {
             for (chref, ch) in alive_targets.iter() {
                 if chref != winning_chref {
                     let _ = ch
-                        .cancel_approval(approval_id, "已由其他 superuser 处理")
+                        .cancel_approval(approval_id, "", "已由其他 superuser 处理")
                         .await;
                 }
             }
@@ -320,7 +321,7 @@ mod tests {
             tokio::time::sleep(self.delay).await;
             Ok(self.respond_with.lock().unwrap().clone())
         }
-        async fn cancel_approval(&self, _: &str, _: &str) -> anyhow::Result<()> {
+        async fn cancel_approval(&self, _: &str, _: &str, _: &str) -> anyhow::Result<()> {
             *self.cancel_count.lock().unwrap() += 1;
             Ok(())
         }

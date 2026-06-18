@@ -1569,15 +1569,13 @@ impl Channel for DawnIMChannel {
         }
     }
 
-    async fn cancel_approval(&self, approval_id: &str, reason: &str) -> anyhow::Result<()> {
-        // Drop the pending sender so the request_approval future no longer waits on us.
+    async fn cancel_approval(
+        &self,
+        approval_id: &str,
+        _recipient: &str,
+        reason: &str,
+    ) -> anyhow::Result<()> {
         let _removed = self.pending_approvals.write().await.remove(approval_id);
-
-        // Best-effort: push a "resolved" card update. We don't have a per-card
-        // recipient cache here; if dawn_im supports updating a card by approval_id
-        // alone (broadcast to original conversation), use that; otherwise this is
-        // a no-op and the original card simply stays visible to the user.
-        // For now: emit a Note log so operators can see the cancel intent.
         ::zeroclaw_log::record!(
             INFO,
             ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1588,7 +1586,7 @@ impl Channel for DawnIMChannel {
                 })),
             "dawn_im: cancel_approval invoked (card patch is best-effort)"
         );
-        let _ = build_resolved_card(approval_id, reason); // construct to keep the helper used + linted
+        let _ = build_resolved_card(approval_id, reason);
         Ok(())
     }
 }

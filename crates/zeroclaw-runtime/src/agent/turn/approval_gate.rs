@@ -232,6 +232,7 @@ pub(crate) async fn gate_tool_approval(
                 arguments_summary: crate::approval::summarize_args(tool_args),
                 raw_arguments: Some(tool_args.clone()),
                 thread_ts: origin.topic.clone(),
+                approval_id: None,
             };
             let recipient = ctx.channel_reply_target.unwrap_or_default();
 

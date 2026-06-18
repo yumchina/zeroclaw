@@ -994,6 +994,7 @@ mod tests {
             arguments_summary: "command: ls -la".into(),
             raw_arguments: None,
             thread_ts: None,
+            approval_id: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: ChannelApprovalRequest = serde_json::from_str(&json).unwrap();

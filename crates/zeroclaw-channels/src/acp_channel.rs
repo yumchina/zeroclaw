@@ -613,6 +613,7 @@ mod tests {
             arguments_summary: "git status --short".to_string(),
             raw_arguments: None,
             thread_ts: None,
+            approval_id: None,
         };
 
         let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
@@ -652,6 +653,7 @@ mod tests {
             arguments_summary: "git commit".to_string(),
             raw_arguments: None,
             thread_ts: None,
+            approval_id: None,
         };
 
         let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
@@ -677,6 +679,7 @@ mod tests {
             arguments_summary: "git push".to_string(),
             raw_arguments: None,
             thread_ts: None,
+            approval_id: None,
         };
         let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
         let line = rx.recv().await.unwrap();
@@ -707,6 +710,7 @@ mod tests {
                 "new_string": "let x = 2;"
             })),
             thread_ts: None,
+            approval_id: None,
         };
 
         let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
@@ -777,6 +781,7 @@ mod tests {
                 "new_string": "let x = 2;"
             })),
             thread_ts: None,
+            approval_id: None,
         };
 
         let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
@@ -820,6 +825,7 @@ mod tests {
                 "new_string": "b"
             })),
             thread_ts: None,
+            approval_id: None,
         };
 
         let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
@@ -853,6 +859,7 @@ mod tests {
             arguments_summary: "edit foo.rs".to_string(),
             raw_arguments: None,
             thread_ts: None,
+            approval_id: None,
         };
 
         let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
@@ -890,6 +897,7 @@ mod tests {
             arguments_summary: "write bar.rs".to_string(),
             raw_arguments: None,
             thread_ts: None,
+            approval_id: None,
         };
 
         let task = zeroclaw_spawn::spawn!(async move { ch.request_approval("", &request).await });
