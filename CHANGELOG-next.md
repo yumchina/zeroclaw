@@ -111,6 +111,23 @@ A [pluggable memory strategy](https://docs.zeroclawlabs.ai/master/en/agents/inte
 - Smart-room named-device tools and ESP32 simulator harnesses (#7045, #7048, #7363).
 - [Versioned documentation](https://docs.zeroclawlabs.ai/master/en/introduction.html) with a version selector (#7023), a full book rework that derives provider and config reference pages from source (#7365), a [FreeBSD setup guide](https://docs.zeroclawlabs.ai/master/en/setup/freebsd.html) with service files (#7161), [Podman guidance](https://docs.zeroclawlabs.ai/master/en/setup/container.html), a [NixOS module](https://docs.zeroclawlabs.ai/master/en/setup/nixos.html) (#6562), and a fully static container build pipeline (#7176).
 
+### Tool approvals
+
+- **Persistent tool approval grants**: operator approvals can now be persisted per-`(channel, topic, user, tool)` key. When an operator clicks the new "Always allow" button in the approval card, ZeroClaw remembers the decision in `<workspace>/state/approval_grants.db` and skips the approval prompt next time the same combination fires. Use `GET /api/approvals/grants` to inspect all grants or `DELETE /api/approvals/grants/{id}` to revoke a specific grant. The existing "Approve once" button remains unchanged.
+- **Approval card humanization**: approval cards optionally run a lightweight LLM summary (configurable via `[approval] summary_provider`, 10-second timeout with automatic fallback to the standard args summary on failure). The feature respects the same secret redaction rules as the task execution path.
+- **Channel approval cancellation**: `Channel::cancel_approval(approval_id, reason)` default no-op method added to the trait; the DawnIM channel implements it to clear pending cards when a fan-out loser cancels early.
+- **Identity reverse lookup**: `IdentityResolver::reverse_lookup(master_id, channel_ref)` added for proxy-approval routing; queries the existing identity bindings table to find a user's local channel-specific id when they lack a direct binding.
+
+## Changed
+
+- `ApprovalManager.session_allowlist` (in-memory `HashSet<String>` per-tool allowlist) **removed** in favor of per-`(channel, topic, user, tool)` persistent grants via `SqliteGrantStore`.
+- `ApprovalManager.audit_log` (in-memory `Vec<ApprovalLogEntry>`) and its `audit_log()` accessor **removed**. All approval decisions (approve, reject, reason, participants) now flow through `zeroclaw_log::record!` and land in `runtime-trace.jsonl` as the single source of truth. Query approval events via `LogFilter { action: Some("approve" | "reject"), .. }` or filter the JSONL directly with `jq '.action=="approve"'`.
+- `ChannelsConfig.superusers` docstring reframed: the field's role now spans both `/bind` whitelist seed and global tool approver. Non-superuser tool requests fan-out to all superusers in this list; the first non-timeout reply wins and the rest are cancelled.
+
+## Known Limitations
+
+- **Approval grant caching active on gateway, not in runtime**: Gateway `GET /api/approvals/grants` and approval lookups use a local `SqliteGrantStore` with LRU cache. The runtime-side `ApprovalManager` construction sites (13 sites across channels and orchestrator code) do not yet inject the shared `Arc<dyn ApprovalGrantStore>` at initialization, so the approval gate's cached-grant short-circuit at runtime is not operational. A follow-up PR will thread the `SqliteGrantStore` arc through all 13 sites so the runtime can skip approval prompts on cache hits.
+
 ## Security
 
 - **Canvas token theft (GHSA-f385-f6h2-3gqj)**: the dashboard Canvas iframe sandbox is tightened so injected content can no longer exfiltrate the pairing token (#6942).
