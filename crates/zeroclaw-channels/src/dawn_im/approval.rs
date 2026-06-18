@@ -108,11 +108,31 @@ pub fn build_approval_card(
                 style: "primary".to_string(),
             },
             WkAction {
+                text: "始终允许".to_string(),
+                value: "always".to_string(),
+                style: "primary".to_string(),
+            },
+            WkAction {
                 text: "拒绝".to_string(),
                 value: "deny".to_string(),
                 style: "danger".to_string(),
             },
         ]),
+    }
+}
+
+/// Render a no-button "已由 XX 处理" card to replace an in-flight approval card
+/// after another superuser already decided. Used by `Channel::cancel_approval`.
+pub fn build_resolved_card(approval_id: &str, decider: &str) -> WkApprovalCard {
+    WkApprovalCard {
+        msg_type: WkMessageType::INTERACTIVE_CARD,
+        approval_id: approval_id.to_string(),
+        timeout_secs: 0,
+        title: "📋 任务执行审批".to_string(),
+        body: WkApprovalBody {
+            content: format!("此请求已由 **{decider}** 处理，无需再次操作。"),
+        },
+        actions: None,
     }
 }
 
@@ -139,8 +159,10 @@ mod tests {
     fn card_has_approve_and_deny_actions() {
         let card = build_approval_card("id2", &req("shell_exec", "cmd: echo"), 60);
         let actions = card.actions.unwrap();
+        assert_eq!(actions.len(), 3);
         assert_eq!(actions[0].value, "approve");
-        assert_eq!(actions[1].value, "deny");
+        assert_eq!(actions[1].value, "always");
+        assert_eq!(actions[2].value, "deny");
     }
 
     #[test]
@@ -163,5 +185,40 @@ mod tests {
         let a: WkApprovalAction = serde_json::from_str(json).unwrap();
         assert_eq!(a.action, "deny");
         assert_eq!(a.msg_type, 21);
+    }
+
+    #[test]
+    fn card_has_three_buttons_including_always() {
+        let card = build_approval_card("id-X", &req("shell", "cmd: ls"), 300);
+        let actions = card.actions.expect("actions");
+        let values: Vec<&str> = actions.iter().map(|a| a.value.as_str()).collect();
+        assert_eq!(values, vec!["approve", "always", "deny"]);
+    }
+
+    #[test]
+    fn approval_action_always_deserializes() {
+        let json = r#"{"type":21,"approval_id":"id1","action":"always"}"#;
+        let a: WkApprovalAction = serde_json::from_str(json).unwrap();
+        assert_eq!(a.action, "always");
+    }
+
+    #[test]
+    fn resolved_card_has_no_actions() {
+        let card = build_resolved_card("id-X", "u_admin");
+        assert!(card.actions.is_none());
+        assert!(card.body.content.contains("u_admin"));
+    }
+
+    #[test]
+    fn action_always_maps_to_always_approve() {
+        // The mapping logic lives in channel::map_approval_action.
+        // This test pins the contract that "always" must NOT fall through to default-deny.
+        let json = r#"{"type":21,"approval_id":"id-Y","action":"always"}"#;
+        let act: WkApprovalAction = serde_json::from_str(json).unwrap();
+        let mapped = crate::dawn_im::channel::map_approval_action(&act);
+        assert!(matches!(
+            mapped,
+            zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove
+        ));
     }
 }

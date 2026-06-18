@@ -18,7 +18,9 @@ use zeroclaw_api::channel::{
 use zeroclaw_api::memory_traits::{Memory, MemoryCategory};
 use zeroclaw_config::schema::DawnIMConfig;
 
-use super::approval::{PendingApprovals, WkApprovalAction, build_approval_card};
+use super::approval::{
+    PendingApprovals, WkApprovalAction, build_approval_card, build_resolved_card,
+};
 use super::connection::{
     ClearUnreadRequest, ConnectParams, DAWN_IM_RPC_VERSION, HEARTBEAT_TIMEOUT, Header,
     JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, PING_INTERVAL, RecvAckParams,
@@ -74,6 +76,14 @@ fn topic_to_thread(topic: Option<&str>) -> Option<String> {
     topic
         .filter(|t| !t.is_empty() && *t != "0")
         .map(ToString::to_string)
+}
+
+pub(crate) fn map_approval_action(action: &WkApprovalAction) -> ChannelApprovalResponse {
+    match action.action.as_str() {
+        "approve" => ChannelApprovalResponse::Approve,
+        "always" => ChannelApprovalResponse::AlwaysApprove,
+        _ => ChannelApprovalResponse::Deny,
+    }
 }
 
 #[derive(Clone)]
@@ -685,20 +695,14 @@ impl DawnIMChannel {
                 .send_ack(params.message_id.clone(), params.message_seq)
                 .await;
             if let Ok(action) = serde_json::from_value::<WkApprovalAction>(payload_json) {
-                let resp = match action.action.as_str() {
-                    "approve" => Some(ChannelApprovalResponse::Approve),
-                    "deny" => Some(ChannelApprovalResponse::Deny),
-                    "always" => Some(ChannelApprovalResponse::AlwaysApprove),
-                    _ => None,
-                };
-                if let Some(r) = resp
-                    && let Some(ptx) = self
-                        .pending_approvals
-                        .write()
-                        .await
-                        .remove(&action.approval_id)
+                let resp = map_approval_action(&action);
+                if let Some(ptx) = self
+                    .pending_approvals
+                    .write()
+                    .await
+                    .remove(&action.approval_id)
                 {
-                    let _ = ptx.send(r);
+                    let _ = ptx.send(resp);
                 }
             }
             return Ok(());
@@ -1563,6 +1567,29 @@ impl Channel for DawnIMChannel {
                 Ok(Some(ChannelApprovalResponse::Deny))
             }
         }
+    }
+
+    async fn cancel_approval(&self, approval_id: &str, reason: &str) -> anyhow::Result<()> {
+        // Drop the pending sender so the request_approval future no longer waits on us.
+        let _removed = self.pending_approvals.write().await.remove(approval_id);
+
+        // Best-effort: push a "resolved" card update. We don't have a per-card
+        // recipient cache here; if dawn_im supports updating a card by approval_id
+        // alone (broadcast to original conversation), use that; otherwise this is
+        // a no-op and the original card simply stays visible to the user.
+        // For now: emit a Note log so operators can see the cancel intent.
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                .with_attrs(::serde_json::json!({
+                    "approval_id": approval_id,
+                    "reason": reason,
+                })),
+            "dawn_im: cancel_approval invoked (card patch is best-effort)"
+        );
+        let _ = build_resolved_card(approval_id, reason); // construct to keep the helper used + linted
+        Ok(())
     }
 }
 

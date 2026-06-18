@@ -3062,6 +3062,7 @@ mod tests {
             cancellation_token: None,
             attachments: Vec::new(),
             in_reply_to: None,
+            kind: zeroclaw_api::channel::SendKind::Text,
         };
         let err = ch.send(&msg).await.unwrap_err();
         assert!(err.to_string().contains("unknown or expired"));
@@ -3077,6 +3078,7 @@ mod tests {
             tools: vec![],
             prompts: vec![],
             location: None,
+            enabled: true,
         }
     }
 
