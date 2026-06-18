@@ -618,6 +618,27 @@ fn is_lark_invalid_access_token(body: &serde_json::Value) -> bool {
     extract_lark_response_code(body) == Some(LARK_INVALID_ACCESS_TOKEN_CODE)
 }
 
+/// Pick the Lark API `receive_id_type` for a recipient string by inspecting
+/// its prefix. Lark identifier conventions:
+///   - `ou_*`     → open_id (user)
+///   - `on_*`     → union_id (user, cross-tenant)
+///   - `oc_*`     → chat_id (group / 1-on-1 chat)
+///   - contains `@` → email
+///   - otherwise  → user_id (custom tenant-side id)
+fn lark_receive_id_type(recipient: &str) -> &'static str {
+    if recipient.starts_with("oc_") {
+        "chat_id"
+    } else if recipient.starts_with("ou_") {
+        "open_id"
+    } else if recipient.starts_with("on_") {
+        "union_id"
+    } else if recipient.contains('@') {
+        "email"
+    } else {
+        "user_id"
+    }
+}
+
 fn should_refresh_lark_tenant_token(status: reqwest::StatusCode, body: &serde_json::Value) -> bool {
     status == reqwest::StatusCode::UNAUTHORIZED || is_lark_invalid_access_token(body)
 }
@@ -2809,7 +2830,7 @@ impl Channel for LarkChannel {
         let url = self.send_message_url();
         let body = serde_json::json!({
             "receive_id": recipient,
-            "receive_id_type": "chat_id",
+            "receive_id_type": lark_receive_id_type(recipient),
             "msg_type": "interactive",
             "content": serde_json::to_string(&card)?,
         });
@@ -3507,10 +3528,9 @@ impl LarkChannel {
             }
         };
 
-        let chat_id = event_payload
-            .pointer("/context/open_chat_id")
-            .or_else(|| event_payload.pointer("/event/message/chat_id"))
-            .or_else(|| event_payload.pointer("/event/context/open_chat_id"))
+        let operator_open_id = event_payload
+            .pointer("/event/operator/open_id")
+            .or_else(|| event_payload.pointer("/operator/open_id"))
             .and_then(|v| v.as_str())
             .ok_or_else(|| {
                 ::zeroclaw_log::record!(
@@ -3518,16 +3538,16 @@ impl LarkChannel {
                     ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                         .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                         .with_attrs(::serde_json::json!({"approval_id": approval_id})),
-                    "card.action.trigger: missing chat_id in event payload"
+                    "card.action.trigger: missing operator.open_id in event payload"
                 );
-                anyhow::Error::msg("card.action.trigger: missing chat_id")
+                anyhow::Error::msg("card.action.trigger: missing operator.open_id")
             })?;
 
         let pending = self
             .pending_approvals
             .lock()
             .await
-            .remove(&(approval_id.to_string(), chat_id.to_string()));
+            .remove(&(approval_id.to_string(), operator_open_id.to_string()));
         let Some(pending) = pending else {
             ::zeroclaw_log::record!(
                 INFO,
@@ -3535,7 +3555,7 @@ impl LarkChannel {
                     .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
                     .with_attrs(::serde_json::json!({
                         "approval_id": approval_id,
-                        "chat_id": chat_id,
+                        "operator_open_id": operator_open_id,
                         "decision": format!("{decision:?}"),
                     })),
                 "Lark: card action for unknown/expired approval_id"
@@ -3596,25 +3616,19 @@ impl LarkChannel {
             return;
         }
 
-        // Extract chat_id from event payload for composite key lookup.
-        // In legacy dispatch path (HTTP callback), event shape mirrors WS
-        // `card.action.trigger` — context.open_chat_id should be present.
-        let chat_id = event
-            .pointer("/context/open_chat_id")
-            .or_else(|| event.pointer("/event/message/chat_id"))
-            .or_else(|| event.pointer("/event/context/open_chat_id"))
-            .and_then(|v| v.as_str());
-
-        let Some(chat_id_str) = chat_id else {
+        // Use operator open_id as composite key's second element.
+        // parse_card_action_trigger already extracted operator from
+        // `/operator/open_id` — this is the same identifier the broker
+        // passed as `recipient` when calling request_approval.
+        let Some(operator_id) = operator.as_ref() else {
             ::zeroclaw_log::record!(
                 WARN,
                 ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
                     .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                     .with_attrs(::serde_json::json!({
                         "approval_id": id,
-                        "operator": operator_str,
                     })),
-                "Lark: card action trigger missing chat_id in event payload"
+                "Lark: card action trigger missing operator.open_id in event payload"
             );
             return;
         };
@@ -3625,8 +3639,7 @@ impl LarkChannel {
                 .with_outcome(::zeroclaw_log::EventOutcome::Success)
                 .with_attrs(::serde_json::json!({
                     "approval_id": id,
-                    "chat_id": chat_id_str,
-                    "operator": operator_str,
+                    "operator": operator_id,
                     "decision": format!("{:?}", response),
                 })),
             "Lark: approval decision received"
@@ -3635,7 +3648,7 @@ impl LarkChannel {
             .pending_approvals
             .lock()
             .await
-            .remove(&(id.to_string(), chat_id_str.to_string()))
+            .remove(&(id.to_string(), operator_id.to_string()))
         {
             let _ = pending.sender.send(response);
         }
@@ -6264,9 +6277,9 @@ mod tests {
         let ch = make_channel();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let approval_id = "test-approval-1".to_string();
-        let chat_id = "oc_test_chat".to_string();
+        let operator_open_id = "ou_test_user".to_string();
         ch.pending_approvals.lock().await.insert(
-            (approval_id.clone(), chat_id.clone()),
+            (approval_id.clone(), operator_open_id.clone()),
             PendingApproval {
                 sender: tx,
                 message_id: String::new(),
@@ -6280,8 +6293,8 @@ mod tests {
                 "value": { "approval_id": approval_id, "decision": "approve" },
                 "tag": "button"
             },
-            "context": {
-                "open_chat_id": chat_id
+            "operator": {
+                "open_id": operator_open_id
             }
         });
         ch.handle_card_action_event(&event)
@@ -6301,9 +6314,9 @@ mod tests {
         let ch = make_channel();
         let (tx, rx) = tokio::sync::oneshot::channel();
         let approval_id = "test-v2-approval".to_string();
-        let chat_id = "oc_test_chat_v2".to_string();
+        let operator_open_id = "ou_test_user_v2".to_string();
         ch.pending_approvals.lock().await.insert(
-            (approval_id.clone(), chat_id.clone()),
+            (approval_id.clone(), operator_open_id.clone()),
             PendingApproval {
                 sender: tx,
                 message_id: String::new(),
@@ -6320,8 +6333,8 @@ mod tests {
                     "value": { "approval_id": approval_id, "decision": "always" }
                 }]
             },
-            "context": {
-                "open_chat_id": chat_id
+            "operator": {
+                "open_id": operator_open_id
             }
         });
         ch.handle_card_action_event(&event)
@@ -6338,8 +6351,8 @@ mod tests {
             "action": {
                 "value": { "approval_id": "never-existed", "decision": "deny" }
             },
-            "context": {
-                "open_chat_id": "oc_test_unknown"
+            "operator": {
+                "open_id": "ou_test_unknown"
             }
         });
         // Unknown approval IDs are dropped silently (info-log only); the
@@ -7067,11 +7080,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lark_request_approval_uses_broker_approval_id_when_provided() {
-        // We can't issue a real HTTP send_text_once here; instead, we exercise
-        // the part of request_approval that runs BEFORE the HTTP call: it
-        // expects the broker-provided approval_id to be used. Inspect the
-        // approval_id resolution logic directly via the request struct.
+    async fn lark_request_approval_id_resolution_logic() {
+        // NOTE: This test exercises the id-resolution expression alone, not
+        // the channel call. Full broker→lark id propagation is covered by the
+        // Task 6 integration test. We can't call request_approval here without
+        // a wiremock HTTP server; instead, we exercise the approval_id
+        // resolution logic that would run BEFORE the HTTP send.
         let req = zeroclaw_api::channel::ChannelApprovalRequest {
             tool_name: "shell".into(),
             arguments_summary: "ls".into(),
@@ -7095,7 +7109,7 @@ mod tests {
         let ch = build_test_lark_channel();
         let (tx, _rx) = tokio::sync::oneshot::channel();
         ch.pending_approvals.lock().await.insert(
-            ("uuid-X".to_string(), "oc_chat_1".to_string()),
+            ("uuid-X".to_string(), "ou_admin1".to_string()),
             PendingApproval {
                 sender: tx,
                 message_id: String::new(),
@@ -7104,7 +7118,7 @@ mod tests {
             },
         );
         let res = ch
-            .cancel_approval("uuid-X", "oc_chat_1", "此请求已被处理 — 同意")
+            .cancel_approval("uuid-X", "ou_admin1", "此请求已被处理 — 同意")
             .await;
         assert!(res.is_ok());
         let pending = ch.pending_approvals.lock().await;
@@ -7117,7 +7131,7 @@ mod tests {
         // No HTTP server stood up; if cancel_approval attempted to patch,
         // it would hit get_tenant_access_token() and fail.
         let res = ch
-            .cancel_approval("uuid-nope", "oc_chat_nope", "此请求已被处理 — 同意")
+            .cancel_approval("uuid-nope", "ou_nope", "此请求已被处理 — 同意")
             .await;
         assert!(
             res.is_ok(),
