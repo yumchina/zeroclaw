@@ -6,7 +6,7 @@
 //! Paired `/bind` codes are short-lived and live in memory only.
 
 use parking_lot::Mutex;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -33,6 +33,11 @@ pub trait IdentityResolver: Send + Sync {
 
     /// Remove a slave-channel binding. Returns `true` if a row was deleted.
     fn unbind(&self, channel_ref: &str, sender: &str) -> bool;
+
+    /// 反向解析：在指定 `channel_ref` 上找到 `master_id` 对应的本地 uid。
+    /// 用于审批 broker 把卡片送达 superuser。无绑定时返回 `None`，调用方应回退到
+    /// master_channel 上的 master_id 本身。
+    fn reverse_lookup(&self, master_id: &str, channel_ref: &str) -> Option<String>;
 }
 
 /// SQLite-backed identity store. Pairing codes are in-memory only.
@@ -148,7 +153,11 @@ impl IdentityResolver for SqliteIdentityStore {
     fn redeem_code(&self, code: &str, channel_ref: &str, sender: &str) -> Result<String, String> {
         let entry = self.codes.lock().remove(code);
         let (master_id, issued_at) = entry.ok_or_else(|| "绑定码无效或已被使用".to_string())?;
-        if issued_at.elapsed().map(|e| e > BIND_CODE_TTL).unwrap_or(true) {
+        if issued_at
+            .elapsed()
+            .map(|e| e > BIND_CODE_TTL)
+            .unwrap_or(true)
+        {
             return Err("绑定码已过期,请重新获取".to_string());
         }
         let conn = self.conn.lock();
@@ -169,6 +178,17 @@ impl IdentityResolver for SqliteIdentityStore {
         )
         .map(|n| n > 0)
         .unwrap_or(false)
+    }
+
+    fn reverse_lookup(&self, master_id: &str, channel_ref: &str) -> Option<String> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT sender FROM identity_mapping \
+             WHERE master_id = ?1 AND channel_ref = ?2 LIMIT 1",
+            params![master_id, channel_ref],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
     }
 }
 
@@ -249,7 +269,38 @@ mod tests {
     fn seed_superusers_is_idempotent() {
         let (_t, s) = store();
         s.seed_superusers(&["u_alice".to_string()]).unwrap();
-        s.seed_superusers(&["u_alice".to_string(), "u_bob".to_string()]).unwrap();
-        assert_eq!(s.resolve("dawnim.work", "u_bob", true), Some("u_bob".to_string()));
+        s.seed_superusers(&["u_alice".to_string(), "u_bob".to_string()])
+            .unwrap();
+        assert_eq!(
+            s.resolve("dawnim.work", "u_bob", true),
+            Some("u_bob".to_string())
+        );
+    }
+
+    #[test]
+    fn reverse_lookup_finds_bound_channel_uid() {
+        let (_t, s) = store();
+        s.seed_superusers(&["u_alice".to_string()]).unwrap();
+        let code = s.issue_code("u_alice").unwrap();
+        s.redeem_code(&code, "lark.work", "ou_aaa").unwrap();
+
+        assert_eq!(
+            s.reverse_lookup("u_alice", "lark.work"),
+            Some("ou_aaa".to_string())
+        );
+    }
+
+    #[test]
+    fn reverse_lookup_returns_none_when_no_binding() {
+        let (_t, s) = store();
+        s.seed_superusers(&["u_alice".to_string()]).unwrap();
+        assert!(s.reverse_lookup("u_alice", "telegram.default").is_none());
+    }
+
+    #[test]
+    fn reverse_lookup_returns_none_for_unknown_master_id() {
+        let (_t, s) = store();
+        s.seed_superusers(&["u_alice".to_string()]).unwrap();
+        assert!(s.reverse_lookup("u_nobody", "lark.work").is_none());
     }
 }
