@@ -9,7 +9,10 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use zeroclaw_runtime::approval::{ApprovalGrant, ApprovalGrantStore, GrantFilter};
+use zeroclaw_runtime::approval::{ApprovalGrantStore, GrantFilter};
+
+#[cfg(test)]
+use zeroclaw_runtime::approval::ApprovalGrant;
 
 #[derive(Clone)]
 pub struct ApprovalsState {
@@ -44,11 +47,20 @@ async fn list_grants(
     };
     match s.grants.list(&filter) {
         Ok(v) => (StatusCode::OK, Json(v)).into_response(),
-        Err(_e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "list failed"})),
-        )
-            .into_response(),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Query)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{:?}", e)})),
+                "list_grants failed"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "list failed"})),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -59,11 +71,20 @@ async fn delete_grant(
     match s.grants.delete(&id) {
         Ok(true) => (StatusCode::OK, Json(DeleteResp { deleted: true })).into_response(),
         Ok(false) => (StatusCode::NOT_FOUND, Json(DeleteResp { deleted: false })).into_response(),
-        Err(_e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": "delete failed"})),
-        )
-            .into_response(),
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Delete)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{:?}", e), "id": &id})),
+                "delete_grant failed"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": "delete failed"})),
+            )
+                .into_response()
+        }
     }
 }
 
