@@ -696,7 +696,7 @@ async fn safety_net_streaming_approval_deny_with_edit_round_trip() {
                 ev.get("event")
                     .and_then(|v| v.get("action"))
                     .and_then(|v| v.as_str()),
-                Some("approve" | "reject")
+                Some("approve" | "reject" | "defer")
             )
         })
         .expect("at least one approval decision recorded");

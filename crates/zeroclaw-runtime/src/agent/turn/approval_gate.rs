@@ -270,7 +270,7 @@ pub(crate) async fn gate_tool_approval(
 
             let decision_channel = ch
                 .last_decision_channel()
-                .unwrap_or_else(|| ctx.channel_name.to_string());
+                .unwrap_or_else(|| ch.name().to_string());
 
             mgr.record_decision(
                 tool_name,
