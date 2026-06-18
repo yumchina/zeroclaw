@@ -15,6 +15,7 @@
 pub mod acp;
 pub mod agent_owned_state;
 pub mod api;
+pub mod api_approvals;
 pub mod api_browse;
 pub mod api_config;
 pub mod api_logs;
@@ -548,6 +549,9 @@ pub struct AppState {
     pub sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     /// Shared SOP audit logger from the daemon (for WS agent sessions).
     pub sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    /// Persistent approval grant store shared with runtime ApprovalManager.
+    /// `None` when the gateway runs standalone without a daemon.
+    pub approval_grants: Option<Arc<dyn zeroclaw_runtime::approval::ApprovalGrantStore>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -567,6 +571,8 @@ pub async fn run_gateway(
     // Shared SOP engine from the daemon. `None` when standalone — sessions build their own.
     sop_engine: Option<Arc<std::sync::Mutex<zeroclaw_runtime::sop::SopEngine>>>,
     sop_audit: Option<Arc<zeroclaw_runtime::sop::SopAuditLogger>>,
+    // Shared approval grant store from the daemon. `None` when standalone.
+    approval_grants: Option<Arc<dyn zeroclaw_runtime::approval::ApprovalGrantStore>>,
 ) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host)
@@ -1525,6 +1531,7 @@ pub async fn run_gateway(
         tui_registry,
         sop_engine,
         sop_audit,
+        approval_grants,
         #[cfg(feature = "webauthn")]
         webauthn: if config.security.webauthn.enabled {
             let secret_store = Arc::new(zeroclaw_runtime::security::SecretStore::new(
@@ -1815,6 +1822,14 @@ pub async fn run_gateway(
     // of the 30s gateway-wide TimeoutLayer. Layers attached here travel with
     // the route through `merge`, so only this endpoint sees the longer
     // timeout.
+    // Approval grants API router (only when approval_grants store is present)
+    let inner = if let Some(grants) = state.approval_grants.clone() {
+        let approvals_state = api_approvals::ApprovalsState { grants };
+        inner.merge(api_approvals::router(approvals_state))
+    } else {
+        inner
+    };
+
     let cron_run_router: Router = Router::new()
         .route("/api/cron/{id}/run", post(api::handle_api_cron_run))
         .with_state(state)
@@ -4359,6 +4374,7 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            approval_grants: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
@@ -4754,7 +4770,7 @@ mod tests {
         // the spawn: a still-running task at the deadline means boot
         // got far enough to start serving.
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
+            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None, None).await
         });
 
         match tokio::time::timeout(
@@ -4818,7 +4834,7 @@ mod tests {
         config.agents.insert("fake123".to_string(), agent);
 
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
+            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None, None).await
         });
 
         match tokio::time::timeout(
@@ -4859,7 +4875,7 @@ mod tests {
         );
 
         let handle = zeroclaw_spawn::spawn!(async move {
-            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None).await
+            run_gateway("127.0.0.1", 0, config, None, None, None, None, None, None, None).await
         });
 
         match tokio::time::timeout(
@@ -4944,6 +4960,7 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            approval_grants: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -5030,6 +5047,7 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            approval_grants: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -5621,6 +5639,7 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            approval_grants: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -5725,6 +5744,7 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            approval_grants: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -5844,6 +5864,7 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            approval_grants: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -5944,6 +5965,7 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            approval_grants: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6062,6 +6084,7 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            approval_grants: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6146,6 +6169,7 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            approval_grants: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6235,6 +6259,7 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            approval_grants: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6331,6 +6356,7 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            approval_grants: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6423,6 +6449,7 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            approval_grants: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -6565,6 +6592,7 @@ mod tests {
             cancel_tokens: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             sop_engine: None,
             sop_audit: None,
+            approval_grants: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -7401,6 +7429,7 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            approval_grants: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }
@@ -7486,6 +7515,7 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            approval_grants: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -7645,6 +7675,7 @@ mod tests {
             tui_registry: None,
             sop_engine: None,
             sop_audit: None,
+            approval_grants: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }

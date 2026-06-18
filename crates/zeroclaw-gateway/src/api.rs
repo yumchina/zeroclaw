@@ -2132,6 +2132,7 @@ mod tests {
             reload_tx: None,
             sop_engine: None,
             sop_audit: None,
+            approval_grants: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         }

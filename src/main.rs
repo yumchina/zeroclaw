@@ -3901,14 +3901,25 @@ async fn main() -> Result<()> {
                     (None, None)
                 };
 
+                // Build approval grant store per iteration. This store is shared
+                // between the gateway (for /api/approvals/grants endpoints) and
+                // the runtime (ApprovalManager/Broker for persistent grants).
+                let approval_grants: Option<Arc<dyn zeroclaw_runtime::approval::ApprovalGrantStore>> =
+                    Some(Arc::new(
+                        zeroclaw_runtime::approval::SqliteGrantStore::new(&current_config.data_dir)
+                            .context("init approval grant store")?,
+                    ));
+
                 #[cfg(feature = "gateway")]
                 registry.register_gateway(Box::new({
                     let sop_e = sop_engine.clone();
                     let sop_a = sop_audit.clone();
+                    let grants = approval_grants.clone();
                     move |host, port, config, tx, reload_tx, tui_registry| {
                         let canvas_store = canvas_store_for_gateway.clone();
                         let sop_engine = sop_e.clone();
                         let sop_audit = sop_a.clone();
+                        let approval_grants = grants.clone();
                         Box::pin(async move {
                             Box::pin(zeroclaw_gateway::run_gateway(
                                 &host,
@@ -3920,6 +3931,7 @@ async fn main() -> Result<()> {
                                 Some(canvas_store),
                                 sop_engine,
                                 sop_audit,
+                                approval_grants,
                             ))
                             .await
                         })
