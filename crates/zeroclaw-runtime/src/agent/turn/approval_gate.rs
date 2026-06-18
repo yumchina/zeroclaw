@@ -29,7 +29,7 @@ fn read_origin() -> zeroclaw_api::channel::ChannelOrigin {
 }
 
 /// Map `ApprovalResponse` → decision reason constant.
-fn cli_reason_for(decision: &ApprovalResponse) -> &'static str {
+fn decision_reason_for(decision: &ApprovalResponse) -> &'static str {
     match decision {
         ApprovalResponse::Yes => INTERACTIVE_APPROVE,
         ApprovalResponse::Always => INTERACTIVE_ALWAYS,
@@ -38,8 +38,8 @@ fn cli_reason_for(decision: &ApprovalResponse) -> &'static str {
     }
 }
 
-/// Map CLI `ApprovalResponse` → `ApprovalGateOutcome`.
-fn cli_decision_to_outcome(decision: ApprovalResponse, _tool_name: &str) -> ApprovalGateOutcome {
+/// Map `ApprovalResponse` → `ApprovalGateOutcome`.
+fn decision_to_outcome(decision: ApprovalResponse, _tool_name: &str) -> ApprovalGateOutcome {
     match decision {
         ApprovalResponse::No => {
             let denied = "Denied by user.".to_string();
@@ -167,7 +167,9 @@ pub(crate) async fn gate_tool_approval(
         return ApprovalGateOutcome::Proceed { approved: false };
     };
 
-    // Broker path: if broker is attached, route through it.
+    // 3-way decision tree: broker → channel → CLI
+
+    // 1. Broker path: if broker is attached, route through it.
     if let Some(broker) = mgr.broker() {
         let req_ctx = BrokerRequestCtx {
             tool_name,
@@ -181,7 +183,71 @@ pub(crate) async fn gate_tool_approval(
         return map_broker_decision(decision, mgr, tool_name, tool_args, ctx, iteration);
     }
 
-    // CLI fallback path: no broker, use CLI prompt.
+    // 2. Channel path: non-interactive with channel support.
+    if mgr.is_non_interactive() {
+        if let Some(ch) = ctx.channel {
+            let ch_request = zeroclaw_api::channel::ChannelApprovalRequest {
+                tool_name: tool_name.to_string(),
+                arguments_summary: crate::approval::summarize_args(tool_args),
+                raw_arguments: Some(tool_args.clone()),
+                thread_ts: origin.topic.clone(),
+            };
+            let recipient = ctx.channel_reply_target.unwrap_or_default();
+
+            let channel_decision = match ch.request_approval(recipient, &ch_request).await {
+                Ok(Some(r)) => r,
+                Ok(None) => {
+                    // Channel doesn't support approval — auto-deny.
+                    zeroclaw_api::channel::ChannelApprovalResponse::Deny
+                }
+                Err(e) => {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(
+                            module_path!(),
+                            ::zeroclaw_log::Action::Note
+                        )
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                        "Channel approval request failed"
+                    );
+                    zeroclaw_api::channel::ChannelApprovalResponse::Deny
+                }
+            };
+
+            let decision = match channel_decision {
+                zeroclaw_api::channel::ChannelApprovalResponse::Approve => {
+                    ApprovalResponse::Yes
+                }
+                zeroclaw_api::channel::ChannelApprovalResponse::AlwaysApprove => {
+                    ApprovalResponse::Always
+                }
+                zeroclaw_api::channel::ChannelApprovalResponse::Deny => {
+                    ApprovalResponse::No
+                }
+                zeroclaw_api::channel::ChannelApprovalResponse::DenyWithEdit {
+                    replacement,
+                } => ApprovalResponse::ReplaceWith(replacement),
+            };
+
+            let decision_channel = ch
+                .last_decision_channel()
+                .unwrap_or_else(|| ctx.channel_name.to_string());
+
+            mgr.record_decision(
+                tool_name,
+                tool_args,
+                &decision,
+                &decision_channel,
+                decision_reason_for(&decision),
+                serde_json::json!({}),
+            );
+
+            return decision_to_outcome(decision, tool_name);
+        }
+    }
+
+    // 3. CLI fallback path: interactive or no channel available.
     let request = ApprovalRequest {
         tool_name: tool_name.to_string(),
         arguments: tool_args.clone(),
@@ -193,7 +259,7 @@ pub(crate) async fn gate_tool_approval(
         tool_args,
         &decision,
         ctx.channel_name,
-        cli_reason_for(&decision),
+        decision_reason_for(&decision),
         serde_json::json!({}),
     );
 
@@ -219,5 +285,5 @@ pub(crate) async fn gate_tool_approval(
         }
     }
 
-    cli_decision_to_outcome(decision, tool_name)
+    decision_to_outcome(decision, tool_name)
 }
