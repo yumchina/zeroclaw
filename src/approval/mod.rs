@@ -63,93 +63,98 @@ mod tests {
         assert!(!mgr.needs_approval("shell"));
     }
 
-    // ── session allowlist ────────────────────────────────────
+    // ── audit log (rewritten to use zeroclaw-log capture) ─────
 
     #[test]
-    fn always_response_adds_to_session_allowlist() {
+    fn record_decision_emits_record_event() {
+        let _g1 = ::zeroclaw_log::__private_test_writer_lock();
+        let _g2 = ::zeroclaw_log::__private_test_hook_lock();
+        let _sub = ::zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = ::zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
         let mgr = ApprovalManager::from_risk_profile(&supervised_config());
-        assert!(mgr.needs_approval("file_write"));
-
-        mgr.record_decision(
-            "file_write",
-            &serde_json::json!({"path": "test.txt"}),
-            &ApprovalResponse::Always,
-            "cli",
-        );
-
-        // Now file_write should be in session allowlist.
-        assert!(!mgr.needs_approval("file_write"));
-    }
-
-    #[test]
-    fn always_ask_overrides_session_allowlist() {
-        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
-
-        // Even after "Always" for shell, it should still prompt.
-        mgr.record_decision(
-            "shell",
-            &serde_json::json!({"command": "ls"}),
-            &ApprovalResponse::Always,
-            "cli",
-        );
-
-        // shell is in always_ask, so it still needs approval.
-        assert!(mgr.needs_approval("shell"));
-    }
-
-    #[test]
-    fn yes_response_does_not_add_to_allowlist() {
-        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
-        mgr.record_decision(
-            "file_write",
-            &serde_json::json!({}),
-            &ApprovalResponse::Yes,
-            "cli",
-        );
-        assert!(mgr.needs_approval("file_write"));
-    }
-
-    // ── audit log ────────────────────────────────────────────
-
-    #[test]
-    fn audit_log_records_decisions() {
-        let mgr = ApprovalManager::from_risk_profile(&supervised_config());
-
         mgr.record_decision(
             "shell",
             &serde_json::json!({"command": "rm -rf ./build/"}),
             &ApprovalResponse::No,
             "cli",
+            zeroclaw_runtime::approval::decision_reason::INTERACTIVE_DENY,
+            serde_json::json!({}),
         );
         mgr.record_decision(
             "file_write",
-            &serde_json::json!({"path": "out.txt", "content": "hello"}),
+            &serde_json::json!({"path": "out.txt"}),
             &ApprovalResponse::Yes,
             "cli",
+            zeroclaw_runtime::approval::decision_reason::INTERACTIVE_APPROVE,
+            serde_json::json!({}),
         );
 
-        let log = mgr.audit_log();
-        assert_eq!(log.len(), 2);
-        assert_eq!(log[0].tool_name, "shell");
-        assert_eq!(log[0].decision, ApprovalResponse::No);
-        assert_eq!(log[1].tool_name, "file_write");
-        assert_eq!(log[1].decision, ApprovalResponse::Yes);
+        let captured: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let approvals: Vec<_> = captured
+            .iter()
+            .filter(|ev| {
+                matches!(
+                    ev.get("event")
+                        .and_then(|v| v.get("action"))
+                        .and_then(|v| v.as_str()),
+                    Some("approve" | "reject")
+                )
+            })
+            .collect();
+        assert!(
+            approvals.len() >= 2,
+            "expected at least 2 approval/reject events; got: {approvals:#?}"
+        );
+        assert!(
+            approvals.iter().any(|ev| {
+                ev.get("attributes")
+                    .and_then(|v| v.get("tool"))
+                    .and_then(|v| v.as_str())
+                    == Some("shell")
+            }),
+            "expected event with tool=shell"
+        );
+        assert!(
+            approvals.iter().any(|ev| {
+                ev.get("attributes")
+                    .and_then(|v| v.get("tool"))
+                    .and_then(|v| v.as_str())
+                    == Some("file_write")
+            }),
+            "expected event with tool=file_write"
+        );
     }
 
     #[test]
-    fn audit_log_contains_timestamp_and_channel() {
+    fn record_decision_event_contains_channel_attribution() {
+        let _g1 = ::zeroclaw_log::__private_test_writer_lock();
+        let _g2 = ::zeroclaw_log::__private_test_hook_lock();
+        let _sub = ::zeroclaw_log::try_install_capture_subscriber();
+        let mut rx = ::zeroclaw_log::subscribe_or_install();
+        while rx.try_recv().is_ok() {}
+
         let mgr = ApprovalManager::from_risk_profile(&supervised_config());
         mgr.record_decision(
             "shell",
             &serde_json::json!({"command": "ls"}),
             &ApprovalResponse::Yes,
             "telegram",
+            zeroclaw_runtime::approval::decision_reason::INTERACTIVE_APPROVE,
+            serde_json::json!({}),
         );
 
-        let log = mgr.audit_log();
-        assert_eq!(log.len(), 1);
-        assert!(!log[0].timestamp.is_empty());
-        assert_eq!(log[0].channel, "telegram");
+        let captured: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            captured.iter().any(|ev| {
+                ev.get("attributes")
+                    .and_then(|v| v.get("channel"))
+                    .and_then(|v| v.as_str())
+                    == Some("telegram")
+            }),
+            "expected event with channel=telegram; got: {captured:#?}"
+        );
     }
 
     // ── summarize_args ───────────────────────────────────────

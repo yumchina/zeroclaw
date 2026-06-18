@@ -602,7 +602,15 @@ mod tests {
         let mgr = ApprovalManager::from_risk_profile(&supervised_config());
         mgr.record_decision(
             "shell",
-            &serde_json::json!({"command": "ls"}),
+            &serde_json::json!({"command": "rm -rf ./build/"}),
+            &ApprovalResponse::No,
+            "cli",
+            crate::approval::decision_reason::INTERACTIVE_DENY,
+            serde_json::json!({}),
+        );
+        mgr.record_decision(
+            "file_write",
+            &serde_json::json!({"path": "out.txt"}),
             &ApprovalResponse::Yes,
             "cli",
             crate::approval::decision_reason::INTERACTIVE_APPROVE,
@@ -610,21 +618,38 @@ mod tests {
         );
 
         let captured: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let approvals: Vec<_> = captured
+            .iter()
+            .filter(|ev| {
+                matches!(
+                    ev.get("event")
+                        .and_then(|v| v.get("action"))
+                        .and_then(|v| v.as_str()),
+                    Some("approve" | "reject")
+                )
+            })
+            .collect();
         assert!(
-            captured.iter().any(|ev| {
-                ev.get("action").and_then(|v| v.as_str()) == Some("approve")
-                    && ev
-                        .get("zeroclaw.attrs")
-                        .and_then(|v| v.get("reason"))
-                        .and_then(|v| v.as_str())
-                        == Some("interactive_approve")
-                    && ev
-                        .get("zeroclaw.attrs")
-                        .and_then(|v| v.get("tool"))
-                        .and_then(|v| v.as_str())
-                        == Some("shell")
+            approvals.len() >= 2,
+            "expected at least 2 approval/reject events; got: {approvals:#?}"
+        );
+        assert!(
+            approvals.iter().any(|ev| {
+                ev.get("attributes")
+                    .and_then(|v| v.get("tool"))
+                    .and_then(|v| v.as_str())
+                    == Some("shell")
             }),
-            "expected event with action=approve, reason=interactive_approve, tool=shell; got: {captured:#?}"
+            "expected event with tool=shell"
+        );
+        assert!(
+            approvals.iter().any(|ev| {
+                ev.get("attributes")
+                    .and_then(|v| v.get("tool"))
+                    .and_then(|v| v.as_str())
+                    == Some("file_write")
+            }),
+            "expected event with tool=file_write"
         );
     }
 

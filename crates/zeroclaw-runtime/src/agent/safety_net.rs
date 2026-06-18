@@ -598,6 +598,12 @@ async fn safety_net_streaming_approval_deny_with_edit_round_trip() {
         }
     }
 
+    let _g1 = ::zeroclaw_log::__private_test_writer_lock();
+    let _g2 = ::zeroclaw_log::__private_test_hook_lock();
+    let _sub = ::zeroclaw_log::try_install_capture_subscriber();
+    let mut event_rx = ::zeroclaw_log::subscribe_or_install();
+    while event_rx.try_recv().is_ok() {}
+
     let exec_count = Arc::new(AtomicUsize::new(0));
     let requests = Arc::new(AtomicUsize::new(0));
     let seen_summary = Arc::new(parking_lot::Mutex::new(None));
@@ -681,10 +687,25 @@ async fn safety_net_streaming_approval_deny_with_edit_round_trip() {
     // here is "edit-channel"; the consolidated streaming wrapper passes the
     // loop a static channel name of "cli", so without per-channel attribution
     // the entry would read "cli" — affirmatively wrong. Pin the real channel.
-    let log = approval_mgr.audit_log();
-    let entry = log.last().expect("a decision must be recorded");
+    let captured_events: Vec<_> = std::iter::from_fn(|| event_rx.try_recv().ok()).collect();
+    let approval_event = captured_events
+        .iter()
+        .rev()
+        .find(|ev| {
+            matches!(
+                ev.get("event")
+                    .and_then(|v| v.get("action"))
+                    .and_then(|v| v.as_str()),
+                Some("approve" | "reject")
+            )
+        })
+        .expect("at least one approval decision recorded");
     assert_eq!(
-        entry.channel, "edit-channel",
+        approval_event
+            .get("attributes")
+            .and_then(|v| v.get("channel"))
+            .and_then(|v| v.as_str()),
+        Some("edit-channel"),
         "approval audit must attribute the deciding back-channel, not the loop's static \"cli\""
     );
 }
