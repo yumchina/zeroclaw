@@ -46,6 +46,7 @@ fn decision_to_outcome(
     tool_args: &serde_json::Value,
     ctx: &TurnCtx<'_>,
     iteration: usize,
+    channel: &str,
 ) -> ApprovalGateOutcome {
     use super::redact::scrub_credentials;
 
@@ -63,6 +64,7 @@ fn decision_to_outcome(
                         "arguments": scrub_credentials(&tool_args.to_string()),
                         "result": denied,
                         "trace_id": ctx.turn_id,
+                        "channel": channel,
                     })),
                 "tool_call_result"
             );
@@ -87,6 +89,7 @@ fn decision_to_outcome(
                         "arguments": scrub_credentials(&tool_args.to_string()),
                         "result": sanitized,
                         "trace_id": ctx.turn_id,
+                        "channel": channel,
                     })),
                 "tool_call_result"
             );
@@ -281,7 +284,7 @@ pub(crate) async fn gate_tool_approval(
                 serde_json::json!({}),
             );
 
-            return decision_to_outcome(decision, tool_name, tool_args, ctx, iteration);
+            return decision_to_outcome(decision, tool_name, tool_args, ctx, iteration, &decision_channel);
         }
     }
 
@@ -323,5 +326,5 @@ pub(crate) async fn gate_tool_approval(
         }
     }
 
-    decision_to_outcome(decision, tool_name, tool_args, ctx, iteration)
+    decision_to_outcome(decision, tool_name, tool_args, ctx, iteration, ctx.channel_name)
 }
