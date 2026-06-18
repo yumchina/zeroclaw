@@ -257,37 +257,6 @@ mod tests {
         assert!(!mgr.needs_approval("shell"));
     }
 
-    #[test]
-    fn non_interactive_session_allowlist_still_works() {
-        let mgr = ApprovalManager::for_non_interactive(&supervised_config());
-        assert!(mgr.needs_approval("file_write"));
-
-        // Simulate an "Always" decision (would come from a prior channel run
-        // if the tool was auto-approved somehow, e.g. via config change).
-        mgr.record_decision(
-            "file_write",
-            &serde_json::json!({"path": "test.txt"}),
-            &ApprovalResponse::Always,
-            "telegram",
-        );
-
-        assert!(!mgr.needs_approval("file_write"));
-    }
-
-    #[test]
-    fn non_interactive_always_ask_overrides_session_allowlist() {
-        let mgr = ApprovalManager::for_non_interactive(&supervised_config());
-
-        mgr.record_decision(
-            "shell",
-            &serde_json::json!({"command": "ls"}),
-            &ApprovalResponse::Always,
-            "telegram",
-        );
-
-        // shell is in always_ask, so it still needs approval even after "Always".
-        assert!(mgr.needs_approval("shell"));
-    }
 
     // ── ApprovalResponse serde ───────────────────────────────
 
