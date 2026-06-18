@@ -213,6 +213,17 @@ impl WuKongIMChannel {
         }
     }
 
+    async fn send_params_fire_and_forget(&self, params: SendParams) -> anyhow::Result<()> {
+        let req = JsonRpcRequest {
+            jsonrpc: WUKONGIM_RPC_VERSION.to_string(),
+            method: "send".to_string(),
+            id: Uuid::new_v4().to_string(),
+            params,
+        };
+        let msg = serde_json::to_string(&req)?;
+        self.send_ws_frame(WsMsg::Text(msg.into())).await
+    }
+
     async fn send_ack(&self, message_id: String, message_seq: u32) -> anyhow::Result<()> {
         let req = JsonRpcNotification {
             jsonrpc: WUKONGIM_RPC_VERSION.to_string(),
@@ -1172,8 +1183,7 @@ impl WuKongIMChannel {
             stream_no: None,
             topic: None,
         };
-        let _: serde_json::Value = self.send_rpc("send", params).await?;
-        Ok(())
+        self.send_params_fire_and_forget(params).await
     }
 
     /// Send a structured "application command" message.
@@ -1226,7 +1236,7 @@ impl WuKongIMChannel {
             stream_no: None,
             topic,
         };
-        let _: serde_json::Value = self.send_rpc("send", params).await?;
+        self.send_params_fire_and_forget(params).await?;
         tracing::info!(
             channel_id = %channel_id,
             channel_type,
@@ -1552,15 +1562,8 @@ impl Channel for WuKongIMChannel {
             topic,
         };
 
-        let req = JsonRpcRequest {
-            jsonrpc: WUKONGIM_RPC_VERSION.to_string(),
-            method: "send".to_string(),
-            id: Uuid::new_v4().to_string(),
-            params,
-        };
-        let msg = serde_json::to_string(&req)?;
-        match self.send_ws_frame(WsMsg::Text(msg.into())).await {
-            Ok(_) => {
+        match self.send_params_fire_and_forget(params).await {
+            Ok(()) => {
                 if let Err(e) = self.remove_from_pending_outbound(message).await {
                     tracing::debug!("WuKongIM: remove_from_pending_outbound: {}", e);
                 }
@@ -1863,12 +1866,11 @@ impl Channel for WuKongIMChannel {
                     if let Ok(msg) = serde_json::to_string(&ping) {
                         self.send_ws_frame(WsMsg::Text(msg.into())).await?;
                     }
-                    self.send_ws_frame(WsMsg::Ping(Default::default())).await?;
                 }
                 frame = read.next() => {
                     let frame = frame.ok_or_else(|| anyhow::anyhow!("WuKongIM: stream closed"))??;
-                    last_activity = Instant::now();
                     let WsMsg::Text(text) = frame else { continue; };
+                    last_activity = Instant::now();
                     let val: serde_json::Value = serde_json::from_str(&text)?;
 
                     if val.get("method").and_then(|m| m.as_str()) == Some("pong") { continue; }
@@ -1967,8 +1969,7 @@ impl Channel for WuKongIMChannel {
                 recipient: recipient_key,
             },
         );
-        self.send_rpc::<_, serde_json::Value>("send", params)
-            .await?;
+        self.send_params_fire_and_forget(params).await?;
         match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), orx).await {
             Ok(Ok(resp)) => Ok(Some(resp)),
             _ => {
@@ -2028,8 +2029,7 @@ impl Channel for WuKongIMChannel {
             .write()
             .await
             .insert(approval_id.clone(), otx);
-        self.send_rpc::<_, serde_json::Value>("send", params)
-            .await?;
+        self.send_params_fire_and_forget(params).await?;
         match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), orx).await {
             Ok(Ok(resp)) => Ok(Some(resp)),
             _ => {
