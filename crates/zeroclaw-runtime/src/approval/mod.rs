@@ -271,8 +271,8 @@ impl ApprovalManager {
                 ::zeroclaw_log::EventOutcome::Failure,
             ),
             ApprovalResponse::ReplaceWith(_) => (
-                ::zeroclaw_log::Action::Reject,
-                ::zeroclaw_log::EventOutcome::Failure,
+                ::zeroclaw_log::Action::Defer,
+                ::zeroclaw_log::EventOutcome::Success,
             ),
         };
 
@@ -625,13 +625,13 @@ mod tests {
                     ev.get("event")
                         .and_then(|v| v.get("action"))
                         .and_then(|v| v.as_str()),
-                    Some("approve" | "reject")
+                    Some("approve" | "reject" | "defer")
                 )
             })
             .collect();
         assert!(
             approvals.len() >= 2,
-            "expected at least 2 approval/reject events; got: {approvals:#?}"
+            "expected at least 2 approval/reject/defer events; got: {approvals:#?}"
         );
         assert!(
             approvals.iter().any(|ev| {

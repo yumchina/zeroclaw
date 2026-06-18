@@ -38,11 +38,34 @@ fn decision_reason_for(decision: &ApprovalResponse) -> &'static str {
     }
 }
 
-/// Map `ApprovalResponse` → `ApprovalGateOutcome`.
-fn decision_to_outcome(decision: ApprovalResponse, _tool_name: &str) -> ApprovalGateOutcome {
+/// Map `ApprovalResponse` → `ApprovalGateOutcome`, emitting tool_call_result
+/// audit events for Deny/Replace.
+fn decision_to_outcome(
+    decision: ApprovalResponse,
+    tool_name: &str,
+    tool_args: &serde_json::Value,
+    ctx: &TurnCtx<'_>,
+    iteration: usize,
+) -> ApprovalGateOutcome {
+    use super::redact::scrub_credentials;
+
     match decision {
         ApprovalResponse::No => {
             let denied = "Denied by user.".to_string();
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "model": ctx.model,
+                        "iteration": iteration + 1,
+                        "tool": tool_name,
+                        "arguments": scrub_credentials(&tool_args.to_string()),
+                        "result": denied,
+                        "trace_id": ctx.turn_id,
+                    })),
+                "tool_call_result"
+            );
             ApprovalGateOutcome::Deny(ToolExecutionOutcome {
                 output: denied.clone(),
                 success: false,
@@ -52,8 +75,23 @@ fn decision_to_outcome(decision: ApprovalResponse, _tool_name: &str) -> Approval
             })
         }
         ApprovalResponse::ReplaceWith(replacement) => {
+            let sanitized = crate::approval::sanitize_tool_replacement(&replacement);
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Defer)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                    .with_attrs(::serde_json::json!({
+                        "model": ctx.model,
+                        "iteration": iteration + 1,
+                        "tool": tool_name,
+                        "arguments": scrub_credentials(&tool_args.to_string()),
+                        "result": sanitized,
+                        "trace_id": ctx.turn_id,
+                    })),
+                "tool_call_result"
+            );
             ApprovalGateOutcome::Replace(ToolExecutionOutcome {
-                output: crate::approval::sanitize_tool_replacement(&replacement),
+                output: sanitized,
                 success: true,
                 error_reason: None,
                 duration: Duration::ZERO,
@@ -243,7 +281,7 @@ pub(crate) async fn gate_tool_approval(
                 serde_json::json!({}),
             );
 
-            return decision_to_outcome(decision, tool_name);
+            return decision_to_outcome(decision, tool_name, tool_args, ctx, iteration);
         }
     }
 
@@ -285,5 +323,5 @@ pub(crate) async fn gate_tool_approval(
         }
     }
 
-    decision_to_outcome(decision, tool_name)
+    decision_to_outcome(decision, tool_name, tool_args, ctx, iteration)
 }
