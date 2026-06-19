@@ -1,5 +1,6 @@
 // src/channel.rs
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1674,10 +1675,39 @@ impl Channel for WuKongIMChannel {
 
         // 2. Connect WebSocket
         tracing::info!("WuKongIM: connecting to {}", self.ws_url);
-        let (ws_stream, _) = tokio::time::timeout(
-            Duration::from_secs(10),
-            tokio_tungstenite::connect_async(&self.ws_url)
-        ).await
+        let ws_stream = tokio::time::timeout(Duration::from_secs(10), async {
+            let url = url::Url::parse(&self.ws_url)
+                .map_err(|e| anyhow::anyhow!("WuKongIM: invalid ws_url: {e}"))?;
+            let host = url.host_str().ok_or_else(|| anyhow::anyhow!("WuKongIM: missing host"))?;
+            let port = url.port_or_known_default().ok_or_else(|| anyhow::anyhow!("WuKongIM: missing port"))?;
+            let addr: SocketAddr = tokio::net::lookup_host((host, port))
+                .await
+                .map_err(|e| anyhow::anyhow!("WuKongIM: DNS lookup failed: {e}"))?
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("WuKongIM: DNS returned no addresses"))?;
+
+            let socket = socket2::Socket::new(
+                socket2::Domain::for_address(addr),
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )?;
+            socket.set_keepalive(true)?;
+            socket.set_tcp_keepalive(
+                &socket2::TcpKeepalive::new()
+                    .with_time(Duration::from_secs(10))
+                    .with_interval(Duration::from_secs(5)),
+            )?;
+            socket.set_nonblocking(true)?;
+            socket.connect(&addr.into()).ok();
+            let tcp = tokio::net::TcpStream::from_std(std::net::TcpStream::from(socket))?;
+            tcp.writable().await?;
+
+            let stream = tokio_tungstenite::MaybeTlsStream::Plain(tcp);
+            let (ws, _) = tokio_tungstenite::client_async(&self.ws_url, stream).await
+                .map_err(|e| anyhow::anyhow!("WuKongIM: WebSocket handshake failed: {e}"))?;
+            anyhow::Ok(ws)
+        })
+        .await
         .map_err(|_| anyhow::anyhow!("WuKongIM WebSocket connection timed out"))??;
         let (write, mut read) = ws_stream.split();
         *self.ws_sink.write().await = Some(write);

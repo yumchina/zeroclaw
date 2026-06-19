@@ -52,6 +52,13 @@ use tracing_subscriber::{
 };
 use zeroclaw_config::api_error::{ConfigApiCode, ConfigApiError};
 
+struct LocalTimer;
+impl tracing_subscriber::fmt::time::FormatTime for LocalTimer {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        write!(w, "{}", chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.6f%:z"))
+    }
+}
+
 /// Decorate the value at `path` in `config.toml` with a leading `# {comment}`
 /// line, preserving any non-comment whitespace. Mirrors the gateway's
 /// `apply_comments`. Best-effort — silently bails on parse errors so a
@@ -1325,7 +1332,7 @@ fn init_logging(
         );
     }
 
-    let stderr_layer = fmt::layer().with_writer(std::io::stderr);
+    let stderr_layer = fmt::layer().with_timer(LocalTimer).with_writer(std::io::stderr);
     let mut guards: Vec<WorkerGuard> = Vec::new();
 
     let out_layer = cfg
@@ -1337,7 +1344,7 @@ fn init_logging(
                 Ok(w) => {
                     let (nb, guard) = tracing_appender::non_blocking(w);
                     guards.push(guard);
-                    Some(fmt::layer().with_writer(nb).with_ansi(false))
+                    Some(fmt::layer().with_timer(LocalTimer).with_writer(nb).with_ansi(false))
                 }
                 Err(e) => {
                     eprintln!("Warning: failed to open out_file '{file}' in '{dir}': {e}");
@@ -1357,6 +1364,7 @@ fn init_logging(
                     guards.push(guard);
                     Some(
                         fmt::layer()
+                            .with_timer(LocalTimer)
                             .with_writer(nb)
                             .with_ansi(false)
                             .with_filter(LevelFilter::WARN),
