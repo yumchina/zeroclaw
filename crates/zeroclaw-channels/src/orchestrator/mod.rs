@@ -2784,6 +2784,7 @@ fn spawn_supervised_listener_with_health_interval(
             zeroclaw_runtime::health::mark_component_ok(&component);
             let mut health = tokio::time::interval(health_interval);
             health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let start_time = std::time::Instant::now();
             let result = {
                 let listen_future = ch.listen(tx.clone());
                 tokio::pin!(listen_future);
@@ -2800,6 +2801,19 @@ fn spawn_supervised_listener_with_health_interval(
 
             if tx.is_closed() {
                 break;
+            }
+
+            // If the listener has been running successfully for a reasonable duration,
+            // reset the reconnect backoff so we attempt immediate reconnection on drop.
+            if start_time.elapsed() >= std::time::Duration::from_secs(30) {
+                tracing::info!(
+                    "Channel {} was active for {:?}; resetting reconnect backoff from {}s to {}s",
+                    ch.name(),
+                    start_time.elapsed(),
+                    backoff,
+                    initial_backoff_secs
+                );
+                backoff = initial_backoff_secs.max(1);
             }
 
             match result {
