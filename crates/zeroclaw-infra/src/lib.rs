@@ -12,10 +12,27 @@ pub mod session_store;
 pub mod stall_watchdog;
 pub mod topic_binding;
 
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::session_backend::SessionBackend;
+
+pub fn effective_gateway_bind_socket_addr(host: &str, port: u16) -> SocketAddr {
+    parse_gateway_bind_socket_addr(host, port)
+        .unwrap_or_else(|_| fallback_gateway_bind_socket_addr(port))
+}
+
+pub fn parse_gateway_bind_socket_addr(
+    host: &str,
+    port: u16,
+) -> Result<SocketAddr, std::net::AddrParseError> {
+    format!("{host}:{port}").parse()
+}
+
+pub fn fallback_gateway_bind_socket_addr(port: u16) -> SocketAddr {
+    SocketAddr::from(([127, 0, 0, 1], port))
+}
 
 /// Construct the configured session-persistence backend.
 ///
