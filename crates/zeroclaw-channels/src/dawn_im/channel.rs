@@ -68,6 +68,26 @@ struct SyncState {
     channel_seqs: HashMap<String, u32>,
 }
 
+/// Enable TCP keepalive on the WebSocket's underlying TCP socket so
+/// the kernel detects half-open / NATted-out / sleeping-host
+/// connections faster than the 25s application heartbeat would on its
+/// own. After 10 s of socket-level silence the OS sends a probe; if
+/// the peer doesn't ACK within the platform-default probe budget
+/// (~15 s at 5 s intervals on Linux) it RSTs the socket, which our
+/// listen loop then surfaces as a stream-closed error and the
+/// supervised listener reconnects.
+///
+/// Extracted as a free function so unit tests can pin the SO_KEEPALIVE
+/// behavior on a real `TcpStream` without standing up a WebSocket
+/// server.
+fn enable_tcp_keepalive(tcp: &tokio::net::TcpStream) -> std::io::Result<()> {
+    let sock = socket2::SockRef::from(tcp);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(10))
+        .with_interval(Duration::from_secs(5));
+    sock.set_tcp_keepalive(&keepalive)
+}
+
 /// Normalise a DawnIM `topic` field into an Option<String> suitable for
 /// `ChannelMessage.thread_ts`. The DawnIM protocol uses `"0"` and `""`
 /// as sentinels for "no topic"; both map to `None` so historical
@@ -1354,6 +1374,25 @@ impl Channel for DawnIMChannel {
         )
         .await
         .map_err(|_| anyhow::anyhow!("DawnIM WebSocket connection timed out"))??;
+
+        // Enable kernel-level TCP keepalive on the underlying socket so
+        // dead peers (typical after macOS sleep/wake or NAT/LB drops)
+        // are detected by the OS before the application heartbeat
+        // catches them. `WebSocketStream::get_ref()` returns the
+        // wrapped `MaybeTlsStream<TcpStream>`, whose own `get_ref()`
+        // strips any TLS layer and hands back the raw `TcpStream`.
+        if let Err(e) = enable_tcp_keepalive(ws_stream.get_ref().get_ref()) {
+            // Non-fatal: keepalive is a defense-in-depth signal, the
+            // application heartbeat (10s/25s) still bounds detection
+            // time. Log and continue.
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({"err": e.to_string()})),
+                "DawnIM: failed to enable TCP keepalive on socket"
+            );
+        }
+
         let (write, mut read) = ws_stream.split();
         *self.ws_sink.write().await = Some(write);
 
@@ -1729,6 +1768,37 @@ mod send_kind_dispatch_tests {
         assert_eq!(
             pending_before, pending_after,
             "send_params_fire_and_forget must never touch pending_responses"
+        );
+    }
+}
+
+#[cfg(test)]
+mod tcp_keepalive_tests {
+    use super::enable_tcp_keepalive;
+
+    /// Spin up a localhost TCP listener and a client `TcpStream`, run
+    /// `enable_tcp_keepalive` against the client stream, then re-read
+    /// the SO_KEEPALIVE socket option via `socket2::SockRef`. If
+    /// keepalive is off the kernel never sends probes and the
+    /// macOS-wake reconnect target collapses to the 25 s app heartbeat
+    /// — pinning the option here keeps that regression visible.
+    #[tokio::test]
+    async fn enable_tcp_keepalive_sets_so_keepalive_on_real_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept_fut = tokio::spawn(async move {
+            let (server_stream, _) = listener.accept().await.unwrap();
+            server_stream
+        });
+        let client_stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let _server_stream = accept_fut.await.unwrap();
+
+        enable_tcp_keepalive(&client_stream).expect("keepalive setup");
+
+        let sock = socket2::SockRef::from(&client_stream);
+        assert!(
+            sock.keepalive().unwrap_or(false),
+            "SO_KEEPALIVE must be on after enable_tcp_keepalive"
         );
     }
 }
