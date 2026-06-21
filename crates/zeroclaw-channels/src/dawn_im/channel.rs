@@ -224,6 +224,38 @@ impl DawnIMChannel {
         }
     }
 
+    /// Send a `send` JSON-RPC request and return as soon as the frame
+    /// is on the wire — do NOT register a `pending_responses` entry or
+    /// wait 30s for an ACK.
+    ///
+    /// The DawnIM server does not reliably return a JSON-RPC response
+    /// for `send`; the previous `send_rpc("send", …)` path always
+    /// hit the 30s `pending_responses` timeout, which surfaced as
+    /// approval cards / status updates appearing to "fail" even when
+    /// they had actually been delivered. Any genuine business
+    /// response (e.g. an approval verdict) arrives on a separate
+    /// `recv` notification that resolves a `pending_approvals` oneshot.
+    async fn send_params_fire_and_forget(&self, params: SendParams) -> anyhow::Result<()> {
+        let req = JsonRpcRequest {
+            jsonrpc: DAWN_IM_RPC_VERSION.to_string(),
+            method: "send".to_string(),
+            id: Uuid::new_v4().to_string(),
+            params,
+        };
+        let msg = serde_json::to_string(&req)?;
+        let mut g = self.ws_sink.write().await;
+        match g.as_mut() {
+            Some(s) => {
+                if let Err(e) = s.send(WsMsg::Text(msg.into())).await {
+                    *g = None;
+                    return Err(anyhow::anyhow!("DawnIM send (fire-and-forget) failed: {}", e));
+                }
+                Ok(())
+            }
+            None => anyhow::bail!("DawnIM: WebSocket not connected"),
+        }
+    }
+
     async fn send_ack(&self, message_id: String, message_seq: u32) -> anyhow::Result<()> {
         let req = JsonRpcNotification {
             jsonrpc: DAWN_IM_RPC_VERSION.to_string(),
@@ -850,7 +882,7 @@ impl DawnIMChannel {
             stream_no: None,
             topic: None,
         };
-        let _: serde_json::Value = self.send_rpc("send", params).await?;
+        self.send_params_fire_and_forget(params).await?;
         Ok(())
     }
 
@@ -922,8 +954,9 @@ impl DawnIMChannel {
 
     ///
     /// The `payload` is serialised to JSON, base64-encoded per the DawnIM
-    /// `SendParams.payload` contract, and shipped via `send_rpc("send")` with
-    /// `channel_type = 1` (personal channel) and the executor's `recipient` uid.
+    /// `SendParams.payload` contract, and shipped via
+    /// `send_params_fire_and_forget` with `channel_type = 1` (personal channel)
+    /// and the executor's `recipient` uid.
     ///
     /// This helper is called by the `SendKind::TaskSubmit` / `TaskQuery` branches
     /// in [`Channel::send`](trait.Channel.html#tymethod.send), following the
@@ -948,7 +981,7 @@ impl DawnIMChannel {
             stream_no: None,
             topic: None,
         };
-        let _: serde_json::Value = self.send_rpc("send", params).await?;
+        self.send_params_fire_and_forget(params).await?;
         Ok(())
     }
 
@@ -1351,7 +1384,7 @@ impl Channel for DawnIMChannel {
             stream_no: None,
             topic: None,
         };
-        let _: serde_json::Value = self.send_rpc("send", params).await?;
+        self.send_params_fire_and_forget(params).await?;
         Ok(())
     }
 
@@ -1602,8 +1635,11 @@ impl Channel for DawnIMChannel {
                 topic: topic_out,
             },
         );
-        self.send_rpc::<_, serde_json::Value>("send", params)
-            .await?;
+        // The actual approval response is delivered via a separate
+        // `recv` notification that resolves the `pending_approvals`
+        // oneshot below — no need to wait on the `send` RPC's own
+        // (unreliable) ACK here.
+        self.send_params_fire_and_forget(params).await?;
         match tokio::time::timeout(Duration::from_secs(self.approval_timeout_secs), orx).await {
             Ok(Ok(resp)) => Ok(Some(resp)),
             _ => {
@@ -1640,7 +1676,7 @@ impl Channel for DawnIMChannel {
             return Ok(());
         };
         let params = self.build_cancel_send_params(approval_id, recipient, reason, pending.topic)?;
-        let _: serde_json::Value = self.send_rpc("send", params).await?;
+        self.send_params_fire_and_forget(params).await?;
         Ok(())
     }
 }
@@ -1678,8 +1714,9 @@ mod send_kind_dispatch_tests {
         DawnIMChannel::from_config(&cfg, "test", tmp.path(), memory)
     }
 
-    /// TaskSubmit kind enters send_task_payload → send_rpc path.
-    /// Unconnected WS should bail at send_rpc layer (not at Text encoding layer).
+    /// TaskSubmit kind enters send_task_payload, which now uses
+    /// `send_params_fire_and_forget`. Unconnected WS should bail at the
+    /// send-frame layer (not at Text encoding layer).
     #[tokio::test]
     async fn send_task_submit_reaches_send_rpc_layer() {
         let ch = build_channel();
@@ -1718,6 +1755,39 @@ mod send_kind_dispatch_tests {
         assert!(
             err_str.contains("not connected") || err_str.contains("RPC"),
             "expected WS-layer error, got: {err_str}"
+        );
+    }
+
+    /// `send_params_fire_and_forget` must NOT register a
+    /// `pending_responses` entry. If it does, the old `send_rpc` 30s
+    /// ACK-wait reappears via the back door and the macOS sleep/wake
+    /// failure mode comes back.
+    #[tokio::test]
+    async fn send_params_fire_and_forget_does_not_register_pending_response() {
+        let ch = build_channel();
+        let pending_before = ch.pending_responses.read().await.len();
+        let params = SendParams {
+            from_uid: Some(ch.uid.clone()),
+            client_msg_no: "test-msg".into(),
+            channel_id: "u_alice".into(),
+            channel_type: 1,
+            payload: serde_json::json!("dGVzdA=="),
+            header: None,
+            setting: None,
+            msg_key: None,
+            expire: None,
+            stream_no: None,
+            topic: None,
+        };
+        // ws_sink is None on a non-connected channel, so the call bails
+        // before any send. The important assertion is that it leaves
+        // `pending_responses` untouched regardless of outcome — neither
+        // the success nor the failure path may insert an entry.
+        let _ = ch.send_params_fire_and_forget(params).await;
+        let pending_after = ch.pending_responses.read().await.len();
+        assert_eq!(
+            pending_before, pending_after,
+            "send_params_fire_and_forget must never touch pending_responses"
         );
     }
 }
