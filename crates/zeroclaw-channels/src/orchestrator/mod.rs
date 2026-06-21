@@ -1217,6 +1217,43 @@ fn strip_historical_image_payloads(turns: &mut Vec<ChatMessage>) {
     }
 }
 
+/// Strip sentinel error/interrupt assistant turns (and the user turn
+/// that triggered each one) from cached history before it's handed to
+/// the LLM. When the orchestrator's tool-call loop terminates
+/// abnormally it appends a closing sentinel (`[Task failed — not
+/// continuing this request]`, `[Task timed out — ...]`, `[Session
+/// interrupted — ...]`) so the orphan user turn isn't replayed as
+/// unfinished context. If these accumulate, the model starts
+/// pattern-matching on them and emits the sentinel verbatim in place
+/// of real answers (history poisoning).
+///
+/// The last entry is intentionally not inspected: by the time this is
+/// called the orchestrator has already pushed the current user turn to
+/// the end, and dropping it would leave the LLM call with no prompt.
+fn strip_sentinel_history_turns(turns: &mut Vec<ChatMessage>) {
+    const SENTINELS: &[&str] = &[
+        "[Task failed \u{2014} not continuing this request]",
+        "[Task timed out \u{2014} not continuing this request]",
+        "[Session interrupted \u{2014} not continuing this request]",
+    ];
+    let mut i = 0usize;
+    while i < turns.len().saturating_sub(1) {
+        let is_sentinel = turns[i].role == "assistant"
+            && SENTINELS
+                .iter()
+                .any(|s| turns[i].content.trim() == *s);
+        if is_sentinel {
+            turns.remove(i);
+            if i > 0 && turns[i - 1].role == "user" {
+                turns.remove(i - 1);
+                i = i.saturating_sub(1);
+            }
+        } else {
+            i += 1;
+        }
+    }
+}
+
 fn normalize_cached_channel_turns(turns: Vec<ChatMessage>) -> Vec<ChatMessage> {
     let mut normalized = Vec::with_capacity(turns.len());
     let mut expecting_user = true;
@@ -4758,6 +4795,11 @@ async fn process_channel_message_body(
             turn.content = strip_tool_summary_prefix(&turn.content);
         }
     }
+
+    // Strip sentinel error/interrupt assistant turns (and their preceding
+    // user turn) from history so the LLM never sees and echoes them. See
+    // strip_sentinel_history_turns for the full rationale.
+    strip_sentinel_history_turns(&mut prior_turns);
 
     // Strip [IMAGE:] markers from older cached turns before context
     // compression. The current message keeps its full payload so vision still
@@ -11969,6 +12011,117 @@ api_key = "anthropic-key"
         assert_eq!(normalized[1].role, "assistant");
         assert!(normalized[1].content.contains("Task timed out"));
         assert_eq!(normalized[2].content, "next question");
+    }
+
+    /// strip_sentinel_history_turns removes a sentinel assistant turn
+    /// AND the user turn that triggered it, leaving the current user
+    /// message at the tail intact.
+    #[test]
+    fn strip_sentinel_removes_failed_pair_keeps_current_user() {
+        let mut turns = vec![
+            ChatMessage::user("download something from GitHub"),
+            ChatMessage::assistant("[Task failed — not continuing this request]"),
+            ChatMessage::user("what is WAL?"),
+        ];
+
+        strip_sentinel_history_turns(&mut turns);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[0].content, "what is WAL?");
+    }
+
+    /// Each of the three sentinel strings is recognized.
+    #[test]
+    fn strip_sentinel_recognizes_all_three_variants() {
+        for sentinel in [
+            "[Task failed — not continuing this request]",
+            "[Task timed out — not continuing this request]",
+            "[Session interrupted — not continuing this request]",
+        ] {
+            let mut turns = vec![
+                ChatMessage::user("u1"),
+                ChatMessage::assistant(sentinel),
+                ChatMessage::user("u2"),
+            ];
+            strip_sentinel_history_turns(&mut turns);
+            assert_eq!(turns.len(), 1, "sentinel `{sentinel}` not stripped");
+            assert_eq!(turns[0].content, "u2");
+        }
+    }
+
+    /// Multiple sentinel pairs accumulated across turns are all stripped.
+    #[test]
+    fn strip_sentinel_removes_multiple_pairs() {
+        let mut turns = vec![
+            ChatMessage::user("u1"),
+            ChatMessage::assistant("[Task failed — not continuing this request]"),
+            ChatMessage::user("u2"),
+            ChatMessage::assistant("[Task timed out — not continuing this request]"),
+            ChatMessage::user("u3 (current)"),
+        ];
+
+        strip_sentinel_history_turns(&mut turns);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].content, "u3 (current)");
+    }
+
+    /// Real assistant replies between sentinel pairs are preserved.
+    #[test]
+    fn strip_sentinel_preserves_real_assistant_replies() {
+        let mut turns = vec![
+            ChatMessage::user("q1"),
+            ChatMessage::assistant("real answer 1"),
+            ChatMessage::user("q2"),
+            ChatMessage::assistant("[Task failed — not continuing this request]"),
+            ChatMessage::user("q3 (current)"),
+        ];
+
+        strip_sentinel_history_turns(&mut turns);
+        assert_eq!(turns.len(), 3);
+        assert_eq!(turns[0].content, "q1");
+        assert_eq!(turns[1].content, "real answer 1");
+        assert_eq!(turns[2].content, "q3 (current)");
+    }
+
+    /// Sentinel content surrounded by whitespace is still matched
+    /// (`trim()` comparison).
+    #[test]
+    fn strip_sentinel_handles_whitespace_padding() {
+        let mut turns = vec![
+            ChatMessage::user("u1"),
+            ChatMessage::assistant("   [Task failed — not continuing this request]\n"),
+            ChatMessage::user("u2 (current)"),
+        ];
+        strip_sentinel_history_turns(&mut turns);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].content, "u2 (current)");
+    }
+
+    /// If the last turn is somehow a sentinel (defensive — shouldn't
+    /// happen because the orchestrator pushes the current user turn at
+    /// the end), it is NOT stripped. This guards against accidentally
+    /// dropping the only prompt the LLM is supposed to answer.
+    #[test]
+    fn strip_sentinel_never_touches_last_turn() {
+        let mut turns = vec![
+            ChatMessage::user("u1"),
+            ChatMessage::assistant("[Task failed — not continuing this request]"),
+        ];
+        let before_len = turns.len();
+        strip_sentinel_history_turns(&mut turns);
+        assert_eq!(turns.len(), before_len);
+    }
+
+    /// Empty / single-turn inputs are no-ops (no panics on the loop bounds).
+    #[test]
+    fn strip_sentinel_handles_short_inputs() {
+        let mut empty: Vec<ChatMessage> = vec![];
+        strip_sentinel_history_turns(&mut empty);
+        assert!(empty.is_empty());
+
+        let mut single = vec![ChatMessage::user("only message")];
+        strip_sentinel_history_turns(&mut single);
+        assert_eq!(single.len(), 1);
     }
 
     #[test]
