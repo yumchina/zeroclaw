@@ -22652,7 +22652,7 @@ mod omitted_feature_tests {
         let config_arc = Arc::new(RwLock::new(config));
         let channels = collect_configured_channels(&config_arc, "test", &[]);
         assert!(
-            channels.iter().all(|c| c.display_name != "Telegram"),
+            channels.channels.iter().all(|c| c.display_name != "Telegram"),
             "Telegram must be absent from collect_configured_channels when \
              channel-telegram feature is not compiled in"
         );

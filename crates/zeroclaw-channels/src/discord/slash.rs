@@ -700,6 +700,7 @@ Write it.
             tags: vec!["slash".to_string()],
             tools: Vec::new(),
             prompts: Vec::new(),
+            enabled: true,
             slash_options: vec![
                 zeroclaw_runtime::skills::SkillSlashOption {
                     name: "opt".to_string(),
@@ -767,6 +768,7 @@ Write it.
             version: "0".to_string(),
             author: None,
             tags: vec!["slash".to_string()],
+            enabled: true,
             tools: Vec::new(),
             prompts: Vec::new(),
             slash_options,
