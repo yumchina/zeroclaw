@@ -9,6 +9,7 @@ use tracing_subscriber::Layer;
 use tracing_subscriber::fmt;
 use tracing_subscriber::fmt::FormatFields;
 use tracing_subscriber::fmt::format::Writer;
+use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
 
@@ -94,18 +95,38 @@ pub fn try_install_capture_subscriber() {
     let _ = tracing::subscriber::set_global_default(subscriber);
 }
 
+/// `tracing_subscriber::fmt::time::FormatTime` adapter that prints the
+/// local timezone with microsecond precision (e.g.
+/// `2026-06-21T15:30:42.123456+08:00`) instead of UTC. The previous
+/// default (`SystemTime`) emitted UTC, which forced operators in
+/// non-UTC zones to mentally translate every line when correlating
+/// logs against user reports or business events. Microsecond precision
+/// keeps adjacent events distinguishable when ordering matters
+/// (especially under bursty channel traffic).
+pub(crate) struct LocalTimer;
+
+impl FormatTime for LocalTimer {
+    fn format_time(&self, w: &mut Writer<'_>) -> std::fmt::Result {
+        write!(
+            w,
+            "{}",
+            chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.6f%:z")
+        )
+    }
+}
+
 /// Tracing event formatter that prefixes each log line with the most
 /// specific alias-bound label available in the current span scope.
 /// `agent_alias` wins; falls back to the channel composite; finally
 /// to `[system]` for boot / migration / install-wide messages.
 struct AgentAliasFormatter {
-    inner: fmt::format::Format<fmt::format::Full, fmt::time::SystemTime>,
+    inner: fmt::format::Format<fmt::format::Full, LocalTimer>,
 }
 
 impl AgentAliasFormatter {
     fn new() -> Self {
         Self {
-            inner: fmt::format::Format::default(),
+            inner: fmt::format::Format::default().with_timer(LocalTimer),
         }
     }
 }
@@ -138,5 +159,58 @@ where
             .unwrap_or_else(|| "system".to_string());
         write!(writer, "[{label}] ")?;
         self.inner.format_event(ctx, writer, event)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pin the LocalTimer's output shape: it must produce an
+    /// RFC3339-like local timestamp with a microsecond fraction (`.6f`)
+    /// and a `±HH:MM` timezone offset. Loss of either part regresses
+    /// log correlation across timezones / collapses adjacent events
+    /// onto the same millisecond.
+    #[test]
+    fn local_timer_emits_microseconds_and_timezone_offset() {
+        use chrono::Datelike;
+
+        let mut buf = String::new();
+        {
+            let mut writer = Writer::new(&mut buf);
+            LocalTimer.format_time(&mut writer).expect("format_time");
+        }
+
+        // Year prefix: a sanity check that the buffer contains *some*
+        // current-era ISO date rather than empty/garbage.
+        let current_year = chrono::Local::now().year();
+        assert!(
+            buf.starts_with(&current_year.to_string()),
+            "expected output to start with current year, got `{buf}`"
+        );
+
+        // Microsecond fraction: exactly 6 digits after the seconds dot.
+        // Locate `T.*:..` then count the digits after `.`.
+        let dot = buf
+            .rfind('.')
+            .expect("expected a `.` separating seconds from fractional component");
+        let frac_end = buf[dot + 1..]
+            .find(|c: char| !c.is_ascii_digit())
+            .map(|i| dot + 1 + i)
+            .unwrap_or(buf.len());
+        let frac_len = frac_end - (dot + 1);
+        assert_eq!(
+            frac_len, 6,
+            "expected 6-digit microsecond fraction in `{buf}`, got {frac_len}"
+        );
+
+        // Timezone offset: `+HH:MM` or `-HH:MM` (or `Z` if running in
+        // UTC, which chrono's `%:z` also accepts as `+00:00`).
+        let tail = &buf[frac_end..];
+        let has_offset = tail.starts_with('+') || tail.starts_with('-');
+        assert!(
+            has_offset && tail.contains(':'),
+            "expected `+HH:MM` or `-HH:MM` timezone tail in `{buf}`, got `{tail}`"
+        );
     }
 }
