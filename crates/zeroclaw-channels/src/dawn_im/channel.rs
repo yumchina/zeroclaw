@@ -23,7 +23,7 @@ use super::approval::{
 };
 use super::connection::{
     ClearUnreadRequest, ConnectParams, DAWN_IM_RPC_VERSION, HEARTBEAT_TIMEOUT, Header,
-    JsonRpcNotification, JsonRpcRequest, JsonRpcResponse, PING_INTERVAL, RecvAckParams,
+    JsonRpcNotification, JsonRpcRequest, PING_INTERVAL, RecvAckParams,
     RecvNotificationParams, SendParams, SyncRequest, SyncResponse, WkChannelType, WkMessageType,
     WsSink,
 };
@@ -162,65 +162,6 @@ impl DawnIMChannel {
             last_message_time: Arc::new(RwLock::new(HashMap::new())),
             workspace_dir: workspace_dir.to_path_buf(),
             progress_streaming: config.progress_streaming,
-        }
-    }
-
-    async fn send_rpc<P: serde::Serialize, R: serde::de::DeserializeOwned>(
-        &self,
-        method: &str,
-        params: P,
-    ) -> anyhow::Result<R> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let id = Uuid::new_v4().to_string();
-        let req = JsonRpcRequest {
-            jsonrpc: DAWN_IM_RPC_VERSION.to_string(),
-            method: method.to_string(),
-            id: id.clone(),
-            params,
-        };
-        self.pending_responses.write().await.insert(id.clone(), tx);
-        let send_result: anyhow::Result<()> = async {
-            let msg = serde_json::to_string(&req)?;
-            let mut g = self.ws_sink.write().await;
-            match g.as_mut() {
-                Some(s) => {
-                    ::zeroclaw_log::record!(
-                        INFO,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Send)
-                            .with_attrs(::serde_json::json!({"method": method, "id": id})),
-                        "DawnIM: RPC send"
-                    );
-                    if let Err(e) = s.send(WsMsg::Text(msg.into())).await {
-                        *g = None;
-                        return Err(anyhow::anyhow!("DawnIM RPC send failed: {}", e));
-                    }
-                    Ok(())
-                }
-                None => anyhow::bail!("DawnIM: WebSocket not connected"),
-            }
-        }
-        .await;
-        if let Err(e) = send_result {
-            self.pending_responses.write().await.remove(&id);
-            return Err(e);
-        }
-        match tokio::time::timeout(Duration::from_secs(30), rx).await {
-            Ok(Ok(val)) => {
-                let resp: JsonRpcResponse<R> = serde_json::from_value(val)?;
-                if let Some(err) = resp.error {
-                    anyhow::bail!("DawnIM RPC error: {} (code {})", err.message, err.code);
-                }
-                resp.result
-                    .ok_or_else(|| anyhow::Error::msg("DawnIM RPC: missing result"))
-            }
-            Ok(Err(_)) => {
-                self.pending_responses.write().await.remove(&id);
-                anyhow::bail!("DawnIM RPC: response channel closed for {}", method);
-            }
-            Err(_) => {
-                self.pending_responses.write().await.remove(&id);
-                anyhow::bail!("DawnIM RPC timeout: {}", method);
-            }
         }
     }
 
