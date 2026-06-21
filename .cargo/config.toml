@@ -5,7 +5,9 @@ web = "run --release -p xtask --bin web --"
 generate = "run --release -p xtask --bin generate --"
 
 # yumclaw release builds — shared feature surface, with vs without the
-# bundled web console. Run via `cargo yumclaw-dev` / `cargo yumclaw-prd`.
+# bundled web console. Both produce `--release` binaries; the suffix
+# describes which artefact, not which cargo profile.
+# Run via `cargo yumclaw-web` / `cargo yumclaw-prd`.
 #
 # Surface (both):
 # - agent-runtime / gateway / schema-export          core daemon + JSON-schema export
@@ -17,14 +19,14 @@ generate = "run --release -p xtask --bin generate --"
 # - channel-wecom-ws                                 企业微信 WebSocket 长连接
 # - browser-native / rag-pdf                         browser tool + PDF RAG
 #
-# dev-only:
+# yumclaw-web only:
 # - embedded-web                                     bake web/dist/ into the binary so the
 #                                                    web console works from a single
-#                                                    redistributable executable. Off in prod
+#                                                    redistributable executable. Off in prd
 #                                                    where the dashboard is hosted separately
 #                                                    (or behind its own reverse proxy) and
 #                                                    bundling adds binary size for no gain.
-yumclaw-dev = "build --release --features agent-runtime,gateway,schema-export,plugins-wasm,plugins-wasm-cranelift,observability-prometheus,channel-feishu,channel-dawnIM,dawn-tools,channel-wecom-ws,browser-native,rag-pdf,embedded-web"
+yumclaw-web = "build --release --features agent-runtime,gateway,schema-export,plugins-wasm,plugins-wasm-cranelift,observability-prometheus,channel-feishu,channel-dawnIM,dawn-tools,channel-wecom-ws,browser-native,rag-pdf,embedded-web"
 yumclaw-prd = "build --release --features agent-runtime,gateway,schema-export,plugins-wasm,plugins-wasm-cranelift,observability-prometheus,channel-feishu,channel-dawnIM,dawn-tools,channel-wecom-ws,browser-native,rag-pdf"
 
 [build]
