@@ -3,7 +3,8 @@
 
 use super::context::TurnCtx;
 use super::events::StreamDelta;
-use super::redact::scrub_credentials;
+use super::redact::scrub_credentials_with_allowlist;
+use crate::agent::scrub_context::current_allowlist;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use crate::util::truncate_with_ellipsis;
 use zeroclaw_tool_call_parser::ParsedToolCall;
@@ -43,8 +44,14 @@ pub(crate) async fn record_executed_outcomes(
                     "model": ctx.model,
                     "iteration": iteration + 1,
                     "tool": call.name.clone(),
-                    "error_reason": outcome.error_reason.as_deref().map(scrub_credentials),
-                    "output": scrub_credentials(&outcome.output),
+                    "error_reason": outcome
+                        .error_reason
+                        .as_deref()
+                        .map(|s| scrub_credentials_with_allowlist(s, &current_allowlist())),
+                    "output": scrub_credentials_with_allowlist(
+                        &outcome.output,
+                        &current_allowlist(),
+                    ),
                     "trace_id": ctx.turn_id,
                 })),
             "tool_call_result"
@@ -98,7 +105,10 @@ fn render_completion_progress(
     } else if let Some(reason) = error_reason {
         format!(
             "\u{274c} {tool} ({secs}s): {}\n",
-            truncate_with_ellipsis(&scrub_credentials(reason), 200)
+            truncate_with_ellipsis(
+                &scrub_credentials_with_allowlist(reason, &current_allowlist()),
+                200,
+            )
         )
     } else {
         format!("\u{274c} {tool} ({secs}s)\n")
@@ -135,5 +145,31 @@ mod tests {
         let line = render_completion_progress("echo", 0, true, None);
         assert!(line.starts_with('\u{2705}'));
         assert!(!line.contains(':'));
+    }
+
+    /// When TOOL_LOOP_ALLOWLIST is set, allowlisted-host URL tokens in
+    /// `error_reason` must survive the rendering scrub.
+    #[tokio::test]
+    async fn completion_progress_preserves_allowlisted_url_in_error_reason() {
+        use crate::agent::scrub_context::TOOL_LOOP_ALLOWLIST;
+        use crate::security::AllowlistRule;
+        use std::sync::Arc;
+
+        let rule = AllowlistRule::new("api.example.com", None).unwrap();
+        let scope_value = Some(Arc::new(vec![rule]));
+        let line = TOOL_LOOP_ALLOWLIST
+            .scope(scope_value, async {
+                render_completion_progress(
+                    "http_get",
+                    1,
+                    false,
+                    Some("https://api.example.com/o?token=hgnD0jgCF63abcdefghij"),
+                )
+            })
+            .await;
+        assert!(
+            line.contains("token=hgnD0jgCF63abcdefghij"),
+            "allowlisted token must survive in progress line: {line}"
+        );
     }
 }

@@ -2,7 +2,8 @@
 //! loop's `TurnEvent` emission helpers (#7415 consolidation).
 
 use super::outcome::ToolLoopCancelled;
-use super::redact::scrub_credentials;
+use super::redact::scrub_credentials_with_allowlist;
+use crate::agent::scrub_context::current_allowlist;
 use crate::agent::tool_execution::ToolExecutionOutcome;
 use anyhow::Result;
 use tokio::sync::mpsc::Sender;
@@ -104,7 +105,7 @@ pub(crate) async fn emit_tool_result(
         .send(TurnEvent::ToolResult {
             id: id.to_string(),
             name: name.to_string(),
-            output: scrub_credentials(&outcome.output),
+            output: scrub_credentials_with_allowlist(&outcome.output, &current_allowlist()),
         })
         .await;
 }
@@ -255,5 +256,43 @@ mod tests {
             }
         }
         assert!(saw_result, "a ToolResult event must be emitted");
+    }
+
+    /// allowlisted-host URL token in a tool result must survive the rendering
+    /// scrub when the orchestrator has set TOOL_LOOP_ALLOWLIST.
+    #[tokio::test]
+    async fn tool_result_event_preserves_allowlisted_url_token() {
+        use crate::agent::scrub_context::TOOL_LOOP_ALLOWLIST;
+        use crate::security::AllowlistRule;
+        use std::sync::Arc;
+
+        let outcome = ToolExecutionOutcome {
+            output: "Pay: https://api.example.com/o?token=hgnD0jgCF63abcdefghij ok"
+                .into(),
+            success: true,
+            error_reason: None,
+            duration: Duration::ZERO,
+            receipt: None,
+        };
+        let rule = AllowlistRule::new("api.example.com", None).unwrap();
+        let scope_value = Some(Arc::new(vec![rule]));
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        TOOL_LOOP_ALLOWLIST
+            .scope(scope_value, async {
+                emit_tool_call_pair(&tx, &parsed_call(Some("c1")), &outcome).await;
+            })
+            .await;
+        drop(tx);
+        let mut saw = false;
+        while let Some(ev) = rx.recv().await {
+            if let TurnEvent::ToolResult { output, .. } = ev {
+                saw = true;
+                assert!(
+                    output.contains("token=hgnD0jgCF63abcdefghij"),
+                    "allowlisted token must survive: {output}"
+                );
+            }
+        }
+        assert!(saw, "a ToolResult event must be emitted");
     }
 }

@@ -125,4 +125,43 @@ mod tests {
             "empty allowlist must be a strict no-op vs plain scrub_credentials"
         );
     }
+
+    /// End-to-end: when the orchestrator sets TOOL_LOOP_ALLOWLIST and a
+    /// renderer calls `scrub_credentials_with_allowlist(x, &current_allowlist())`,
+    /// allowlisted-host URL tokens survive. This is the post-merge home of
+    /// PR #48's tool-execution-layer integration test.
+    #[tokio::test]
+    async fn allowlisted_url_token_survives_rendering_scrub() {
+        use crate::agent::scrub_context::{TOOL_LOOP_ALLOWLIST, current_allowlist};
+        use std::sync::Arc;
+
+        let raw = "QR: https://api.example.com/o?token=hgnD0jgCF63abcdefghij done";
+        let rule = AllowlistRule::new("api.example.com", None).unwrap();
+        let scope_value = Some(Arc::new(vec![rule]));
+        let scrubbed = TOOL_LOOP_ALLOWLIST
+            .scope(scope_value, async move {
+                scrub_credentials_with_allowlist(raw, &current_allowlist())
+            })
+            .await;
+        assert!(
+            scrubbed.contains("token=hgnD0jgCF63abcdefghij"),
+            "allowlisted token must survive: {scrubbed}"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_allowlisted_url_token_still_scrubbed_in_rendering() {
+        use crate::agent::scrub_context::{TOOL_LOOP_ALLOWLIST, current_allowlist};
+        use std::sync::Arc;
+
+        let raw = "evil: https://evil.com/x?token=abcdefghijklmnop done";
+        let rule = AllowlistRule::new("api.example.com", None).unwrap();
+        let scope_value = Some(Arc::new(vec![rule]));
+        let scrubbed = TOOL_LOOP_ALLOWLIST
+            .scope(scope_value, async move {
+                scrub_credentials_with_allowlist(raw, &current_allowlist())
+            })
+            .await;
+        assert!(!scrubbed.contains("abcdefghijklmnop"), "got: {scrubbed}");
+    }
 }

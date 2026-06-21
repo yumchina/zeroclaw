@@ -458,37 +458,3 @@ pub async fn execute_tools_sequential(
     Ok(slots)
 }
 
-#[cfg(test)]
-mod allowlist_integration_tests {
-    use super::*;
-    use std::sync::Arc;
-    use crate::agent::scrub_context::TOOL_LOOP_ALLOWLIST;
-    use crate::security::AllowlistRule;
-
-    #[tokio::test]
-    async fn allowlisted_url_token_survives_tool_output_scrub() {
-        let raw = "QR: https://api.example.com/o?token=hgnD0jgCF63abcdefghij done";
-        let rule = AllowlistRule::new("api.example.com", None).unwrap();
-        let scope_value = Some(Arc::new(vec![rule]));
-        let scrubbed = TOOL_LOOP_ALLOWLIST
-            .scope(scope_value, async move {
-                scrub_for_tool_output(raw)
-            })
-            .await;
-        assert!(
-            scrubbed.contains("token=hgnD0jgCF63abcdefghij"),
-            "allowlisted token must survive: {scrubbed}"
-        );
-    }
-
-    #[tokio::test]
-    async fn non_allowlisted_url_token_still_scrubbed() {
-        let raw = "evil: https://evil.com/x?token=abcdefghijklmnop done";
-        let rule = AllowlistRule::new("api.example.com", None).unwrap();
-        let scope_value = Some(Arc::new(vec![rule]));
-        let scrubbed = TOOL_LOOP_ALLOWLIST
-            .scope(scope_value, async move { scrub_for_tool_output(raw) })
-            .await;
-        assert!(!scrubbed.contains("abcdefghijklmnop"), "got: {scrubbed}");
-    }
-}
