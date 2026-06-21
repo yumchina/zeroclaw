@@ -1503,8 +1503,15 @@ impl Channel for DawnIMChannel {
                 }
                 frame = read.next() => {
                     let frame = frame.ok_or_else(|| anyhow::Error::msg("DawnIM: stream closed"))??;
-                    last_activity = Instant::now();
+                    // Only count real business frames (Text) toward
+                    // liveness. Counting every frame allows the
+                    // automatic WS Ping/Pong control frames to keep
+                    // `last_activity` fresh after the DawnIM server
+                    // has stopped delivering recv notifications,
+                    // which masks zombie connections after a
+                    // macOS sleep/wake or NAT/LB drop.
                     let WsMsg::Text(text) = frame else { continue; };
+                    last_activity = Instant::now();
                     let val: serde_json::Value = serde_json::from_str(&text)?;
 
                     if val.get("method").and_then(|m| m.as_str()) == Some("pong") { continue; }

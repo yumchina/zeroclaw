@@ -8,8 +8,19 @@ use tokio_tungstenite::tungstenite::Message as WsMsg;
 
 pub const DAWN_IM_RPC_VERSION: &str = "2.0";
 
-pub const PING_INTERVAL: Duration = Duration::from_secs(30);
-pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(90);
+/// Interval between JSON-RPC `ping` frames sent to the DawnIM server.
+/// Together with `HEARTBEAT_TIMEOUT` this bounds how quickly a zombie
+/// (silent) connection is detected at the application layer. Pair
+/// with the TCP keepalive configured on the underlying socket — the
+/// kernel-level probe fires earlier on most NAT/LB drops; this
+/// catches cases where TCP looks alive but the server has stopped
+/// servicing recv notifications.
+pub const PING_INTERVAL: Duration = Duration::from_secs(10);
+/// Maximum time without a *business* frame (JSON-RPC pong or a recv
+/// notification) before the listen loop bails and supervised
+/// reconnect kicks in. ~2.5× `PING_INTERVAL` so a single dropped pong
+/// does not falsely trip the timeout.
+pub const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(25);
 
 pub type WsSink = futures_util::stream::SplitSink<
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
@@ -277,6 +288,22 @@ mod tests {
         }"#;
         let parsed: RecvNotificationParams = serde_json::from_str(json).unwrap();
         assert!(parsed.topic.is_none());
+    }
+
+    /// Pin the heartbeat tuning so an accidental revert doesn't
+    /// silently regress macOS sleep/wake recovery time. The 10s/25s
+    /// pair bounds zombie-detection at roughly the same window as the
+    /// TCP-keepalive probe (10s idle / 5s interval), and keeps
+    /// HEARTBEAT_TIMEOUT ≈ 2.5× PING_INTERVAL so one dropped pong is
+    /// tolerated.
+    #[test]
+    fn heartbeat_constants_match_macos_wake_target() {
+        assert_eq!(PING_INTERVAL, Duration::from_secs(10));
+        assert_eq!(HEARTBEAT_TIMEOUT, Duration::from_secs(25));
+        assert!(
+            HEARTBEAT_TIMEOUT >= PING_INTERVAL * 2,
+            "HEARTBEAT_TIMEOUT must allow at least one dropped pong"
+        );
     }
 
     #[test]
