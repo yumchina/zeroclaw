@@ -397,6 +397,7 @@ mod tests {
             tags: tags.iter().map(|s| (*s).to_string()).collect(),
             tools: vec![],
             prompts: vec![],
+            enabled: true,
             slash_options: vec![],
             location: loc.map(PathBuf::from),
         };
