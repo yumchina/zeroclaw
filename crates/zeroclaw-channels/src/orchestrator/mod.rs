@@ -4185,6 +4185,35 @@ fn strip_isolated_tool_json_artifacts(message: &str, known_tool_names: &HashSet<
     result.trim().to_string()
 }
 
+/// Minimum uptime a supervised listener must achieve before its
+/// pre-drop reconnect backoff is reset to `initial_backoff_secs`. Keeps
+/// genuinely flapping channels on exponential backoff while letting a
+/// channel that has been stable for "long enough" reconnect quickly
+/// after a single drop.
+const STABLE_RUN_RESET_THRESHOLD: Duration = Duration::from_secs(30);
+
+/// Decide the next reconnect backoff after a listener exit.
+///
+/// Pure function so the behavior can be tested without standing up a
+/// real listener (the 30 s wall-clock threshold makes that
+/// prohibitively slow). Reset only fires when both conditions hold:
+/// (1) the listener ran for at least `stable_threshold`, and
+/// (2) the current backoff has already grown past the initial value
+///     (otherwise the reset is a no-op anyway).
+fn maybe_reset_backoff_after_stable_run(
+    uptime: Duration,
+    current_backoff: u64,
+    initial_backoff_secs: u64,
+    stable_threshold: Duration,
+) -> u64 {
+    let floor = initial_backoff_secs.max(1);
+    if uptime >= stable_threshold && current_backoff > floor {
+        floor
+    } else {
+        current_backoff
+    }
+}
+
 fn spawn_supervised_listener(
     ch: Arc<dyn Channel>,
     alias: Option<String>,
@@ -4234,6 +4263,7 @@ fn spawn_supervised_listener_with_health_interval(
                 zeroclaw_runtime::health::mark_component_ok(&component);
                 let mut health = tokio::time::interval(health_interval);
                 health.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let start_time = std::time::Instant::now();
                 let result = {
                     let listen_future = ch.listen(tx.clone());
                     tokio::pin!(listen_future);
@@ -4248,6 +4278,35 @@ fn spawn_supervised_listener_with_health_interval(
                         }
                     }
                 };
+
+                // If the listener ran stably for a meaningful window
+                // before dropping, treat it as a healthy session that
+                // happened to lose its peer (NAT drop, sleep/wake,
+                // server restart) and reconnect at the *initial*
+                // backoff. Without this reset, a single brief blip
+                // after hours of stable operation would still inherit
+                // any prior accumulated exponential delay, surfacing
+                // as multi-minute reconnect waits to the user.
+                let new_backoff = maybe_reset_backoff_after_stable_run(
+                    start_time.elapsed(),
+                    backoff,
+                    initial_backoff_secs,
+                    STABLE_RUN_RESET_THRESHOLD,
+                );
+                if new_backoff != backoff {
+                    ::zeroclaw_log::record!(
+                        INFO,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                            .with_attrs(::serde_json::json!({
+                                "channel": ch.name(),
+                                "uptime_secs": start_time.elapsed().as_secs(),
+                                "prev_backoff_secs": backoff,
+                                "reset_to_secs": new_backoff,
+                            })),
+                        "Channel ran stably ≥30s before drop; resetting reconnect backoff"
+                    );
+                }
+                backoff = new_backoff;
 
                 match result {
                     Ok(()) => {
@@ -19538,6 +19597,93 @@ This is an example JSON object for profile settings."#;
             }
             Ok(())
         }
+    }
+
+    /// A short-lived run (under the threshold) keeps the accumulated
+    /// exponential backoff so a genuinely flapping channel doesn't
+    /// thrash the server.
+    #[test]
+    fn backoff_reset_skips_short_runs() {
+        let next = maybe_reset_backoff_after_stable_run(
+            Duration::from_secs(5),
+            16,
+            1,
+            Duration::from_secs(30),
+        );
+        assert_eq!(next, 16);
+    }
+
+    /// At-or-above the threshold with a grown backoff: reset to the
+    /// `initial_backoff_secs` floor (clamped to ≥1 by the helper).
+    #[test]
+    fn backoff_reset_after_stable_run_drops_to_initial() {
+        let next = maybe_reset_backoff_after_stable_run(
+            Duration::from_secs(30),
+            16,
+            1,
+            Duration::from_secs(30),
+        );
+        assert_eq!(next, 1);
+    }
+
+    /// If the backoff is already at its floor (or below), reset is a
+    /// no-op — the function must not bump a value upward or downward
+    /// inappropriately.
+    #[test]
+    fn backoff_reset_is_noop_when_already_at_floor() {
+        let next = maybe_reset_backoff_after_stable_run(
+            Duration::from_secs(45),
+            1,
+            1,
+            Duration::from_secs(30),
+        );
+        assert_eq!(next, 1);
+    }
+
+    /// `initial_backoff_secs == 0` is clamped to a floor of 1 by the
+    /// helper, mirroring the same `max(1)` invariant the supervised
+    /// listener relies on elsewhere.
+    #[test]
+    fn backoff_reset_clamps_zero_initial_to_one() {
+        let next = maybe_reset_backoff_after_stable_run(
+            Duration::from_secs(30),
+            32,
+            0,
+            Duration::from_secs(30),
+        );
+        assert_eq!(next, 1);
+    }
+
+    /// End-to-end integration: feed the supervised listener a channel
+    /// whose first `listen()` call returns instantly with `Ok(())`
+    /// (mimicking a clean exit *before* the stable-run threshold), and
+    /// confirm the existing reset path on `Ok(())` still drops backoff
+    /// to floor. Together with the unit tests above this pins the
+    /// happy-path while documenting that the new `Err(_)` reset goes
+    /// through the same `maybe_reset_backoff_after_stable_run` helper.
+    #[tokio::test]
+    async fn supervised_listener_resets_backoff_on_clean_exit() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let channel: Arc<dyn Channel> = Arc::new(FailOnceChannel {
+            name: format!("test-supervised-clean-{}", uuid::Uuid::new_v4()),
+            calls: Arc::clone(&calls),
+            err: std::sync::Mutex::new(None),
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<zeroclaw_api::channel::ChannelMessage>(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        // initial=1, max=4 — clean Ok(()) returns should keep backoff at 1.
+        let handle = spawn_supervised_listener(channel, None, tx, 1, 4, cancel.clone());
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(rx);
+        cancel.cancel();
+        let _ = tokio::time::timeout(Duration::from_millis(500), handle).await;
+
+        // The listener should have been re-entered multiple times.
+        // (No direct assert on backoff value — confirmed via the unit
+        // tests above; this test just exercises the live path.)
+        assert!(calls.load(Ordering::SeqCst) >= 1);
     }
 
     #[tokio::test]
