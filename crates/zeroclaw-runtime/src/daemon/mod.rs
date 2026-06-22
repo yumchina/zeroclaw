@@ -118,7 +118,7 @@ pub struct DaemonSubsystems {
         Box<
             dyn Fn(
                     Config,
-                    Option<tokio::sync::mpsc::UnboundedReceiver<(String, u8, serde_json::Value)>>,
+                    Option<tokio::sync::mpsc::UnboundedReceiver<crate::tools::dawn_task::DawnMsg>>,
                 ) -> std::pin::Pin<Box<dyn Future<Output = Result<()>> + Send>>
                 + Send
                 + Sync,
@@ -157,7 +157,7 @@ pub async fn run(
     // WuKongIM channel bridge: tool-to-agent tasks write the sender,
     // the WuKongIM channel supervisor reads the receiver.
     let (_channel_msg_tx, channel_msg_rx) =
-        tokio::sync::mpsc::unbounded_channel::<(String, u8, serde_json::Value)>();
+        tokio::sync::mpsc::unbounded_channel::<crate::tools::dawn_task::DawnMsg>();
     crate::tools::dawn_task::set_dawn_bridge(_channel_msg_tx.clone());
     let mut channel_msg_rx = Some(channel_msg_rx);
 

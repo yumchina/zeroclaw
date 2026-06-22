@@ -21,6 +21,7 @@ use zeroclaw_config::dawn_agents::DawnAgents;
 pub struct DawnContext {
     pub from_uid: String,
     pub reply_target: String,
+    pub topic: Option<String>,
 }
 
 tokio::task_local! {
@@ -35,9 +36,16 @@ fn read_context() -> DawnContext {
 // Follows CRON_CHANNEL_REGISTRY pattern (OnceLock + daemon injection).
 // The bridge sender is set by the daemon after mpsc channel creation.
 // The orchestrator's bridge listener consumes the receiver and calls
-// WuKongIMChannel::send_status_message().
+// WuKongIMChannel::send_status_message_with_topic().
 
-type DawnMsg = (String, u8, serde_json::Value); // (recipient, channel_type, payload)
+#[derive(Debug, Clone)]
+pub struct DawnMsg {
+    pub recipient: String,
+    pub channel_type: u8,
+    pub payload: serde_json::Value,
+    pub topic: Option<String>,
+}
+
 type DawnBridgeTx = mpsc::UnboundedSender<DawnMsg>;
 
 static DAWN_BRIDGE: OnceLock<DawnBridgeTx> = OnceLock::new();
@@ -120,25 +128,36 @@ impl Tool for DawnCreateTask {
         } else {
             ctx.reply_target.clone()
         };
+        let topic = ctx.topic.filter(|t| !t.is_empty() && t != "0");
 
-        let payload = json!({
+        let mut param = serde_json::json!({
+            "type": task_type,
+            "user_id": user_id,
+            "user_text": user_text,
+            "params": params,
+            "reply_to": self.la_id,
+            "reply_target": reply_target
+        });
+        if let Some(ref t) = topic {
+            param["topic"] = serde_json::Value::String(t.clone());
+        }
+
+        let payload = serde_json::json!({
             "type": 2000,
             "cmd": "dawn.create_task",
-            "param": {
-                "type": task_type,
-                "user_id": user_id,
-                "user_text": user_text,
-                "params": params,
-                "reply_to": self.la_id,
-                "reply_target": reply_target
-            }
+            "param": param
         });
 
         // 4. 发送
         DAWN_BRIDGE
             .get()
             .ok_or_else(|| anyhow::anyhow!("Dawn 桥接未配置（DAWN_BRIDGE 未设置）"))?
-            .send((agent_uid, 1, payload))
+            .send(DawnMsg {
+                recipient: agent_uid,
+                channel_type: 1,
+                payload,
+                topic,
+            })
             .map_err(|e| anyhow::anyhow!("发送消息到 Dawn Agent 失败: {}", e))?;
 
         Ok(ToolResult {
@@ -208,21 +227,33 @@ impl Tool for DawnQueryTask {
         let agent_uid = agent_config.uid.clone();
 
         let ctx = read_context();
-        let payload = json!({
+        let topic = ctx.topic.filter(|t| !t.is_empty() && t != "0");
+
+        let mut param = serde_json::json!({
+            "type": task_type,
+            "task_id": task_id,
+            "user_id": ctx.from_uid,
+            "reply_to": self.la_id
+        });
+        if let Some(ref t) = topic {
+            param["topic"] = serde_json::Value::String(t.clone());
+        }
+
+        let payload = serde_json::json!({
             "type": 2000,
             "cmd": "dawn.query_task",
-            "param": {
-                "type": task_type,
-                "task_id": task_id,
-                "user_id": ctx.from_uid,
-                "reply_to": self.la_id
-            }
+            "param": param
         });
 
         DAWN_BRIDGE
             .get()
             .ok_or_else(|| anyhow::anyhow!("Dawn 桥接未配置（DAWN_BRIDGE 未设置）"))?
-            .send((agent_uid, 1, payload))
+            .send(DawnMsg {
+                recipient: agent_uid,
+                channel_type: 1,
+                payload,
+                topic,
+            })
             .map_err(|e| anyhow::anyhow!("发送查询到 Dawn Agent 失败: {}", e))?;
 
         Ok(ToolResult {
@@ -230,5 +261,58 @@ impl Tool for DawnQueryTask {
             output: format!("已发送查询请求，task_id: {}", task_id),
             error: None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use zeroclaw_config::dawn_agents::{DawnAgentConfig, DawnAgents};
+
+    fn dawn_agents() -> DawnAgents {
+        DawnAgents {
+            agents: HashMap::from([(
+                "1".to_string(),
+                DawnAgentConfig {
+                    uid: "xuanji_worker".to_string(),
+                    name: "xuanji".to_string(),
+                    description: "doc extraction".to_string(),
+                },
+            )]),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_task_forwards_current_topic_to_bridge_and_payload() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        set_dawn_bridge(tx);
+
+        let tool = DawnCreateTask::new("la_uid".to_string(), dawn_agents());
+        let args = json!({
+            "type": 1,
+            "user_text": "extract this file",
+            "params": {
+                "files": [{
+                    "file_url": "https://example.invalid/a.pdf",
+                    "file_name": "a.pdf",
+                    "file_type": "pdf"
+                }]
+            }
+        });
+        let ctx = DawnContext {
+            from_uid: "user_1".to_string(),
+            reply_target: "1:user_1".to_string(),
+            topic: Some("topic-123".to_string()),
+        };
+
+        let result = DAWN_CONTEXT.scope(ctx, tool.execute(args)).await.unwrap();
+
+        assert!(result.success);
+        let msg = rx.recv().await.unwrap();
+        assert_eq!(msg.recipient, "xuanji_worker");
+        assert_eq!(msg.channel_type, 1);
+        assert_eq!(msg.topic.as_deref(), Some("topic-123"));
+        assert_eq!(msg.payload["param"]["topic"], "topic-123");
     }
 }

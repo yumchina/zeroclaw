@@ -2901,6 +2901,7 @@ async fn process_channel_message(
             .unwrap_or(&msg.sender)
             .to_string(),
         reply_target: msg.reply_target.clone(),
+        topic: msg.thread_ts.clone(),
     };
 
     println!(
@@ -5985,7 +5986,7 @@ pub async fn start_channels(
     config: Config,
     canvas_store: Option<zeroclaw_runtime::tools::CanvasStore>,
     #[allow(unused)] channel_msg_rx: Option<
-        tokio::sync::mpsc::UnboundedReceiver<(String, u8, serde_json::Value)>,
+        tokio::sync::mpsc::UnboundedReceiver<zeroclaw_runtime::tools::dawn_task::DawnMsg>,
     >,
 ) -> Result<()> {
     // No model resolves yet — the user has channels configured but hasn't
@@ -6452,7 +6453,7 @@ pub async fn start_channels(
 
     // zeroclaw → WuKongIM bridge: spawn a listener that consumes messages from
     // the zeroclaw tools' mpsc sender and forwards them through the WuKongIM
-    // channel's send_status_message.
+    // channel's send_status_message_with_topic.
     #[cfg(feature = "channel-wukongim")]
     {
         let has_rx = channel_msg_rx.is_some();
@@ -6460,20 +6461,25 @@ pub async fn start_channels(
         if let (Some(mut rx), Some(wk)) = (channel_msg_rx, wukongim_channel) {
             tracing::info!("Bridge listener started (Tool → WuKongIM)");
             tokio::spawn(async move {
-                while let Some((recipient, channel_type, payload)) = rx.recv().await {
+                while let Some(msg) = rx.recv().await {
                     tracing::info!(
-                        recipient,
-                        channel_type,
-                        cmd = %payload.get("cmd").and_then(|v| v.as_str()).unwrap_or("?"),
+                        recipient = %msg.recipient,
+                        channel_type = msg.channel_type,
+                        cmd = %msg.payload.get("cmd").and_then(|v| v.as_str()).unwrap_or("?"),
                         "Bridge: forwarding message to WuKongIM"
                     );
                     if let Err(e) = wk
-                        .send_status_message(&recipient, channel_type, payload)
+                        .send_status_message_with_topic(
+                            &msg.recipient,
+                            msg.channel_type,
+                            msg.payload,
+                            msg.topic,
+                        )
                         .await
                     {
                         tracing::error!(
                             ?e,
-                            recipient,
+                            recipient = %msg.recipient,
                             "Failed to forward tool message to WuKongIM"
                         );
                     }
