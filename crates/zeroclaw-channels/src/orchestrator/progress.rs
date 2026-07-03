@@ -20,6 +20,7 @@
 //! draft edits.
 
 use std::sync::Arc;
+use uuid::Uuid;
 
 use zeroclaw_api::channel::{Channel, ProgressPhase, ProgressUpdate};
 use zeroclaw_config::schema::ProgressObserverConfig;
@@ -27,6 +28,30 @@ use zeroclaw_runtime::observability::{Observer, ObserverEvent, traits::ObserverM
 
 const ARG_SNIPPET_MAX_CHARS: usize = 120;
 const ERROR_MESSAGE_MAX_CHARS: usize = 200;
+
+fn observer_event_name(event: &ObserverEvent) -> &'static str {
+    match event {
+        ObserverEvent::AgentStart { .. } => "AgentStart",
+        ObserverEvent::AgentEnd { .. } => "AgentEnd",
+        ObserverEvent::LlmRequest { .. } => "LlmRequest",
+        ObserverEvent::ToolCallStart { .. } => "ToolCallStart",
+        ObserverEvent::ToolCall { .. } => "ToolCall",
+        ObserverEvent::Error { .. } => "Error",
+        _ => "Other",
+    }
+}
+
+fn progress_phase_name(phase: &ProgressPhase) -> &'static str {
+    match phase {
+        ProgressPhase::AgentStart { .. } => "AgentStart",
+        ProgressPhase::AgentEnd => "AgentEnd",
+        ProgressPhase::LlmRequest { .. } => "LlmRequest",
+        ProgressPhase::ToolStart { .. } => "ToolStart",
+        ProgressPhase::ToolDone { .. } => "ToolDone",
+        ProgressPhase::Error { .. } => "Error",
+        ProgressPhase::Generic => "Generic",
+    }
+}
 
 /// Extract a short user-facing snippet from a JSON tool-arguments blob.
 ///
@@ -178,19 +203,20 @@ pub(crate) fn event_to_progress(
 /// Per-message wrapper observer.
 ///
 /// Lifecycle is bound to a single `process_channel_message` call. Holds the
-/// target channel + recipient + (optional) draft id; on each translatable
+/// target channel + recipient + stable per-turn progress id; on each translatable
 /// event it spawns a fire-and-forget task that calls
 /// `Channel::update_draft_progress`. The inner observer is always invoked,
 /// so this wrapper never breaks an existing chain.
 ///
-/// `draft_message_id` is forwarded verbatim to the channel; channels that
-/// don't need it (today: DawnIM, Slack via `set_assistant_status`)
-/// simply ignore the argument.
+/// If a channel already has a real draft id (e.g. Lark/Slack partial mode),
+/// we reuse it. Otherwise we mint one stable `zc-progress-*` id per turn,
+/// mirroring the old execution_id model.
 pub(crate) struct ProgressObserver {
     inner: Arc<dyn Observer>,
     channel: Arc<dyn Channel>,
     recipient: String,
-    draft_message_id: Option<String>,
+    progress_message_id: String,
+    progress_id_generated: bool,
     cfg: ProgressObserverConfig,
 }
 
@@ -202,11 +228,19 @@ impl ProgressObserver {
         draft_message_id: Option<String>,
         cfg: ProgressObserverConfig,
     ) -> Self {
+        let normalized = draft_message_id
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty());
+        let (progress_message_id, progress_id_generated) = match normalized {
+            Some(id) => (id, false),
+            None => (format!("zc-progress-{}", Uuid::new_v4()), true),
+        };
         Self {
             inner,
             channel,
             recipient,
-            draft_message_id,
+            progress_message_id,
+            progress_id_generated,
             cfg,
         }
     }
@@ -214,30 +248,104 @@ impl ProgressObserver {
 
 impl Observer for ProgressObserver {
     fn record_event(&self, event: &ObserverEvent) {
+        let event_name = observer_event_name(event);
+        let is_lifecycle = matches!(
+            event,
+            ObserverEvent::AgentStart { .. } | ObserverEvent::AgentEnd { .. }
+        );
+
         if let Some(update) = event_to_progress(event, &self.cfg) {
             let channel = Arc::clone(&self.channel);
             let recipient = self.recipient.clone();
-            let draft_id = self.draft_message_id.clone().unwrap_or_default();
+            let progress_id = self.progress_message_id.clone();
+            let progress_id_generated = self.progress_id_generated;
+            let channel_name = channel.name().to_string();
+            let channel_name_for_log = channel_name.clone();
+            let recipient_for_log = recipient.clone();
+            let phase_name = progress_phase_name(&update.phase);
+            let text_len = update.text.chars().count();
+            if is_lifecycle {
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Dispatch)
+                        .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                        .with_attrs(::serde_json::json!({
+                            "event": event_name,
+                            "phase": phase_name,
+                            "channel": channel_name_for_log,
+                            "recipient": recipient_for_log,
+                            "progress_id_generated": progress_id_generated,
+                            "text_len": text_len,
+                        })),
+                    "ProgressObserver: dispatching lifecycle progress event"
+                );
+            }
             // Fire-and-forget. Network errors are advisory; losing a single
             // progress update is preferable to back-pressuring the agent
             // loop or panicking.
             zeroclaw_spawn::spawn!(async move {
-                if let Err(e) = channel
-                    .update_draft_progress(&recipient, &draft_id, &update)
+                match channel
+                    .update_draft_progress(&recipient, &progress_id, &update)
                     .await
                 {
-                    ::zeroclaw_log::record!(
-                        DEBUG,
-                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
-                            .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    Ok(()) => {
+                        if is_lifecycle {
+                            ::zeroclaw_log::record!(
+                                INFO,
+                                ::zeroclaw_log::Event::new(
+                                    module_path!(),
+                                    ::zeroclaw_log::Action::Complete
+                                )
+                                .with_outcome(::zeroclaw_log::EventOutcome::Success)
+                                .with_attrs(::serde_json::json!({
+                                    "event": event_name,
+                                    "phase": phase_name,
+                                    "channel": channel_name,
+                                    "recipient": recipient,
+                                    "progress_id_generated": progress_id_generated,
+                                })),
+                                "ProgressObserver: lifecycle progress event delivered"
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        ::zeroclaw_log::record!(
+                            WARN,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Fail
+                            )
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
                             .with_attrs(::serde_json::json!({
-                                "channel": channel.name(),
+                                "event": event_name,
+                                "phase": phase_name,
+                                "channel": channel_name,
+                                "recipient": recipient,
+                                "progress_id_generated": progress_id_generated,
                                 "error": format!("{e}"),
                             })),
-                        "ProgressObserver: update_draft_progress failed"
-                    );
+                            "ProgressObserver: update_draft_progress failed"
+                        );
+                    }
                 }
             });
+        } else if is_lifecycle {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Unknown)
+                    .with_attrs(::serde_json::json!({
+                        "event": event_name,
+                        "enabled": self.cfg.enabled,
+                        "agent_start": self.cfg.agent_start,
+                        "agent_end": self.cfg.agent_end,
+                        "tool_call_start": self.cfg.tool_call_start,
+                        "tool_call": self.cfg.tool_call,
+                        "llm_thinking": self.cfg.llm_thinking,
+                        "error": self.cfg.error,
+                    })),
+                "ProgressObserver: lifecycle event filtered by config"
+            );
         }
         self.inner.record_event(event);
     }
@@ -421,7 +529,12 @@ mod tests {
         let u = event_to_progress(&event, &cfg).expect("should translate");
         assert!(u.text.contains("456"), "text was: {}", u.text);
         match u.phase {
-            ProgressPhase::ToolDone { tool, tool_call_id, success, elapsed_ms } => {
+            ProgressPhase::ToolDone {
+                tool,
+                tool_call_id,
+                success,
+                elapsed_ms,
+            } => {
                 assert_eq!(tool, "shell");
                 assert_eq!(tool_call_id.as_deref(), Some("call_1"));
                 assert!(success);
@@ -580,10 +693,11 @@ mod tests {
             message_id: &str,
             update: &zeroclaw_api::channel::ProgressUpdate,
         ) -> anyhow::Result<()> {
-            self.calls
-                .lock()
-                .await
-                .push((recipient.into(), message_id.into(), update.text.clone()));
+            self.calls.lock().await.push((
+                recipient.into(),
+                message_id.into(),
+                update.text.clone(),
+            ));
             Ok(())
         }
     }
@@ -630,11 +744,15 @@ mod tests {
         let (recipient, draft_id, text) = &calls[0];
         assert_eq!(recipient, "u_alice");
         assert_eq!(draft_id, "draft-xyz");
-        assert!(text.contains("ls"), "text should contain 'ls', got: {}", text);
+        assert!(
+            text.contains("ls"),
+            "text should contain 'ls', got: {}",
+            text
+        );
     }
 
     #[tokio::test]
-    async fn progress_observer_passes_empty_draft_id_when_none() {
+    async fn progress_observer_generates_stable_progress_id_when_none() {
         let inner = Arc::new(CountingObserver::default());
         let ch = Arc::new(RecordingProgressChannel::default());
         let obs = ProgressObserver::new(
@@ -657,11 +775,21 @@ mod tests {
         });
 
         wait_for_calls(&ch, 1, 200).await;
+        obs.record_event(&ObserverEvent::AgentStart {
+            model_provider: "openai".into(),
+            model: "gpt-5".into(),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
+        });
+
+        wait_for_calls(&ch, 2, 200).await;
         let calls = ch.calls.lock().await;
-        assert_eq!(calls.len(), 1);
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].1.starts_with("zc-progress-"));
         assert_eq!(
-            calls[0].1, "",
-            "missing draft id is forwarded as empty string"
+            calls[0].1, calls[1].1,
+            "all progress events in one turn must reuse the same generated id"
         );
     }
 

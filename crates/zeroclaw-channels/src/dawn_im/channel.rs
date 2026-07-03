@@ -23,9 +23,8 @@ use super::approval::{
 };
 use super::connection::{
     ClearUnreadRequest, ConnectParams, DAWN_IM_RPC_VERSION, HEARTBEAT_TIMEOUT, Header,
-    JsonRpcNotification, JsonRpcRequest, PING_INTERVAL, RecvAckParams,
-    RecvNotificationParams, SendParams, SyncRequest, SyncResponse, WkChannelType, WkMessageType,
-    WsSink,
+    JsonRpcNotification, JsonRpcRequest, PING_INTERVAL, RecvAckParams, RecvNotificationParams,
+    SendParams, SyncRequest, SyncResponse, WkChannelType, WkMessageType, WsSink,
 };
 use super::exception_card::build_exception_card;
 use super::filter::{is_mentioned, is_user_allowed, parse_recipient};
@@ -98,6 +97,53 @@ fn topic_to_thread(topic: Option<&str>) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn strip_progress_cloud_prefix(text: &str) -> &str {
+    text.trim()
+        .strip_prefix('💭')
+        .map_or(text.trim(), |s| s.trim())
+}
+
+fn to_cn_progress_text(update: &zeroclaw_api::channel::ProgressUpdate) -> String {
+    use zeroclaw_api::channel::ProgressPhase;
+    match &update.phase {
+        ProgressPhase::AgentStart { provider, model } => {
+            format!("Agent 启动（{provider}/{model}）")
+        }
+        ProgressPhase::AgentEnd => "处理完成".to_string(),
+        ProgressPhase::LlmRequest { messages_count } => {
+            format!("正在调用大模型推理（{messages_count} 条消息）")
+        }
+        ProgressPhase::ToolStart { tool, .. } => format!("调用工具：{tool}"),
+        ProgressPhase::ToolDone {
+            tool,
+            success,
+            elapsed_ms,
+            ..
+        } => {
+            if *success {
+                format!("{tool} 执行完成（{elapsed_ms}ms）")
+            } else {
+                format!("{tool} 执行失败")
+            }
+        }
+        ProgressPhase::Error { component } => format!("{component} 出现错误"),
+        ProgressPhase::Generic => {
+            let plain = strip_progress_cloud_prefix(&update.text);
+            match plain {
+                "Done" | "Processing complete" => "处理完成".to_string(),
+                _ if plain.starts_with("Agent started (") && plain.ends_with(')') => {
+                    let inner = plain
+                        .strip_prefix("Agent started (")
+                        .and_then(|s| s.strip_suffix(')'))
+                        .unwrap_or(plain);
+                    format!("Agent 启动（{inner}）")
+                }
+                _ => plain.to_string(),
+            }
+        }
+    }
+}
+
 pub(crate) fn map_approval_action(action: &WkApprovalAction) -> ChannelApprovalResponse {
     match action.action.as_str() {
         "approve" => ChannelApprovalResponse::Approve,
@@ -140,6 +186,9 @@ pub struct DawnIMChannel {
     /// Reserved for future re-implementation of real-time agent-progress
     /// updates. Currently unwired in the 0.8.0 port.
     pub(crate) progress_streaming: bool,
+    /// Per-recipient in-flight progress card id, used to merge AgentStart →
+    /// ToolStart/Done → AgentEnd into one LA update timeline.
+    pub(crate) progress_mid_by_recipient: Arc<tokio::sync::Mutex<HashMap<String, String>>>,
 }
 
 impl DawnIMChannel {
@@ -182,7 +231,63 @@ impl DawnIMChannel {
             last_message_time: Arc::new(RwLock::new(HashMap::new())),
             workspace_dir: workspace_dir.to_path_buf(),
             progress_streaming: config.progress_streaming,
+            progress_mid_by_recipient: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
         }
+    }
+
+    async fn resolve_progress_mid(
+        &self,
+        recipient: &str,
+        message_id: &str,
+        phase: &zeroclaw_api::channel::ProgressPhase,
+    ) -> String {
+        let mut mids = self.progress_mid_by_recipient.lock().await;
+        let provided = message_id.trim();
+        let is_start = matches!(phase, zeroclaw_api::channel::ProgressPhase::AgentStart { .. });
+        let is_terminal = matches!(
+            phase,
+            zeroclaw_api::channel::ProgressPhase::AgentEnd
+                | zeroclaw_api::channel::ProgressPhase::Error { .. }
+        );
+
+        if !provided.is_empty() {
+            let provided_mid = provided.to_string();
+            if is_start {
+                mids.insert(recipient.to_string(), provided_mid.clone());
+                return provided_mid;
+            }
+
+            if let Some(existing) = mids.get(recipient) {
+                if is_terminal && existing != &provided_mid {
+                    return existing.clone();
+                }
+                return provided_mid;
+            }
+
+            if !matches!(phase, zeroclaw_api::channel::ProgressPhase::Generic) {
+                mids.insert(recipient.to_string(), provided_mid.clone());
+            }
+            return provided_mid;
+        }
+
+        if matches!(
+            phase,
+            zeroclaw_api::channel::ProgressPhase::AgentStart { .. }
+        ) {
+            let mid = format!("zc-progress-{}", Uuid::new_v4());
+            mids.insert(recipient.to_string(), mid.clone());
+            return mid;
+        }
+
+        if let Some(existing) = mids.get(recipient) {
+            return existing.clone();
+        }
+
+        let mid = format!("zc-progress-{}", Uuid::new_v4());
+        if !matches!(phase, zeroclaw_api::channel::ProgressPhase::Generic) {
+            mids.insert(recipient.to_string(), mid.clone());
+        }
+        mid
     }
 
     /// Send a `send` JSON-RPC request and return as soon as the frame
@@ -209,7 +314,10 @@ impl DawnIMChannel {
             Some(s) => {
                 if let Err(e) = s.send(WsMsg::Text(msg.into())).await {
                     *g = None;
-                    return Err(anyhow::anyhow!("DawnIM send (fire-and-forget) failed: {}", e));
+                    return Err(anyhow::anyhow!(
+                        "DawnIM send (fire-and-forget) failed: {}",
+                        e
+                    ));
                 }
                 Ok(())
             }
@@ -593,9 +701,35 @@ impl DawnIMChannel {
         params: RecvNotificationParams,
         tx: &tokio::sync::mpsc::Sender<ChannelMessage>,
     ) -> anyhow::Result<()> {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Inbound).with_attrs(
+                ::serde_json::json!({
+                    "alias": self.alias,
+                    "message_id": params.message_id,
+                    "message_seq": params.message_seq,
+                    "channel_id": params.channel_id,
+                    "channel_type": params.channel_type,
+                    "from_uid": params.from_uid,
+                    "topic": params.topic,
+                })
+            ),
+            "DawnIM: inbound recv notification"
+        );
         let topic_thread = topic_to_thread(params.topic.as_deref());
 
         if params.from_uid == self.uid {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
+                    .with_attrs(::serde_json::json!({
+                        "reason": "self_message",
+                        "alias": self.alias,
+                        "message_id": params.message_id,
+                        "from_uid": params.from_uid,
+                    })),
+                "DawnIM: dropping self-authored inbound message"
+            );
             return Ok(());
         }
 
@@ -616,6 +750,22 @@ impl DawnIMChannel {
             .unwrap_or(&0);
         let current_seq = mem_seq.max(file_seq);
         if params.message_seq <= current_seq {
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
+                    .with_attrs(::serde_json::json!({
+                        "reason": "sequence_dedup",
+                        "alias": self.alias,
+                        "message_id": params.message_id,
+                        "message_seq": params.message_seq,
+                        "current_seq": current_seq,
+                        "memory_seq": mem_seq,
+                        "file_seq": file_seq,
+                        "channel_id": params.channel_id,
+                        "channel_type": params.channel_type,
+                    })),
+                "DawnIM: inbound message dropped by sequence dedup"
+            );
             return Ok(());
         }
 
@@ -647,6 +797,20 @@ impl DawnIMChannel {
             let _ = self
                 .send_ack(params.message_id.clone(), params.message_seq)
                 .await;
+            ::zeroclaw_log::record!(
+                INFO,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+                    .with_attrs(::serde_json::json!({
+                        "alias": self.alias,
+                        "message_id": params.message_id,
+                        "message_seq": params.message_seq,
+                        "channel_id": params.channel_id,
+                        "channel_type": params.channel_type,
+                        "cmd": payload_json.get("cmd"),
+                        "msg_type": msg_type,
+                    })),
+                "DawnIM: inbound command message"
+            );
             if payload_json.get("cmd").and_then(|c| c.as_str()) == Some("la_init_helloworld")
                 && let Some(content) = payload_json.get("content").and_then(|c| c.as_str())
                 && (params.channel_type != WkChannelType::GROUP
@@ -678,6 +842,19 @@ impl DawnIMChannel {
                         params.timestamp * 1_000_000_000,
                     )
                     .await?;
+                } else {
+                    ::zeroclaw_log::record!(
+                        WARN,
+                        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                            .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                            .with_attrs(::serde_json::json!({
+                                "alias": self.alias,
+                                "message_id": params.message_id,
+                                "message_seq": params.message_seq,
+                                "reason": "tx_send_failed_cmd",
+                            })),
+                        "DawnIM: failed to forward command message to orchestrator"
+                    );
                 }
             }
             return Ok(());
@@ -732,6 +909,19 @@ impl DawnIMChannel {
 
             if !mentioned {
                 silent = true;
+                ::zeroclaw_log::record!(
+                    INFO,
+                    ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Skip)
+                        .with_attrs(::serde_json::json!({
+                            "reason": "group_not_mentioned",
+                            "alias": self.alias,
+                            "message_id": params.message_id,
+                            "message_seq": params.message_seq,
+                            "channel_id": params.channel_id,
+                            "from_uid": params.from_uid,
+                        })),
+                    "DawnIM: message marked silent due to mention_only group policy"
+                );
             } else if !final_content_str.contains(&format!("@{}", self.uid)) {
                 ::zeroclaw_log::record!(
                     INFO,
@@ -782,6 +972,7 @@ impl DawnIMChannel {
         } else {
             &params.channel_id
         };
+        let message_id_for_log = params.message_id.clone();
 
         let ch_msg = ChannelMessage {
             id: params.message_id,
@@ -801,6 +992,21 @@ impl DawnIMChannel {
             subject: None,
         };
 
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Dispatch)
+                .with_attrs(::serde_json::json!({
+                    "alias": self.alias,
+                    "message_id": ch_msg.id,
+                    "message_seq": params.message_seq,
+                    "reply_target": ch_msg.reply_target,
+                    "sender": ch_msg.sender,
+                    "thread_ts": ch_msg.thread_ts,
+                    "silent": silent,
+                    "content_len": ch_msg.content.chars().count(),
+                })),
+            "DawnIM: forwarding message to orchestrator channel tx"
+        );
         if tx.send(ch_msg).await.is_ok() {
             ::zeroclaw_log::record!(
                 INFO,
@@ -818,6 +1024,21 @@ impl DawnIMChannel {
                 params.timestamp * 1_000_000_000,
             )
             .await?;
+        } else {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({
+                        "alias": self.alias,
+                        "message_id": message_id_for_log,
+                        "message_seq": params.message_seq,
+                        "channel_id": params.channel_id,
+                        "channel_type": params.channel_type,
+                        "reason": "tx_send_failed_text",
+                    })),
+                "DawnIM: failed to forward inbound message to orchestrator"
+            );
         }
         Ok(())
     }
@@ -894,8 +1115,8 @@ impl DawnIMChannel {
         topic: Option<String>,
     ) -> anyhow::Result<SendParams> {
         let card = build_resolved_card(approval_id, reason);
-        let payload_b64 = base64::engine::general_purpose::STANDARD
-            .encode(serde_json::to_string(&card)?);
+        let payload_b64 =
+            base64::engine::general_purpose::STANDARD.encode(serde_json::to_string(&card)?);
         let (channel_id, channel_type) = parse_recipient(recipient);
         let setting_out = topic.as_ref().map(|_| 8u32);
         Ok(SendParams {
@@ -1312,21 +1533,27 @@ impl Channel for DawnIMChannel {
     ///     never persisted server-side, and
     ///   * it doesn't bump the chat's unread counter.
     ///
-    /// `message_id` is ignored — we always send a fresh ephemeral message
-    /// (no edit semantics on the JSON-RPC channel). The 💭 prefix exists
-    /// so the user can visually distinguish progress from real responses.
+    /// `message_id` (when provided) is used as the progress `mid` correlation
+    /// key; otherwise we keep a per-recipient in-memory `mid` session.
     async fn update_draft_progress(
         &self,
         recipient: &str,
-        _message_id: &str,
+        message_id: &str,
         update: &zeroclaw_api::channel::ProgressUpdate,
     ) -> anyhow::Result<()> {
-        let trimmed = update.text.trim();
-        if trimmed.is_empty() {
+        let content = to_cn_progress_text(update);
+        if content.trim().is_empty() {
             return Ok(());
         }
-        let content = format!("💭 {trimmed}");
-        let payload_b64 = encode_progress_payload(&content, &update.phase)?;
+        let should_clear_mid = matches!(
+            update.phase,
+            zeroclaw_api::channel::ProgressPhase::AgentEnd
+                | zeroclaw_api::channel::ProgressPhase::Error { .. }
+        );
+        let mid = self
+            .resolve_progress_mid(recipient, message_id, &update.phase)
+            .await;
+        let payload_b64 = encode_progress_payload(&content, &mid, &update.phase)?;
         let (channel_id, channel_type) = parse_recipient(recipient);
         let params = SendParams {
             from_uid: Some(self.uid.clone()),
@@ -1346,6 +1573,12 @@ impl Channel for DawnIMChannel {
             topic: None,
         };
         self.send_params_fire_and_forget(params).await?;
+        if should_clear_mid {
+            self.progress_mid_by_recipient
+                .lock()
+                .await
+                .remove(recipient);
+        }
         Ok(())
     }
 
@@ -1655,7 +1888,8 @@ impl Channel for DawnIMChannel {
             );
             return Ok(());
         };
-        let params = self.build_cancel_send_params(approval_id, recipient, reason, pending.topic)?;
+        let params =
+            self.build_cancel_send_params(approval_id, recipient, reason, pending.topic)?;
         self.send_params_fire_and_forget(params).await?;
         Ok(())
     }
@@ -1830,6 +2064,14 @@ mod topic_to_thread_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "channel_progress_text_tests.rs"]
+mod progress_text_tests;
+
+#[cfg(test)]
+#[path = "channel_progress_mid_tests.rs"]
+mod progress_mid_tests;
 
 #[cfg(test)]
 mod inbound_topic_mapping_tests {
@@ -2087,7 +2329,8 @@ mod approval_id_propagation_tests {
         };
         let tmp = tempfile::tempdir().unwrap();
         let memory: Arc<dyn zeroclaw_api::memory_traits::Memory> = Arc::new(
-            zeroclaw_memory::SqliteMemory::new_named("sqlite", tmp.path(), "approval_id_test").unwrap(),
+            zeroclaw_memory::SqliteMemory::new_named("sqlite", tmp.path(), "approval_id_test")
+                .unwrap(),
         );
         DawnIMChannel::from_config(&cfg, "test", tmp.path(), memory)
     }
@@ -2147,7 +2390,10 @@ mod approval_id_propagation_tests {
         let (tx, _rx) = tokio::sync::oneshot::channel();
         ch.pending_approvals.write().await.insert(
             ("uuid-X".to_string(), "u_admin1".to_string()),
-            crate::dawn_im::approval::PendingApproval { sender: tx, topic: None },
+            crate::dawn_im::approval::PendingApproval {
+                sender: tx,
+                topic: None,
+            },
         );
         // Simulate inbound: build the payload the channel would receive.
         let action_payload = serde_json::json!({
@@ -2193,12 +2439,7 @@ mod approval_id_propagation_tests {
     async fn cancel_send_params_carries_resolved_card_payload() {
         let ch = build_test_channel();
         let params = ch
-            .build_cancel_send_params(
-                "uuid-X",
-                "u_admin1",
-                "此请求已被处理 — 同意",
-                None,
-            )
+            .build_cancel_send_params("uuid-X", "u_admin1", "此请求已被处理 — 同意", None)
             .expect("build_cancel_send_params should succeed");
         // channel_id should be the bare recipient (no <type>: prefix), channel_type PERSONAL (1).
         assert_eq!(params.channel_id, "u_admin1");
@@ -2211,14 +2452,17 @@ mod approval_id_propagation_tests {
         let payload_bytes = base64::engine::general_purpose::STANDARD
             .decode(&payload_b64)
             .expect("payload should be valid base64");
-        let card: serde_json::Value = serde_json::from_slice(&payload_bytes)
-            .expect("payload should decode to JSON");
+        let card: serde_json::Value =
+            serde_json::from_slice(&payload_bytes).expect("payload should decode to JSON");
         assert_eq!(
             card["type"].as_u64().unwrap(),
             u64::from(crate::dawn_im::connection::WkMessageType::INTERACTIVE_CARD)
         );
         assert_eq!(card["body"]["content"], "此请求已被处理 — 同意");
-        assert!(card["actions"].is_null(), "resolved card must have no actions");
+        assert!(
+            card["actions"].is_null(),
+            "resolved card must have no actions"
+        );
     }
 
     #[tokio::test]
@@ -2240,12 +2484,7 @@ mod approval_id_propagation_tests {
     async fn cancel_send_params_without_topic_omits_setting_bit() {
         let ch = build_test_channel();
         let params = ch
-            .build_cancel_send_params(
-                "uuid-X",
-                "u_admin1",
-                "此请求已被处理 — 同意",
-                None,
-            )
+            .build_cancel_send_params("uuid-X", "u_admin1", "此请求已被处理 — 同意", None)
             .expect("build_cancel_send_params should succeed");
         assert!(params.topic.is_none());
         assert!(params.setting.is_none());
@@ -2263,12 +2502,18 @@ mod approval_id_propagation_tests {
         let (tx, _rx) = tokio::sync::oneshot::channel();
         ch.pending_approvals.write().await.insert(
             ("uuid-X".to_string(), "u_admin1".to_string()),
-            crate::dawn_im::approval::PendingApproval { sender: tx, topic: None },
+            crate::dawn_im::approval::PendingApproval {
+                sender: tx,
+                topic: None,
+            },
         );
         let res = ch
             .cancel_approval("uuid-X", "u_admin1", "此请求已被处理 — 同意")
             .await;
-        assert!(res.is_err(), "expected Err from send_rpc when ws_sink is None, got: {res:?}");
+        assert!(
+            res.is_err(),
+            "expected Err from send_rpc when ws_sink is None, got: {res:?}"
+        );
         let err_msg = res.unwrap_err().to_string();
         assert!(
             err_msg.contains("not connected") || err_msg.contains("WebSocket"),

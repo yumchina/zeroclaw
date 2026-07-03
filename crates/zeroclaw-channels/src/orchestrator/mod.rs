@@ -1238,10 +1238,8 @@ fn strip_sentinel_history_turns(turns: &mut Vec<ChatMessage>) {
     ];
     let mut i = 0usize;
     while i < turns.len().saturating_sub(1) {
-        let is_sentinel = turns[i].role == "assistant"
-            && SENTINELS
-                .iter()
-                .any(|s| turns[i].content.trim() == *s);
+        let is_sentinel =
+            turns[i].role == "assistant" && SENTINELS.iter().any(|s| turns[i].content.trim() == *s);
         if is_sentinel {
             turns.remove(i);
             if i > 0 && turns[i - 1].role == "user" {
@@ -5270,8 +5268,27 @@ async fn process_channel_message_body(
     // that only want ephemeral status (e.g. DawnIM) can opt in by
     // overriding `update_draft_progress` alone. No-op when no target
     // channel is available or no toggle is enabled in config.
+    let progress_any_enabled = ctx.progress_observer.any_enabled();
+    let progress_events_enabled = target_channel.is_some() && progress_any_enabled;
+    ::zeroclaw_log::record!(
+        INFO,
+        ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
+            .with_attrs(::serde_json::json!({
+                "has_target_channel": target_channel.is_some(),
+                "progress_any_enabled": progress_any_enabled,
+                "progress_events_enabled": progress_events_enabled,
+                "progress_channel": target_channel.as_ref().map(|ch| ch.name().to_string()),
+                "agent_start": ctx.progress_observer.agent_start,
+                "agent_end": ctx.progress_observer.agent_end,
+                "tool_call_start": ctx.progress_observer.tool_call_start,
+                "tool_call": ctx.progress_observer.tool_call,
+                "llm_thinking": ctx.progress_observer.llm_thinking,
+                "error": ctx.progress_observer.error,
+            })),
+        "Progress observer wiring decision"
+    );
     let progress_observer: Arc<dyn Observer> = match target_channel.as_ref() {
-        Some(channel) if ctx.progress_observer.any_enabled() => {
+        Some(channel) if progress_events_enabled => {
             Arc::new(progress::ProgressObserver::new(
                 Arc::clone(&notify_observer) as Arc<dyn Observer>,
                 Arc::clone(channel),
@@ -5282,6 +5299,30 @@ async fn process_channel_message_body(
         }
         _ => Arc::clone(&notify_observer) as Arc<dyn Observer>,
     };
+    if progress_events_enabled {
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Dispatch)
+                .with_attrs(::serde_json::json!({
+                    "event": "AgentStart",
+                    "reason": "orchestrator_message_begin",
+                    "observer_path": "progress_observer",
+                    "model_provider": route.model_provider.clone(),
+                    "model": route.model.clone(),
+                    "channel": target_channel.as_ref().map(|ch| ch.name().to_string()),
+                    "reply_target": msg.reply_target.clone(),
+                    "message_id": msg.id.clone(),
+                })),
+            "Progress observer: dispatching AgentStart at message begin"
+        );
+        progress_observer.record_event(&ObserverEvent::AgentStart {
+            model_provider: route.model_provider.clone(),
+            model: route.model.clone(),
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
+        });
+    }
     let notify_channel = target_channel.clone();
     let notify_reply_target = msg.reply_target.clone();
     let notify_thread_root = followup_thread_id(&msg);
@@ -5498,7 +5539,25 @@ async fn process_channel_message_body(
                         route.model = new_model;
                         clear_model_switch_request();
 
-                        ctx.observer.record_event(&ObserverEvent::AgentStart {
+                        ::zeroclaw_log::record!(
+                            INFO,
+                            ::zeroclaw_log::Event::new(
+                                module_path!(),
+                                ::zeroclaw_log::Action::Dispatch
+                            )
+                            .with_attrs(::serde_json::json!({
+                                "event": "AgentStart",
+                                "reason": "model_switch",
+                                "observer_path": "progress_observer",
+                                "model_provider": route.model_provider.clone(),
+                                "model": route.model.clone(),
+                                "channel": target_channel.as_ref().map(|ch| ch.name().to_string()),
+                                "reply_target": msg.reply_target.clone(),
+                                "message_id": msg.id.clone(),
+                            })),
+                            "Progress observer: dispatching AgentStart after model switch"
+                        );
+                        progress_observer.record_event(&ObserverEvent::AgentStart {
                             model_provider: route.model_provider.clone(),
                             model: route.model.clone(),
                             channel: None,
@@ -5551,6 +5610,35 @@ async fn process_channel_message_body(
     // Thread the final reply only if tools were used (multi-message response)
     if notify_observer_flag.tools_used.load(Ordering::Relaxed) && msg.channel != "cli" {
         msg.thread_ts = followup_thread_id(&msg);
+    }
+    if progress_events_enabled {
+        let elapsed_ms = started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
+        ::zeroclaw_log::record!(
+            INFO,
+            ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Dispatch)
+                .with_attrs(::serde_json::json!({
+                    "event": "AgentEnd",
+                    "reason": "orchestrator_message_end",
+                    "observer_path": "progress_observer",
+                    "model_provider": route.model_provider.clone(),
+                    "model": route.model.clone(),
+                    "elapsed_ms": elapsed_ms,
+                    "channel": target_channel.as_ref().map(|ch| ch.name().to_string()),
+                    "reply_target": msg.reply_target.clone(),
+                    "message_id": msg.id.clone(),
+                })),
+            "Progress observer: dispatching AgentEnd at message end"
+        );
+        progress_observer.record_event(&ObserverEvent::AgentEnd {
+            model_provider: route.model_provider.clone(),
+            model: route.model.clone(),
+            duration: std::time::Duration::from_millis(elapsed_ms),
+            tokens_used: None,
+            cost_usd: None,
+            channel: None,
+            agent_alias: None,
+            turn_id: None,
+        });
     }
     // Drop the notify sender so the forwarder task finishes
     drop(progress_observer);
@@ -9996,9 +10084,9 @@ pub async fn start_channels(
 
         // Build channel directory for ApprovalBroker once channels_by_name is ready
         let channel_directory: Option<Arc<dyn zeroclaw_runtime::approval::ChannelDirectory>> =
-            Some(Arc::new(channel_directory::OrchestratorChannelDirectory::new(
-                Arc::clone(&channels_by_name),
-            )));
+            Some(Arc::new(
+                channel_directory::OrchestratorChannelDirectory::new(Arc::clone(&channels_by_name)),
+            ));
 
         // Wire this agent's reaction / ask_user / escalate tool handles
         // into the shared `channels_by_name` map.
@@ -10111,13 +10199,14 @@ pub async fn start_channels(
             identity: shared_identity.clone(),
             topic_binding: shared_topic_binding.clone(),
             approval_manager: Arc::new({
-                let identity_resolver = shared_identity
-                    .as_ref()
-                    .map(|ir| ir.resolver.clone() as Arc<dyn zeroclaw_infra::identity_store::IdentityResolver>);
+                let identity_resolver = shared_identity.as_ref().map(|ir| {
+                    ir.resolver.clone() as Arc<dyn zeroclaw_infra::identity_store::IdentityResolver>
+                });
                 let cfg = config.clone();
                 let superusers_resolver = Arc::new(move || cfg.channels.superusers.clone());
                 let cfg2 = config.clone();
-                let master_channel_resolver = Arc::new(move || cfg2.channels.master_channel.clone());
+                let master_channel_resolver =
+                    Arc::new(move || cfg2.channels.master_channel.clone());
                 // Default approval timeout: 300s (5 min). Channel-specific overrides
                 // (e.g. dawn_im.approval_timeout_secs) are not yet threaded through here.
                 let approval_timeout = std::time::Duration::from_secs(300);
@@ -22955,7 +23044,10 @@ mod omitted_feature_tests {
         let config_arc = Arc::new(RwLock::new(config));
         let channels = collect_configured_channels(&config_arc, "test", &[]);
         assert!(
-            channels.channels.iter().all(|c| c.display_name != "Telegram"),
+            channels
+                .channels
+                .iter()
+                .all(|c| c.display_name != "Telegram"),
             "Telegram must be absent from collect_configured_channels when \
              channel-telegram feature is not compiled in"
         );

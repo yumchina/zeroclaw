@@ -21,34 +21,80 @@ const SUPPORTED_IMAGE_MIMES: &[&str] = &[
 
 /// Encode a text content string as a DawnIM type-14 Markdown Base64 payload.
 pub fn encode_text_payload(content: &str) -> anyhow::Result<String> {
-    encode_progress_payload(content, &zeroclaw_api::channel::ProgressPhase::Generic)
+    let payload = serde_json::json!({
+        "type": 14,
+        "content": {
+            "type": "markdown",
+            "text": content,
+        }
+    });
+    encode_payload(payload)
 }
 
-/// Encode a progress update payload: markdown `text` for fallback display,
-/// plus structured fields from `phase` so rich clients can render in place
-/// (e.g. update a tool bubble by `tool_call_id`).
-pub fn encode_progress_payload(content: &str, phase: &zeroclaw_api::channel::ProgressPhase) -> anyhow::Result<String> {
-    let mut inner = serde_json::json!({ "type": "markdown", "text": content });
+/// Encode a progress update payload as a DawnIM type-23 LA update card.
+///
+/// `desc` stays human-readable fallback text while structured fields
+/// (`status`, `tool_call_id`, `elapsed_ms`, `phase`) let rich clients render
+/// progress state transitions.
+pub fn encode_progress_payload(
+    content: &str,
+    mid: &str,
+    phase: &zeroclaw_api::channel::ProgressPhase,
+) -> anyhow::Result<String> {
+    let (phase_name, status, item_type) = match phase {
+        zeroclaw_api::channel::ProgressPhase::AgentStart { .. } => {
+            ("agent_start", "agent_start", "agent")
+        }
+        zeroclaw_api::channel::ProgressPhase::LlmRequest { .. } => {
+            ("llm_request", "llm_request", "agent")
+        }
+        zeroclaw_api::channel::ProgressPhase::ToolStart { .. } => {
+            ("tool_start", "tool_start", "tool")
+        }
+        zeroclaw_api::channel::ProgressPhase::ToolDone { success, .. } => (
+            "tool_done",
+            if *success {
+                "tool_success"
+            } else {
+                "tool_failed"
+            },
+            "tool",
+        ),
+        zeroclaw_api::channel::ProgressPhase::AgentEnd => ("agent_end", "agent_end", "agent"),
+        zeroclaw_api::channel::ProgressPhase::Error { .. } => ("error", "error", "agent"),
+        zeroclaw_api::channel::ProgressPhase::Generic => ("generic", "generic", "agent"),
+    };
+
+    let mut inner = serde_json::json!({
+        "mid": mid,
+        "title": "",
+        "desc": content,
+        "text": content,
+        "type": item_type,
+        "status": status,
+        "phase": phase_name,
+    });
     if let Some(obj) = inner.as_object_mut() {
         match phase {
             zeroclaw_api::channel::ProgressPhase::AgentStart { provider, model } => {
-                obj.insert("phase".into(), serde_json::json!("agent_start"));
                 obj.insert("provider".into(), serde_json::json!(provider));
                 obj.insert("model".into(), serde_json::json!(model));
             }
             zeroclaw_api::channel::ProgressPhase::LlmRequest { messages_count } => {
-                obj.insert("phase".into(), serde_json::json!("llm_request"));
                 obj.insert("messages_count".into(), serde_json::json!(messages_count));
             }
             zeroclaw_api::channel::ProgressPhase::ToolStart { tool, tool_call_id } => {
-                obj.insert("phase".into(), serde_json::json!("tool_start"));
                 obj.insert("tool_name".into(), serde_json::json!(tool));
                 if let Some(id) = tool_call_id {
                     obj.insert("tool_call_id".into(), serde_json::json!(id));
                 }
             }
-            zeroclaw_api::channel::ProgressPhase::ToolDone { tool, tool_call_id, success, elapsed_ms } => {
-                obj.insert("phase".into(), serde_json::json!("tool_done"));
+            zeroclaw_api::channel::ProgressPhase::ToolDone {
+                tool,
+                tool_call_id,
+                success,
+                elapsed_ms,
+            } => {
                 obj.insert("tool_name".into(), serde_json::json!(tool));
                 if let Some(id) = tool_call_id {
                     obj.insert("tool_call_id".into(), serde_json::json!(id));
@@ -56,19 +102,18 @@ pub fn encode_progress_payload(content: &str, phase: &zeroclaw_api::channel::Pro
                 obj.insert("success".into(), serde_json::json!(success));
                 obj.insert("elapsed_ms".into(), serde_json::json!(elapsed_ms));
             }
-            zeroclaw_api::channel::ProgressPhase::AgentEnd => {
-                obj.insert("phase".into(), serde_json::json!("agent_end"));
-            }
+            zeroclaw_api::channel::ProgressPhase::AgentEnd => {}
             zeroclaw_api::channel::ProgressPhase::Error { component } => {
-                obj.insert("phase".into(), serde_json::json!("error"));
                 obj.insert("component".into(), serde_json::json!(component));
             }
-            zeroclaw_api::channel::ProgressPhase::Generic => {
-                obj.insert("phase".into(), serde_json::json!("generic"));
-            }
+            zeroclaw_api::channel::ProgressPhase::Generic => {}
         }
     }
-    let payload = serde_json::json!({ "type": 14, "content": inner });
+    let payload = serde_json::json!({ "type": 23, "content": inner });
+    encode_payload(payload)
+}
+
+fn encode_payload(payload: serde_json::Value) -> anyhow::Result<String> {
     let json = serde_json::to_string(&payload)?;
     Ok(base64::engine::general_purpose::STANDARD.encode(json))
 }
@@ -448,6 +493,7 @@ mod tests {
         use zeroclaw_api::channel::ProgressPhase;
         let b64 = encode_progress_payload(
             "💭 shell completed (5ms)",
+            "progress-mid-1",
             &ProgressPhase::ToolDone {
                 tool: "shell".into(),
                 tool_call_id: Some("call_42".into()),
@@ -456,14 +502,42 @@ mod tests {
             },
         )
         .expect("encode should succeed");
-        let raw = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
         let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
-        assert_eq!(v["type"], 14);
+        assert_eq!(v["type"], 23);
+        assert_eq!(v["content"]["mid"], "progress-mid-1");
+        assert_eq!(v["content"]["desc"], "💭 shell completed (5ms)");
+        assert_eq!(v["content"]["status"], "tool_success");
+        assert_eq!(v["content"]["type"], "tool");
         assert_eq!(v["content"]["tool_name"], "shell");
         assert_eq!(v["content"]["tool_call_id"], "call_42");
         assert_eq!(v["content"]["success"], true);
         assert_eq!(v["content"]["elapsed_ms"], 5);
         assert_eq!(v["content"]["phase"], "tool_done");
+    }
+
+    #[test]
+    fn encode_progress_payload_maps_tool_done_failure_to_tool_failed() {
+        use zeroclaw_api::channel::ProgressPhase;
+        let b64 = encode_progress_payload(
+            "💭 shell failed",
+            "progress-mid-2",
+            &ProgressPhase::ToolDone {
+                tool: "shell".into(),
+                tool_call_id: Some("call_43".into()),
+                success: false,
+                elapsed_ms: 9,
+            },
+        )
+        .expect("encode should succeed");
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        assert_eq!(v["content"]["status"], "tool_failed");
+        assert_eq!(v["content"]["type"], "tool");
     }
 
     #[test]
